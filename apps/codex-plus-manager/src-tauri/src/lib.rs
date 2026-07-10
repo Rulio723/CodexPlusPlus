@@ -115,7 +115,6 @@ pub fn run() {
             commands::preview_session_index_cleanup,
             commands::apply_session_index_cleanup,
             commands::sync_providers_now,
-            commands::load_ads,
             commands::refresh_script_market,
             commands::install_market_script,
             commands::set_user_script_enabled,
