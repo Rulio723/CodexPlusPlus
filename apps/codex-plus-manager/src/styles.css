@@ -698,6 +698,97 @@ body {
   text-align: center;
 }
 
+.official-account-current {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--muted) / 0.45);
+  padding: 12px;
+}
+
+.official-account-current svg {
+  flex: 0 0 auto;
+  color: hsl(var(--primary));
+}
+
+.official-account-current strong,
+.official-account-current span,
+.official-account-summary strong,
+.official-account-summary span,
+.official-account-summary small {
+  display: block;
+}
+
+.official-account-current span,
+.official-account-summary span,
+.official-account-summary small,
+.official-account-note {
+  color: hsl(var(--muted-foreground));
+}
+
+.official-account-save-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto auto;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.official-account-note {
+  margin: 10px 0;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.official-account-list {
+  display: grid;
+  gap: 8px;
+}
+
+.official-account-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.official-account-row.active {
+  border-color: hsl(var(--primary) / 0.55);
+  background: hsl(var(--primary) / 0.08);
+}
+
+.official-account-summary {
+  min-width: 0;
+}
+
+.official-account-summary span,
+.official-account-summary small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.official-account-summary span {
+  margin-top: 2px;
+  font-size: 13px;
+}
+
+.official-account-summary small {
+  margin-top: 3px;
+  font-size: 12px;
+}
+
+.official-account-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
 .relay-profile-list {
   display: grid;
   gap: 10px;
@@ -3628,6 +3719,19 @@ body {
 
   .hero-layout .toolbar {
     justify-content: flex-start;
+  }
+
+  .official-account-save-row {
+    grid-template-columns: 1fr;
+  }
+
+  .official-account-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .official-account-actions {
+    flex-wrap: wrap;
   }
 
   .relay-profile-card {

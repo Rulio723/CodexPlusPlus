@@ -693,6 +693,30 @@ type AdsResult = CommandResult<{
   ads: AdItem[];
 }>;
 
+type OfficialAccountSummary = {
+  id: string;
+  label: string;
+  accountHint?: string | null;
+  createdAt: number;
+  updatedAt: number;
+  active: boolean;
+};
+
+type OfficialAccountsResult = CommandResult<{
+  accounts: OfficialAccountSummary[];
+  currentAccountLabel?: string | null;
+}>;
+
+type OfficialAccountSwitchResult = CommandResult<{
+  inventory: {
+    accounts: OfficialAccountSummary[];
+    currentAccountLabel?: string | null;
+  };
+  selected?: OfficialAccountSummary | null;
+  restartRequired: boolean;
+  backupPath?: string | null;
+}>;
+
 type ScriptMarketItem = {
   id: string;
   name: string;
@@ -934,6 +958,8 @@ export function App() {
   const [dreamSkinUnsavedDialog, setDreamSkinUnsavedDialog] = useState(false);
   const dreamSkinPendingActionRef = useRef<(() => void) | null>(null);
   const [update, setUpdate] = useState<UpdateResult | null>(null);
+  const [officialAccounts, setOfficialAccounts] = useState<OfficialAccountsResult | null>(null);
+  const [officialAccountBusy, setOfficialAccountBusy] = useState(false);
   const [updateInstallProgress, setUpdateInstallProgress] = useState<TaskProgress>({
     active: false,
     percent: 0,
@@ -1094,6 +1120,91 @@ export function App() {
       if (!silent) showResultNotice(t("配置文件"), result, { silentSuccess: true });
     }
     return result;
+  };
+
+  const refreshOfficialAccounts = async (silent = false) => {
+    const result = await run(() => call<OfficialAccountsResult>("list_official_accounts"));
+    if (result) {
+      setOfficialAccounts(result);
+      if (!silent) showResultNotice(t("官方账号"), result, { silentSuccess: true });
+    }
+    return result;
+  };
+
+  const saveCurrentOfficialAccount = async (label?: string) => {
+    if (officialAccountBusy) return;
+    setOfficialAccountBusy(true);
+    try {
+      const result = await run(() =>
+        call<OfficialAccountsResult>("save_current_official_account", {
+          request: { label: label?.trim() || null },
+        }),
+      );
+      if (result) {
+        setOfficialAccounts(result);
+        showNotice(t("保存官方账号"), result.message, result.status);
+      }
+    } finally {
+      setOfficialAccountBusy(false);
+    }
+  };
+
+  const switchOfficialAccount = async (accountId: string) => {
+    if (officialAccountBusy) return;
+    setOfficialAccountBusy(true);
+    try {
+      const result = await run(() =>
+        call<OfficialAccountSwitchResult>("switch_official_account", {
+          request: { accountId },
+        }),
+      );
+      if (result) {
+        setOfficialAccounts({
+          status: result.status,
+          message: result.message,
+          ...result.inventory,
+        });
+        showNotice(t("切换官方账号"), result.message, result.status);
+      }
+    } finally {
+      setOfficialAccountBusy(false);
+    }
+  };
+
+  const renameOfficialAccount = async (accountId: string, label: string) => {
+    if (officialAccountBusy) return;
+    setOfficialAccountBusy(true);
+    try {
+      const result = await run(() =>
+        call<OfficialAccountsResult>("rename_official_account", {
+          request: { accountId, label },
+        }),
+      );
+      if (result) {
+        setOfficialAccounts(result);
+        showNotice(t("重命名官方账号"), result.message, result.status);
+      }
+    } finally {
+      setOfficialAccountBusy(false);
+    }
+  };
+
+  const deleteOfficialAccount = async (accountId: string) => {
+    if (officialAccountBusy) return;
+    setOfficialAccountBusy(true);
+    try {
+      const result = await run(() =>
+        call<OfficialAccountsResult>("delete_official_account", {
+          request: { accountId },
+        }),
+      );
+      if (result) {
+        setOfficialAccounts(result);
+        showNotice(t("删除官方账号"), result.message, result.status);
+      }
+    } finally {
+      setOfficialAccountBusy(false);
+    }
   };
 
   const refreshEnvConflicts = async (silent = false) => {
@@ -1737,6 +1848,7 @@ export function App() {
       await refreshRelayFiles(true);
       await refreshEnvConflicts(true);
       await refreshCcsProviders(true);
+      await refreshOfficialAccounts(true);
     }
     if (next === "relayEnvironment") await refreshRelayEnvironment(true);
     if (next === "sessions") {
@@ -2755,6 +2867,11 @@ export function App() {
       },
       refreshRelay,
       refreshRelayFiles,
+      refreshOfficialAccounts,
+      saveCurrentOfficialAccount,
+      switchOfficialAccount,
+      renameOfficialAccount,
+      deleteOfficialAccount,
       refreshEnvConflicts,
       refreshRelayEnvironment,
       removeEnvConflicts,
@@ -2809,7 +2926,7 @@ export function App() {
       disableWatcher: () => watcherAction("disable_watcher"),
       toggleTheme: () => setTheme((current) => (current === "dark" ? "light" : "dark")),
     }),
-    [route, launchForm, settingsForm, settings, overview, removeOwnedData, update, updateInstallProgress.active, logs, diagnostics, theme, relayFiles, localSessions, zedRemoteProjects, selectedProviderSyncTarget, envConflicts, relayEnvironment, ccsProviders, dreamSkinLibrary, dreamSkinMarket, dreamSkinCommunity, selectedDreamSkinTheme, savedDreamSkinThemeDraft, dreamSkinThemeDraft, dreamSkinDraftDirty, pendingDreamSkinRestart],
+    [route, launchForm, settingsForm, settings, overview, removeOwnedData, update, updateInstallProgress.active, officialAccountBusy, logs, diagnostics, theme, relayFiles, localSessions, zedRemoteProjects, selectedProviderSyncTarget, envConflicts, relayEnvironment, ccsProviders, dreamSkinLibrary, dreamSkinMarket, dreamSkinCommunity, selectedDreamSkinTheme, savedDreamSkinThemeDraft, dreamSkinThemeDraft, dreamSkinDraftDirty, pendingDreamSkinRestart],
   );
   const hasUpdate = update?.updateAvailable === true;
 
@@ -2904,6 +3021,8 @@ export function App() {
               relayFiles={relayFiles}
               envConflicts={envConflicts}
               ccsProviders={ccsProviders}
+              officialAccounts={officialAccounts}
+              officialAccountBusy={officialAccountBusy}
               form={settingsForm}
               actions={actions}
             />
@@ -3113,6 +3232,11 @@ type Actions = {
   setLaunchMode: (launchMode: LaunchMode) => Promise<void>;
   refreshRelay: () => Promise<void>;
   refreshRelayFiles: () => Promise<RelayFilesResult | null>;
+  refreshOfficialAccounts: (silent?: boolean) => Promise<OfficialAccountsResult | null>;
+  saveCurrentOfficialAccount: (label?: string) => Promise<void>;
+  switchOfficialAccount: (accountId: string) => Promise<void>;
+  renameOfficialAccount: (accountId: string, label: string) => Promise<void>;
+  deleteOfficialAccount: (accountId: string) => Promise<void>;
   refreshEnvConflicts: (silent?: boolean) => Promise<EnvConflictsResult | null>;
   refreshRelayEnvironment: (silent?: boolean) => Promise<RelayEnvironmentResult | null>;
   removeEnvConflicts: (names: string[]) => Promise<void>;
@@ -3346,11 +3470,120 @@ function RelayEnvironmentScreen({ result, actions }: { result: RelayEnvironmentR
   );
 }
 
+function OfficialAccountsCard({
+  accounts,
+  busy,
+  actions,
+}: {
+  accounts: OfficialAccountsResult | null;
+  busy: boolean;
+  actions: Actions;
+}) {
+  const [label, setLabel] = useState("");
+  const items = accounts?.accounts ?? [];
+  return (
+    <Panel>
+      <CardHead
+        title={t("官方账号")}
+        detail={t("只切换 auth.json 官方登录凭据；不会修改供应商、config.toml 或混入 API Key")}
+      />
+      <CardContent>
+        <div className="official-account-current">
+          <ShieldCheck className="h-5 w-5" />
+          <div>
+            <strong>{t("当前官方登录")}</strong>
+            <span>{accounts?.currentAccountLabel || t("未检测到有效的 ChatGPT 官方登录")}</span>
+          </div>
+        </div>
+        <div className="official-account-save-row">
+          <Input
+            disabled={busy}
+            onChange={(event) => setLabel(event.currentTarget.value)}
+            placeholder={t("账号名称（可选）")}
+            value={label}
+          />
+          <Button
+            disabled={busy}
+            onClick={() => {
+              void actions.saveCurrentOfficialAccount(label);
+              setLabel("");
+            }}
+          >
+            <Save className="h-4 w-4" />
+            {t("保存当前账号")}
+          </Button>
+          <Button disabled={busy} onClick={() => void actions.refreshOfficialAccounts()} variant="secondary">
+            <RefreshCw className="h-4 w-4" />
+            {t("刷新")}
+          </Button>
+        </div>
+        <div className="official-account-note">
+          {t("切换后请手动重启 Codex。现有供应商配置和混入 API Key 将保持不变。")}
+        </div>
+        {items.length ? (
+          <div className="official-account-list">
+            {items.map((account) => (
+              <div className={`official-account-row ${account.active ? "active" : ""}`} key={account.id}>
+                <div className="official-account-summary">
+                  <strong>{account.label}</strong>
+                  <span>{account.accountHint || t("未解析到账号标识")}</span>
+                  <small>{tf("保存时间：{0}", [formatTime(account.updatedAt * 1000)])}</small>
+                </div>
+                <div className="official-account-actions">
+                  <Button
+                    disabled={busy || account.active}
+                    onClick={() => void actions.switchOfficialAccount(account.id)}
+                    size="sm"
+                    variant={account.active ? "secondary" : "default"}
+                  >
+                    <CheckCircle2 className="h-4 w-4" />
+                    {account.active ? t("当前使用") : t("切换")}
+                  </Button>
+                  <Button
+                    disabled={busy}
+                    onClick={() => {
+                      const next = window.prompt(t("输入新的账号名称"), account.label);
+                      if (next?.trim() && next.trim() !== account.label) {
+                        void actions.renameOfficialAccount(account.id, next.trim());
+                      }
+                    }}
+                    size="icon"
+                    title={t("重命名")}
+                    variant="ghost"
+                  >
+                    <Edit3 className="h-4 w-4" />
+                  </Button>
+                  <Button
+                    disabled={busy}
+                    onClick={() => {
+                      if (!window.confirm(tf("删除保存的官方账号“{0}”？当前 live 登录不会被删除。", [account.label]))) return;
+                      void actions.deleteOfficialAccount(account.id);
+                    }}
+                    size="icon"
+                    title={t("删除保存副本")}
+                    variant="ghost"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="empty">{t("尚未保存官方账号。请先在 Codex 中登录，然后保存当前账号。")}</div>
+        )}
+      </CardContent>
+    </Panel>
+  );
+}
+
 function RelayScreen({
   settings: _settings,
   relayFiles,
   envConflicts,
   ccsProviders,
+  officialAccounts,
+  officialAccountBusy,
   form,
   actions,
 }: {
@@ -3358,6 +3591,8 @@ function RelayScreen({
   relayFiles: RelayFilesResult | null;
   envConflicts: EnvConflictsResult | null;
   ccsProviders: CcsProvidersResult | null;
+  officialAccounts: OfficialAccountsResult | null;
+  officialAccountBusy: boolean;
   form: BackendSettings;
   actions: Actions;
 }) {
@@ -3428,6 +3663,11 @@ function RelayScreen({
 
   return (
     <>
+      <OfficialAccountsCard
+        accounts={officialAccounts}
+        busy={officialAccountBusy}
+        actions={actions}
+      />
       <Panel>
         <CardHead title={t("供应商列表")} detail={tf("{0} 个供应商配置；可拖动排序，点编辑进入详情", [normalized.relayProfiles.length])} />
         <CardContent>
