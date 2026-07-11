@@ -95,6 +95,69 @@ fn launcher_binary_embeds_codex_icon_resource() {
 }
 
 #[test]
+fn launcher_recovers_administrator_state_before_single_instance_activation() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let launcher_main = manifest_dir
+        .parent()
+        .and_then(std::path::Path::parent)
+        .unwrap()
+        .join("codex-plus-launcher/src/main.rs");
+    let source = std::fs::read_to_string(launcher_main).expect("read launcher main.rs");
+    let recovery = source
+        .find("prepare_administrator_mode_startup(&options).await?")
+        .unwrap();
+    let guard = source
+        .find("acquire_single_instance_guard(options.debug_port)?")
+        .unwrap();
+    assert!(recovery < guard);
+    let preparation = source
+        .split("async fn prepare_administrator_mode_startup")
+        .nth(1)
+        .unwrap()
+        .split("fn acquire_single_instance_guard")
+        .next()
+        .unwrap();
+    assert!(preparation.contains("if !settings.administrator_mode_enabled"));
+    assert!(preparation.contains("recover_stale_admin_mode"));
+    assert!(preparation.contains("codex-plus-admin-shim.exe"));
+    assert!(preparation.contains("administrator shim is missing"));
+}
+
+#[test]
+fn administrator_second_invocation_only_activates_existing_session() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let launcher_main = manifest_dir
+        .parent()
+        .and_then(std::path::Path::parent)
+        .unwrap()
+        .join("codex-plus-launcher/src/main.rs");
+    let source = std::fs::read_to_string(launcher_main).expect("read launcher main.rs");
+    assert!(source.contains("if settings.administrator_mode_enabled"));
+    assert!(source.contains("return activate_existing_administrator_session(options, &app_dir)"));
+    let admin_activation = source
+        .split("fn activate_existing_administrator_session")
+        .nth(1)
+        .unwrap()
+        .split("fn log_launcher_already_running")
+        .next()
+        .unwrap();
+    for forbidden in [
+        ".launch_codex(",
+        "start_helper(",
+        "ensure_injection(",
+        "start_bridge_watchdog(",
+        "start_administrator_mode(",
+    ] {
+        assert!(
+            !admin_activation.contains(forbidden),
+            "forbidden call: {forbidden}"
+        );
+    }
+    assert!(admin_activation.contains("find_codex_processes"));
+    assert!(admin_activation.contains("windows_activate_process_window"));
+}
+
+#[test]
 fn windows_binaries_request_administrator_privileges() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let manager_build =

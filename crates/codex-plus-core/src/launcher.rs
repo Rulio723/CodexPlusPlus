@@ -19,6 +19,8 @@ use tokio::sync::Mutex;
 use crate::settings::{BackendSettings, SettingsStore, normalize_codex_extra_args};
 use crate::status::{LaunchStatus, StatusStore};
 
+pub use crate::admin_mode::AdminModeLease;
+
 #[cfg(windows)]
 const POST_LAUNCH_COMPUTER_USE_GUARD_SECONDS: &[u64] = &[0, 5, 15, 30, 60, 120, 180, 240, 300];
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -105,6 +107,7 @@ pub struct LaunchHandle {
     pub launch: CodexLaunch,
     pub status_store: StatusStore,
     helper_started: bool,
+    administrator_mode: Arc<Mutex<Option<AdminModeLease>>>,
     hooks: Arc<dyn LaunchHooks>,
 }
 
@@ -123,10 +126,17 @@ impl std::fmt::Debug for LaunchHandle {
 
 impl LaunchHandle {
     pub async fn wait_for_codex_exit(&self) -> anyhow::Result<()> {
-        let result = self
+        let mut result = self
             .hooks
             .wait_for_codex_exit(&self.launch, self.debug_port)
             .await;
+        if let Some(lease) = self.administrator_mode.lock().await.take()
+            && let Err(error) = self.hooks.stop_administrator_mode(lease).await
+        {
+            if result.is_ok() {
+                result = Err(error);
+            }
+        }
         if self.helper_started {
             self.hooks.shutdown_helper(self.helper_port).await;
         }
@@ -165,6 +175,32 @@ pub trait LaunchHooks: Send + Sync {
         Ok(())
     }
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()>;
+    async fn start_administrator_mode(
+        &self,
+        settings: &BackendSettings,
+        app_dir: &Path,
+    ) -> anyhow::Result<Option<AdminModeLease>> {
+        if !settings.administrator_mode_enabled {
+            return Ok(None);
+        }
+        let current_exe = std::env::current_exe().context("administrator_mode:shim")?;
+        let shim_path = current_exe
+            .parent()
+            .context("administrator_mode:shim: launcher has no parent directory")?
+            .join("codex-plus-admin-shim.exe");
+        let runtime =
+            crate::admin_mode::AdminModeRuntime::start(crate::admin_mode::AdminModeConfig {
+                codex_home: &crate::codex_home::default_codex_home_dir(),
+                state_dir: &crate::paths::default_app_state_dir(),
+                app_dir,
+                shim_path: &shim_path,
+            })
+            .await?;
+        Ok(Some(AdminModeLease::new(runtime)))
+    }
+    async fn stop_administrator_mode(&self, lease: AdminModeLease) -> anyhow::Result<()> {
+        lease.shutdown().await.map(|_| ())
+    }
     async fn launch_codex(
         &self,
         app_dir: &Path,
@@ -281,6 +317,12 @@ where
     let mut helper_started = false;
     let mut launched = None;
     let mut keep_launched_on_error = false;
+    let mut administrator_lease = None;
+    let mut administrator_status = AdministratorModeStatus {
+        requested: settings.administrator_mode_enabled,
+        ..AdministratorModeStatus::default()
+    };
+    let mut administrator_start_failed = false;
 
     let result: anyhow::Result<LaunchHandle> = async {
         let home = crate::relay_config::default_codex_home_dir();
@@ -349,6 +391,50 @@ where
             helper_started = true;
         }
 
+        if settings.administrator_mode_enabled {
+            administrator_status.state = "starting".to_string();
+            let starting = launch_status_with_administrator_mode(
+                "starting",
+                "Administrator Mode is starting",
+                debug_port,
+                helper_port,
+                &app_dir,
+                administrator_status.clone(),
+            );
+            options.status_store.save_latest(&starting)?;
+            hooks.write_status("starting").await;
+            match hooks.start_administrator_mode(&settings, &app_dir).await {
+                Ok(Some(lease)) => {
+                    administrator_lease = Some(lease);
+                    administrator_status.state = "active".to_string();
+                    administrator_status.exec_elevated = true;
+                    administrator_status.computer_use_elevated = true;
+                    let active = launch_status_with_administrator_mode(
+                        "starting",
+                        "Administrator Mode is active; activating Codex",
+                        debug_port,
+                        helper_port,
+                        &app_dir,
+                        administrator_status.clone(),
+                    );
+                    options.status_store.save_latest(&active)?;
+                    hooks.write_status("active").await;
+                }
+                Ok(None) => {
+                    administrator_start_failed = true;
+                    administrator_status.state = "failed".to_string();
+                    administrator_status.error_component = Some("runtime".to_string());
+                    anyhow::bail!("administrator_mode:runtime: enabled startup returned no lease");
+                }
+                Err(error) => {
+                    administrator_start_failed = true;
+                    administrator_status.state = "failed".to_string();
+                    administrator_status.error_component = Some(admin_error_component(&error));
+                    return Err(error);
+                }
+            }
+        }
+
         let launch = hooks
             .launch_codex(&app_dir, debug_port, &settings, &settings.codex_extra_args)
             .await?;
@@ -373,12 +459,13 @@ where
                 .await;
                 hooks.start_bridge_watchdog(debug_port, helper_port).await?;
             } else {
-                let degraded = launch_status(
+                let degraded = launch_status_with_administrator_mode(
                     "running_degraded",
                     "Codex launched; Codex++ enhancements are still waiting for the page bridge.",
                     debug_port,
                     helper_port,
                     &app_dir,
+                    administrator_status.clone(),
                 );
                 options.status_store.save_latest(&degraded)?;
                 hooks.write_status("running_degraded").await;
@@ -387,12 +474,13 @@ where
         }
 
         if !settings.enhancements_enabled || !injection_degraded {
-            let status = launch_status(
+            let status = launch_status_with_administrator_mode(
                 "running",
                 "Codex++ launcher ready",
                 debug_port,
                 helper_port,
                 &app_dir,
+                administrator_status.clone(),
             );
             options.status_store.save_latest(&status)?;
             hooks.write_status("running").await;
@@ -405,6 +493,7 @@ where
             launch,
             status_store: status_store.clone(),
             helper_started,
+            administrator_mode: Arc::new(Mutex::new(administrator_lease.take())),
             hooks: Arc::clone(&hooks),
         })
     }
@@ -413,6 +502,15 @@ where
     match result {
         Ok(handle) => Ok(handle),
         Err(error) => {
+            if let Some(lease) = administrator_lease.take() {
+                let _ = hooks.stop_administrator_mode(lease).await;
+                if !administrator_start_failed {
+                    administrator_status.state = "failed".to_string();
+                    administrator_status.exec_elevated = false;
+                    administrator_status.computer_use_elevated = false;
+                    administrator_status.error_component = Some("activation".to_string());
+                }
+            }
             if helper_started {
                 hooks.shutdown_helper(helper_port).await;
             }
@@ -421,8 +519,21 @@ where
                     hooks.terminate_codex(launch).await;
                 }
             }
-            let message = error.to_string();
-            let failure = launch_status("failed", &message, debug_port, helper_port, &app_dir);
+            let message = if administrator_start_failed {
+                "Administrator Mode failed to start".to_string()
+            } else if administrator_status.error_component.as_deref() == Some("activation") {
+                "Administrator Mode activation failed".to_string()
+            } else {
+                error.to_string()
+            };
+            let failure = launch_status_with_administrator_mode(
+                "failed",
+                &message,
+                debug_port,
+                helper_port,
+                &app_dir,
+                administrator_status,
+            );
             let _ = status_store.save_latest(&failure);
             hooks.write_status("failed").await;
             Err(error)
@@ -3016,12 +3127,13 @@ async fn terminate_windows_process_id(process_id: u32) -> anyhow::Result<()> {
     anyhow::bail!("cannot terminate Windows process id {process_id} on this platform")
 }
 
-fn launch_status(
+fn launch_status_with_administrator_mode(
     status: &str,
     message: &str,
     debug_port: u16,
     helper_port: u16,
     app_dir: &Path,
+    administrator_mode: AdministratorModeStatus,
 ) -> LaunchStatus {
     LaunchStatus {
         status: status.to_string(),
@@ -3030,8 +3142,35 @@ fn launch_status(
         debug_port: Some(debug_port),
         helper_port: Some(helper_port),
         codex_app: Some(app_dir.to_string_lossy().to_string()),
-        administrator_mode: crate::status::AdministratorModeStatus::default(),
+        administrator_mode,
     }
+}
+
+fn admin_error_component(error: &anyhow::Error) -> String {
+    const COMPONENTS: &[&str] = &[
+        "recovery",
+        "identity",
+        "job",
+        "exec",
+        "computer_use",
+        "environment",
+        "shim",
+        "runtime",
+    ];
+    let chain = error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(":");
+    COMPONENTS
+        .iter()
+        .find(|component| {
+            chain.contains(&format!("administrator_mode:{component}"))
+                || chain.starts_with(&format!("{component}:"))
+        })
+        .copied()
+        .unwrap_or("runtime")
+        .to_string()
 }
 
 fn now_ms() -> u64 {

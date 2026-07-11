@@ -68,6 +68,7 @@ async fn launcher_main() -> Result<()> {
         hooks.shutdown_helper(options.helper_port).await;
         return Ok(());
     }
+    prepare_administrator_mode_startup(&options).await?;
     let Some(_guard) = acquire_single_instance_guard(options.debug_port)? else {
         activate_existing_codex_app(&options).await?;
         return Ok(());
@@ -78,6 +79,27 @@ async fn launcher_main() -> Result<()> {
     let hooks = LauncherHooks::default();
     let handle = launch_and_inject_with_hooks(options, &hooks).await?;
     handle.wait_for_codex_exit().await?;
+    Ok(())
+}
+
+async fn prepare_administrator_mode_startup(_options: &LaunchOptions) -> anyhow::Result<()> {
+    let settings = codex_plus_core::settings::SettingsStore::default().load()?;
+    if !settings.administrator_mode_enabled {
+        return Ok(());
+    }
+    codex_plus_core::admin_mode::recover_stale_admin_mode(
+        &codex_plus_core::codex_home::default_codex_home_dir(),
+        &codex_plus_core::paths::default_app_state_dir(),
+    )?;
+    let current_exe = std::env::current_exe().context("administrator_mode:shim")?;
+    let shim_path = current_exe
+        .parent()
+        .context("administrator_mode:shim: launcher has no parent directory")?
+        .join("codex-plus-admin-shim.exe");
+    anyhow::ensure!(
+        shim_path.is_file(),
+        "administrator_mode:shim: administrator shim is missing"
+    );
     Ok(())
 }
 
@@ -176,6 +198,9 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
             json!({"blocking_process_ids": blocking_process_ids}),
         );
     }
+    if settings.administrator_mode_enabled {
+        return activate_existing_administrator_session(options, &app_dir);
+    }
     let launch_result = hooks
         .launch_codex(
             &app_dir,
@@ -235,6 +260,33 @@ fn should_finalize_pending_remote_control_recovery(
     blocking_process_ids: &[u32],
 ) -> bool {
     has_pending_recovery && blocking_process_ids.is_empty()
+}
+
+fn activate_existing_administrator_session(
+    options: &LaunchOptions,
+    app_dir: &Path,
+) -> anyhow::Result<()> {
+    let process_ids = codex_plus_core::watcher::find_codex_processes();
+    let mut activated = false;
+    #[cfg(windows)]
+    {
+        for process_id in &process_ids {
+            if codex_plus_core::windows_activate_process_window(*process_id) {
+                activated = true;
+                break;
+            }
+        }
+    }
+    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+        "launcher.activate_existing_administrator_session",
+        json!({
+            "app_dir": app_dir.to_string_lossy(),
+            "debug_port": options.debug_port,
+            "process_ids": process_ids,
+            "activated": activated
+        }),
+    );
+    Ok(())
 }
 
 fn log_launcher_already_running(debug_port: u16) {
@@ -452,6 +504,21 @@ impl LaunchHooks for LauncherHooks {
 
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()> {
         self.core.start_helper(helper_port).await
+    }
+
+    async fn start_administrator_mode(
+        &self,
+        settings: &codex_plus_core::settings::BackendSettings,
+        app_dir: &Path,
+    ) -> anyhow::Result<Option<codex_plus_core::launcher::AdminModeLease>> {
+        self.core.start_administrator_mode(settings, app_dir).await
+    }
+
+    async fn stop_administrator_mode(
+        &self,
+        lease: codex_plus_core::launcher::AdminModeLease,
+    ) -> anyhow::Result<()> {
+        self.core.stop_administrator_mode(lease).await
     }
 
     async fn launch_codex(

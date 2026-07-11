@@ -7,8 +7,9 @@ use codex_plus_core::app_paths::{
     packaged_app_user_model_id, resolve_codex_app_dir_with_saved, user_data_candidates_from,
 };
 use codex_plus_core::launcher::{
-    CodexLaunch, DefaultLaunchHooks, LaunchHooks, LaunchOptions, MacosCleanupPolicy,
-    browser_identity_changed, build_codex_arguments, build_codex_arguments_for_settings,
+    AdminModeLease, CodexLaunch, DefaultLaunchHooks, LaunchHooks, LaunchOptions,
+    MacosCleanupPolicy, browser_identity_changed, build_codex_arguments,
+    build_codex_arguments_for_settings,
     build_codex_arguments_with_native_menu_inspector, build_codex_command,
     build_codex_command_with_native_menu_inspector, build_macos_cleanup_command,
     build_macos_open_command, build_macos_open_command_with_native_menu_inspector,
@@ -1689,6 +1690,187 @@ async fn default_provider_sync_enabled_fails_instead_of_silently_skipping() {
 }
 
 #[tokio::test]
+async fn administrator_mode_starts_before_codex_and_stops_after_wait() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut settings = BackendSettings::default();
+    settings.administrator_mode_enabled = true;
+    settings.enhancements_enabled = false;
+    let hooks = FakeHooks::new(events.clone()).with_settings(settings);
+
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(PathBuf::from("/Applications/Codex.app")),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store: StatusStore::new(tempfile::tempdir().unwrap().path().join("status.json")),
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+    handle.wait_for_codex_exit().await.unwrap();
+
+    let events = events.lock().unwrap();
+    let start = events
+        .iter()
+        .position(|event| event == "start-admin")
+        .unwrap();
+    let launch = events
+        .iter()
+        .position(|event| event.starts_with("launch:9229"))
+        .unwrap();
+    let wait = events
+        .iter()
+        .position(|event| event == "wait-codex")
+        .unwrap();
+    let stop = events
+        .iter()
+        .position(|event| event == "stop-admin")
+        .unwrap();
+    assert!(start < launch && launch < wait && wait < stop);
+}
+
+#[tokio::test]
+async fn administrator_mode_failure_never_launches_codex_and_is_secret_free() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let status_dir = tempfile::tempdir().unwrap();
+    let status_store = StatusStore::new(status_dir.path().join("status.json"));
+    let mut settings = BackendSettings::default();
+    settings.administrator_mode_enabled = true;
+    let hooks = FakeHooks::new(events.clone())
+        .with_settings(settings)
+        .with_admin_start_error("computer_use: secret-proof-must-not-leak");
+
+    let error = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(PathBuf::from("/Applications/Codex.app")),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store: status_store.clone(),
+        },
+        &hooks,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("computer_use"));
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.starts_with("launch:"))
+    );
+    let status = status_store.load_latest().unwrap().unwrap();
+    assert_eq!(status.administrator_mode.state, "failed");
+    assert_eq!(
+        status.administrator_mode.error_component.as_deref(),
+        Some("computer_use")
+    );
+    assert!(
+        !serde_json::to_string(&status)
+            .unwrap()
+            .contains("secret-proof")
+    );
+}
+
+#[tokio::test]
+async fn administrator_mode_stops_when_waiting_for_codex_errors() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut settings = BackendSettings::default();
+    settings.administrator_mode_enabled = true;
+    settings.enhancements_enabled = false;
+    let hooks = FakeHooks::new(events.clone())
+        .with_settings(settings)
+        .with_wait_error("wait failed");
+
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(PathBuf::from("/Applications/Codex.app")),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store: StatusStore::new(tempfile::tempdir().unwrap().path().join("status.json")),
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+    assert!(handle.wait_for_codex_exit().await.is_err());
+    assert!(events.lock().unwrap().contains(&"stop-admin".to_string()));
+}
+
+#[tokio::test]
+async fn administrator_mode_stops_when_official_activation_fails() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let status_dir = tempfile::tempdir().unwrap();
+    let status_store = StatusStore::new(status_dir.path().join("status.json"));
+    let mut settings = BackendSettings::default();
+    settings.administrator_mode_enabled = true;
+    let hooks = FakeHooks::new(events.clone())
+        .with_settings(settings)
+        .with_launch_error("activation failed with secret-proof-must-not-leak");
+
+    assert!(
+        launch_and_inject_with_hooks(
+            LaunchOptions {
+                app_dir: Some(PathBuf::from("/Applications/Codex.app")),
+                debug_port: 9229,
+                helper_port: 57321,
+                status_store: status_store.clone(),
+            },
+            &hooks,
+        )
+        .await
+        .is_err()
+    );
+    let events = events.lock().unwrap();
+    let launch = events
+        .iter()
+        .position(|event| event.starts_with("launch:"))
+        .unwrap();
+    let stop = events
+        .iter()
+        .position(|event| event == "stop-admin")
+        .unwrap();
+    assert!(launch < stop);
+    let status = status_store.load_latest().unwrap().unwrap();
+    assert_eq!(status.administrator_mode.state, "failed");
+    assert_eq!(
+        status.administrator_mode.error_component.as_deref(),
+        Some("activation")
+    );
+    assert!(!status.message.contains("secret-proof"));
+}
+
+#[tokio::test]
+async fn administrator_mode_disabled_never_touches_admin_hooks() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut settings = BackendSettings::default();
+    settings.administrator_mode_enabled = false;
+    settings.enhancements_enabled = false;
+    let hooks = FakeHooks::new(events.clone()).with_settings(settings);
+
+    launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(PathBuf::from("/Applications/Codex.app")),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store: StatusStore::new(tempfile::tempdir().unwrap().path().join("status.json")),
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.contains("admin"))
+    );
+}
+
+#[tokio::test]
 async fn launch_continues_when_plugin_marketplace_config_fails() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let hooks = FakeHooks::new(events.clone())
@@ -1777,6 +1959,8 @@ struct FakeHooks {
     provider_sync_unsupported: bool,
     plugin_marketplace_error: Option<String>,
     has_pending_remote_control_session_recoveries: bool,
+    admin_start_error: Option<String>,
+    wait_error: Option<String>,
 }
 
 impl FakeHooks {
@@ -1794,6 +1978,8 @@ impl FakeHooks {
             provider_sync_unsupported: false,
             plugin_marketplace_error: None,
             has_pending_remote_control_session_recoveries: false,
+            admin_start_error: None,
+            wait_error: None,
         }
     }
 
@@ -1829,6 +2015,16 @@ impl FakeHooks {
 
     fn with_pending_remote_control_session_recoveries(mut self) -> Self {
         self.has_pending_remote_control_session_recoveries = true;
+        self
+    }
+
+    fn with_admin_start_error(mut self, message: &str) -> Self {
+        self.admin_start_error = Some(message.to_string());
+        self
+    }
+
+    fn with_wait_error(mut self, message: &str) -> Self {
+        self.wait_error = Some(message.to_string());
         self
     }
 
@@ -1910,6 +2106,26 @@ impl LaunchHooks for FakeHooks {
         Ok(())
     }
 
+    async fn start_administrator_mode(
+        &self,
+        settings: &BackendSettings,
+        _app_dir: &Path,
+    ) -> anyhow::Result<Option<AdminModeLease>> {
+        if !settings.administrator_mode_enabled {
+            return Ok(None);
+        }
+        self.event("start-admin");
+        if let Some(message) = &self.admin_start_error {
+            anyhow::bail!(message.clone());
+        }
+        Ok(Some(AdminModeLease::testing()))
+    }
+
+    async fn stop_administrator_mode(&self, _lease: AdminModeLease) -> anyhow::Result<()> {
+        self.event("stop-admin");
+        Ok(())
+    }
+
     async fn launch_codex(
         &self,
         app_dir: &Path,
@@ -1973,6 +2189,9 @@ impl LaunchHooks for FakeHooks {
         _debug_port: u16,
     ) -> anyhow::Result<()> {
         self.event("wait-codex");
+        if let Some(message) = &self.wait_error {
+            anyhow::bail!(message.clone());
+        }
         Ok(())
     }
 
