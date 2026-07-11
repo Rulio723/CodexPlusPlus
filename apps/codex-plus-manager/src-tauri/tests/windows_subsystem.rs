@@ -210,6 +210,121 @@ fn windows_binaries_request_administrator_privileges() {
 }
 
 #[test]
+fn administrator_shim_manifest_stays_non_elevated() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let shim_manifest = manifest_dir
+        .parent()
+        .and_then(std::path::Path::parent)
+        .unwrap()
+        .join("codex-plus-admin-shim/windows-app-manifest.xml");
+    let shim_manifest =
+        std::fs::read_to_string(shim_manifest).expect("read administrator shim manifest");
+
+    assert!(
+        shim_manifest.contains(r#"<requestedExecutionLevel level="asInvoker" uiAccess="false" />"#)
+    );
+    assert!(!shim_manifest.contains("requireAdministrator"));
+}
+
+#[test]
+fn administrator_runtime_is_staged_with_fixed_executable_roles() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest_dir
+        .parent()
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::parent)
+        .unwrap();
+    let workspace = std::fs::read_to_string(root.join("Cargo.toml")).expect("read workspace");
+    let release = std::fs::read_to_string(root.join(".github/workflows/release-assets.yml"))
+        .expect("read release workflow");
+    let pr = std::fs::read_to_string(root.join(".github/workflows/pr-build.yml"))
+        .expect("read PR workflow");
+    let installer =
+        std::fs::read_to_string(root.join("scripts/installer/windows/CodexPlusPlus.nsi"))
+            .expect("read NSIS installer");
+    let launcher_build = std::fs::read_to_string(root.join("apps/codex-plus-launcher/build.rs"))
+        .expect("read launcher build script");
+    let launcher_manifest =
+        std::fs::read_to_string(root.join("apps/codex-plus-launcher/windows-app-manifest.xml"))
+            .expect("read launcher manifest");
+    let shim_build = std::fs::read_to_string(root.join("apps/codex-plus-admin-shim/build.rs"))
+        .expect("read shim build script");
+    let manager_manifest = std::fs::read_to_string(
+        root.join("apps/codex-plus-manager/src-tauri/windows-app-manifest.xml"),
+    )
+    .expect("read manager manifest");
+    let shim_manifest =
+        std::fs::read_to_string(root.join("apps/codex-plus-admin-shim/windows-app-manifest.xml"))
+            .expect("read shim manifest");
+    let launcher = std::fs::read_to_string(root.join("apps/codex-plus-launcher/src/main.rs"))
+        .expect("read launcher source");
+
+    assert!(workspace.contains("apps/codex-plus-admin-shim"));
+    for workflow in [&release, &pr] {
+        assert!(workflow.contains("cargo build --release"));
+        assert!(
+            workflow
+                .contains("Copy-Item target/release/codex-plus-admin-shim.exe dist/windows/app/")
+        );
+        assert!(workflow.contains("Remove-Item dist/windows/app -Recurse -Force"));
+        for binary in [
+            "codex-plus-plus.exe",
+            "codex-plus-plus-manager.exe",
+            "codex-plus-admin-shim.exe",
+        ] {
+            assert_eq!(
+                workflow
+                    .lines()
+                    .filter(
+                        |line| line.trim_start().starts_with("Copy-Item target/release/")
+                            && line.contains(binary)
+                    )
+                    .count(),
+                1,
+                "Windows staging must copy {binary} exactly once"
+            );
+        }
+    }
+
+    assert!(launcher_build.contains("windows-app-manifest.xml"));
+    assert!(!launcher_build.contains("codex-plus-manager/src-tauri/windows-app-manifest.xml"));
+    assert!(!launcher_build.contains("codex-plus-admin-shim"));
+    assert!(shim_build.contains("windows-app-manifest.xml"));
+    assert!(!shim_build.contains("codex-plus-launcher"));
+    assert!(!shim_build.contains("codex-plus-manager"));
+    assert!(launcher_manifest.contains("requireAdministrator"));
+    assert!(manager_manifest.contains("requireAdministrator"));
+    assert!(shim_manifest.contains("asInvoker"));
+    assert!(!shim_manifest.contains("requireAdministrator"));
+    assert!(launcher.contains("current_exe"));
+    assert!(launcher.contains(".join(\"codex-plus-admin-shim.exe\")"));
+
+    assert!(installer.contains("File \"${ROOT}\\dist\\windows\\app\\codex-plus-admin-shim.exe\""));
+    assert!(installer.contains("Delete \"$INSTDIR\\codex-plus-admin-shim.exe\""));
+    assert_eq!(
+        installer
+            .matches("taskkill /IM codex-plus-admin-shim.exe /F")
+            .count(),
+        2
+    );
+    let installer_executables = installer
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("File ") && line.ends_with(".exe\""))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        installer_executables,
+        [
+            "File \"${ROOT}\\dist\\windows\\app\\codex-plus-plus.exe\"",
+            "File \"${ROOT}\\dist\\windows\\app\\codex-plus-plus-manager.exe\"",
+            "File \"${ROOT}\\dist\\windows\\app\\codex-plus-admin-shim.exe\"",
+        ]
+    );
+    assert!(!installer.contains("auth.json"));
+    assert!(!installer.contains("environments.toml"));
+}
+
+#[test]
 fn windows_entrypoints_register_codexplusplus_url_protocol() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let windows_install = manifest_dir

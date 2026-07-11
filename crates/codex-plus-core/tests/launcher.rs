@@ -2194,6 +2194,13 @@ async fn administrator_mode_stops_when_official_activation_fails() {
 #[tokio::test]
 async fn administrator_mode_disabled_never_touches_admin_hooks() {
     let events = Arc::new(Mutex::new(Vec::new()));
+    let temp = tempfile::tempdir().unwrap();
+    let environments = temp.path().join("environments.toml");
+    let transport = temp.path().join("helper_transport.js");
+    let environments_before = b"default = 'official'\n";
+    let transport_before = b"export const transport = 'official';\n";
+    std::fs::write(&environments, environments_before).unwrap();
+    std::fs::write(&transport, transport_before).unwrap();
     let mut settings = BackendSettings::default();
     settings.administrator_mode_enabled = false;
     settings.enhancements_enabled = false;
@@ -2217,6 +2224,8 @@ async fn administrator_mode_disabled_never_touches_admin_hooks() {
             .iter()
             .any(|event| event.contains("admin"))
     );
+    assert_eq!(std::fs::read(environments).unwrap(), environments_before);
+    assert_eq!(std::fs::read(transport).unwrap(), transport_before);
 }
 
 #[tokio::test]
