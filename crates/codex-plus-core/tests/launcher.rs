@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use codex_plus_core::admin_mode::environment::{AdminEnvironmentSpec, AdminEnvironmentTransaction};
 use codex_plus_core::app_paths::{
     build_codex_executable, codex_app_version, find_latest_codex_app_dir,
     find_latest_codex_app_dir_from_roots, find_macos_codex_app, normalize_codex_app_path,
@@ -8,13 +10,13 @@ use codex_plus_core::app_paths::{
 };
 use codex_plus_core::launcher::{
     AdminModeLease, CodexLaunch, DefaultLaunchHooks, LaunchHooks, LaunchOptions,
-    MacosCleanupPolicy, browser_identity_changed, build_codex_arguments,
-    build_codex_arguments_for_settings,
+    MacosCleanupPolicy, activate_existing_administrator_session_with, browser_identity_changed,
+    build_codex_arguments, build_codex_arguments_for_settings,
     build_codex_arguments_with_native_menu_inspector, build_codex_command,
     build_codex_command_with_native_menu_inspector, build_macos_cleanup_command,
-    build_macos_open_command, build_macos_open_command_with_native_menu_inspector,
-    build_packaged_activation, build_packaged_activation_with_native_menu_inspector,
-    launch_and_inject_with_hooks,
+    build_macos_open_command,
+    build_macos_open_command_with_native_menu_inspector, build_packaged_activation,
+    build_packaged_activation_with_native_menu_inspector, launch_and_inject_with_hooks,
 };
 #[cfg(windows)]
 use codex_plus_core::launcher::{WindowsProcessControlStrategy, windows_process_control_strategy};
@@ -25,6 +27,7 @@ use codex_plus_core::settings::{
     BackendSettings, RelayMode, RelayModelRoute, RelayProfile, RelayProtocol,
 };
 use codex_plus_core::status::StatusStore;
+use tokio::sync::Notify;
 
 #[test]
 fn browser_identity_change_requires_two_distinct_observations() {
@@ -1692,6 +1695,8 @@ async fn default_provider_sync_enabled_fails_instead_of_silently_skipping() {
 #[tokio::test]
 async fn administrator_mode_starts_before_codex_and_stops_after_wait() {
     let events = Arc::new(Mutex::new(Vec::new()));
+    let status_dir = tempfile::tempdir().unwrap();
+    let status_store = StatusStore::new(status_dir.path().join("status.json"));
     let mut settings = BackendSettings::default();
     settings.administrator_mode_enabled = true;
     settings.enhancements_enabled = false;
@@ -1702,7 +1707,7 @@ async fn administrator_mode_starts_before_codex_and_stops_after_wait() {
             app_dir: Some(PathBuf::from("/Applications/Codex.app")),
             debug_port: 9229,
             helper_port: 57321,
-            status_store: StatusStore::new(tempfile::tempdir().unwrap().path().join("status.json")),
+            status_store: status_store.clone(),
         },
         &hooks,
     )
@@ -1728,6 +1733,12 @@ async fn administrator_mode_starts_before_codex_and_stops_after_wait() {
         .position(|event| event == "stop-admin")
         .unwrap();
     assert!(start < launch && launch < wait && wait < stop);
+    let status = status_store.load_latest().unwrap().unwrap();
+    assert_eq!(status.status, "stopped");
+    assert_eq!(status.administrator_mode.state, "stopped");
+    assert!(!status.administrator_mode.exec_elevated);
+    assert!(!status.administrator_mode.computer_use_elevated);
+    assert_eq!(status.administrator_mode.error_component, None);
 }
 
 #[tokio::test]
@@ -1777,19 +1788,21 @@ async fn administrator_mode_failure_never_launches_codex_and_is_secret_free() {
 #[tokio::test]
 async fn administrator_mode_stops_when_waiting_for_codex_errors() {
     let events = Arc::new(Mutex::new(Vec::new()));
+    let status_dir = tempfile::tempdir().unwrap();
+    let status_store = StatusStore::new(status_dir.path().join("status.json"));
     let mut settings = BackendSettings::default();
     settings.administrator_mode_enabled = true;
     settings.enhancements_enabled = false;
     let hooks = FakeHooks::new(events.clone())
         .with_settings(settings)
-        .with_wait_error("wait failed");
+        .with_wait_error("wait failed with secret-wait-must-not-leak");
 
     let handle = launch_and_inject_with_hooks(
         LaunchOptions {
             app_dir: Some(PathBuf::from("/Applications/Codex.app")),
             debug_port: 9229,
             helper_port: 57321,
-            status_store: StatusStore::new(tempfile::tempdir().unwrap().path().join("status.json")),
+            status_store: status_store.clone(),
         },
         &hooks,
     )
@@ -1797,6 +1810,342 @@ async fn administrator_mode_stops_when_waiting_for_codex_errors() {
     .unwrap();
     assert!(handle.wait_for_codex_exit().await.is_err());
     assert!(events.lock().unwrap().contains(&"stop-admin".to_string()));
+    let status = status_store.load_latest().unwrap().unwrap();
+    assert_eq!(status.status, "failed");
+    assert_eq!(status.administrator_mode.state, "failed");
+    assert_eq!(
+        status.administrator_mode.error_component.as_deref(),
+        Some("codex_wait")
+    );
+    assert!(!status.administrator_mode.exec_elevated);
+    assert!(!status.administrator_mode.computer_use_elevated);
+    assert!(!status.message.contains("secret-wait"));
+}
+
+#[tokio::test]
+async fn administrator_mode_cleanup_error_is_reported_and_secret_free() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let status_dir = tempfile::tempdir().unwrap();
+    let status_store = StatusStore::new(status_dir.path().join("status.json"));
+    let mut settings = BackendSettings::default();
+    settings.administrator_mode_enabled = true;
+    settings.enhancements_enabled = false;
+    let hooks = FakeHooks::new(events)
+        .with_settings(settings)
+        .with_admin_stop_error("cleanup failed with secret-cleanup-must-not-leak");
+
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(PathBuf::from("/Applications/Codex.app")),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store: status_store.clone(),
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+    let error = handle.wait_for_codex_exit().await.unwrap_err();
+
+    assert!(error.to_string().contains("secret-cleanup"));
+    let status = status_store.load_latest().unwrap().unwrap();
+    assert_eq!(status.status, "failed");
+    assert_eq!(status.administrator_mode.state, "failed");
+    assert_eq!(
+        status.administrator_mode.error_component.as_deref(),
+        Some("cleanup")
+    );
+    assert!(!status.administrator_mode.exec_elevated);
+    assert!(!status.administrator_mode.computer_use_elevated);
+    assert!(!status.message.contains("secret-cleanup"));
+}
+
+#[tokio::test]
+async fn administrator_mode_cleanup_task_failure_is_persisted() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let status_dir = tempfile::tempdir().unwrap();
+    let status_store = StatusStore::new(status_dir.path().join("status.json"));
+    let mut settings = BackendSettings::default();
+    settings.administrator_mode_enabled = true;
+    settings.enhancements_enabled = false;
+    let hooks = FakeHooks::new(events)
+        .with_settings(settings)
+        .with_admin_stop_abort();
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(PathBuf::from("/Applications/Codex.app")),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store: status_store.clone(),
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+
+    assert!(handle.wait_for_codex_exit().await.is_err());
+    let status = status_store.load_latest().unwrap().unwrap();
+    assert_eq!(status.status, "failed");
+    assert_eq!(
+        status.administrator_mode.error_component.as_deref(),
+        Some("cleanup")
+    );
+    assert!(!status.message.contains("secret-cleanup-task"));
+}
+
+#[tokio::test]
+async fn administrator_mode_wait_and_cleanup_errors_are_combined() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let status_dir = tempfile::tempdir().unwrap();
+    let status_store = StatusStore::new(status_dir.path().join("status.json"));
+    let mut settings = BackendSettings::default();
+    settings.administrator_mode_enabled = true;
+    settings.enhancements_enabled = false;
+    let hooks = FakeHooks::new(events)
+        .with_settings(settings)
+        .with_wait_error("secret-wait-error")
+        .with_admin_stop_error("secret-cleanup-error");
+
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(PathBuf::from("/Applications/Codex.app")),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store: status_store.clone(),
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+    let error = handle.wait_for_codex_exit().await.unwrap_err().to_string();
+
+    assert!(error.contains("secret-wait-error"));
+    assert!(error.contains("secret-cleanup-error"));
+    let status = status_store.load_latest().unwrap().unwrap();
+    assert_eq!(
+        status.administrator_mode.error_component.as_deref(),
+        Some("cleanup")
+    );
+    assert!(!status.message.contains("secret-wait"));
+    assert!(!status.message.contains("secret-cleanup"));
+}
+
+#[tokio::test]
+async fn dropping_launch_handle_restores_administrator_environment() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let temp = tempfile::tempdir().unwrap();
+    let original = b"[user]\nvalue = 'preserve me'\n";
+    let (lease, environment_path) = administrator_environment_lease(&temp, original);
+    let mut settings = BackendSettings::default();
+    settings.administrator_mode_enabled = true;
+    settings.enhancements_enabled = false;
+    let hooks = FakeHooks::new(events)
+        .with_settings(settings)
+        .with_admin_lease(lease);
+
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(PathBuf::from("/Applications/Codex.app")),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store: StatusStore::new(temp.path().join("status.json")),
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+    assert_ne!(std::fs::read(&environment_path).unwrap(), original);
+
+    drop(handle);
+
+    assert_eq!(std::fs::read(environment_path).unwrap(), original);
+}
+
+#[tokio::test]
+async fn cancelling_wait_during_cleanup_still_restores_environment() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let temp = tempfile::tempdir().unwrap();
+    let original = b"original environment\n";
+    let (lease, environment_path) = administrator_environment_lease(&temp, original);
+    let cleanup_started = Arc::new(Notify::new());
+    let cleanup_release = Arc::new(Notify::new());
+    let mut settings = BackendSettings::default();
+    settings.administrator_mode_enabled = true;
+    settings.enhancements_enabled = false;
+    let hooks = FakeHooks::new(events)
+        .with_settings(settings)
+        .with_admin_lease(lease)
+        .with_admin_stop_gate(cleanup_started.clone(), cleanup_release.clone());
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(PathBuf::from("/Applications/Codex.app")),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store: StatusStore::new(temp.path().join("status.json")),
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+
+    let wait = handle.wait_for_codex_exit();
+    tokio::pin!(wait);
+    tokio::select! {
+        _ = cleanup_started.notified() => {}
+        result = &mut wait => panic!("wait completed before cleanup gate: {result:?}"),
+    }
+    drop(wait);
+    cleanup_release.notify_one();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if std::fs::read(&environment_path).unwrap() == original {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached cleanup task must finish after wait cancellation");
+}
+
+#[tokio::test]
+async fn concurrent_waits_start_exactly_one_administrator_cleanup() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let temp = tempfile::tempdir().unwrap();
+    let original = b"original environment\n";
+    let (lease, environment_path) = administrator_environment_lease(&temp, original);
+    let mut settings = BackendSettings::default();
+    settings.administrator_mode_enabled = true;
+    settings.enhancements_enabled = false;
+    let hooks = FakeHooks::new(events.clone())
+        .with_settings(settings)
+        .with_admin_lease(lease);
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(PathBuf::from("/Applications/Codex.app")),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store: StatusStore::new(temp.path().join("status.json")),
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+
+    let (first, second) = tokio::join!(handle.wait_for_codex_exit(), handle.wait_for_codex_exit());
+
+    first.unwrap();
+    second.unwrap();
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.as_str() == "stop-admin")
+            .count(),
+        1
+    );
+    assert_eq!(std::fs::read(environment_path).unwrap(), original);
+}
+
+fn administrator_environment_lease(
+    temp: &tempfile::TempDir,
+    original: &[u8],
+) -> (AdminModeLease, PathBuf) {
+    let codex_home = temp.path().join("codex-home");
+    let state_dir = temp.path().join("state");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let environment_path = codex_home.join("environments.toml");
+    std::fs::write(&environment_path, original).unwrap();
+    let shim_path = temp.path().join("codex-plus-admin-shim.exe");
+    let proof_path = state_dir.join("administrator-mode-computer-use.v1.proof");
+    let transaction = AdminEnvironmentTransaction::install(
+        &codex_home,
+        &state_dir,
+        &AdminEnvironmentSpec {
+            shim_path: &shim_path,
+            pipe_name: r"\\.\pipe\codex-plus-admin-test",
+            session_id: "test-session",
+            proof_path: &proof_path,
+        },
+    )
+    .unwrap();
+    (
+        AdminModeLease::testing_with_environment(transaction),
+        environment_path,
+    )
+}
+
+#[tokio::test]
+async fn administrator_existing_window_polling_activates_a_delayed_process() {
+    let mut polls = 0;
+    let mut waits = 0;
+
+    let process_id = activate_existing_administrator_session_with(
+        4,
+        || {
+            polls += 1;
+            if polls < 3 { Vec::new() } else { vec![42] }
+        },
+        |process_id| process_id == 42,
+        || {
+            waits += 1;
+            std::future::ready(())
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(process_id, 42);
+    assert_eq!(polls, 3);
+    assert_eq!(waits, 2);
+}
+
+#[tokio::test]
+async fn administrator_existing_window_polling_retries_failed_activation() {
+    let mut activations = 0;
+
+    let process_id = activate_existing_administrator_session_with(
+        3,
+        || vec![42],
+        |_| {
+            activations += 1;
+            activations == 3
+        },
+        || std::future::ready(()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(process_id, 42);
+    assert_eq!(activations, 3);
+}
+
+#[tokio::test]
+async fn administrator_existing_window_polling_times_out_without_a_window() {
+    let mut polls = 0;
+    let mut waits = 0;
+
+    let error = activate_existing_administrator_session_with(
+        3,
+        || {
+            polls += 1;
+            Vec::new()
+        },
+        |_| false,
+        || {
+            waits += 1;
+            std::future::ready(())
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("before deadline"));
+    assert_eq!(polls, 3);
+    assert_eq!(waits, 2);
 }
 
 #[tokio::test]
@@ -1960,6 +2309,11 @@ struct FakeHooks {
     plugin_marketplace_error: Option<String>,
     has_pending_remote_control_session_recoveries: bool,
     admin_start_error: Option<String>,
+    admin_stop_error: Option<String>,
+    admin_stop_abort: bool,
+    admin_lease: Arc<Mutex<Option<AdminModeLease>>>,
+    admin_stop_started: Option<Arc<Notify>>,
+    admin_stop_release: Option<Arc<Notify>>,
     wait_error: Option<String>,
 }
 
@@ -1979,6 +2333,11 @@ impl FakeHooks {
             plugin_marketplace_error: None,
             has_pending_remote_control_session_recoveries: false,
             admin_start_error: None,
+            admin_stop_error: None,
+            admin_stop_abort: false,
+            admin_lease: Arc::new(Mutex::new(None)),
+            admin_stop_started: None,
+            admin_stop_release: None,
             wait_error: None,
         }
     }
@@ -2025,6 +2384,27 @@ impl FakeHooks {
 
     fn with_wait_error(mut self, message: &str) -> Self {
         self.wait_error = Some(message.to_string());
+        self
+    }
+
+    fn with_admin_stop_error(mut self, message: &str) -> Self {
+        self.admin_stop_error = Some(message.to_string());
+        self
+    }
+
+    fn with_admin_stop_abort(mut self) -> Self {
+        self.admin_stop_abort = true;
+        self
+    }
+
+    fn with_admin_lease(self, lease: AdminModeLease) -> Self {
+        *self.admin_lease.lock().unwrap() = Some(lease);
+        self
+    }
+
+    fn with_admin_stop_gate(mut self, started: Arc<Notify>, release: Arc<Notify>) -> Self {
+        self.admin_stop_started = Some(started);
+        self.admin_stop_release = Some(release);
         self
     }
 
@@ -2118,12 +2498,42 @@ impl LaunchHooks for FakeHooks {
         if let Some(message) = &self.admin_start_error {
             anyhow::bail!(message.clone());
         }
-        Ok(Some(AdminModeLease::testing()))
+        Ok(Some(
+            self.admin_lease
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(AdminModeLease::testing),
+        ))
     }
 
-    async fn stop_administrator_mode(&self, _lease: AdminModeLease) -> anyhow::Result<()> {
-        self.event("stop-admin");
-        Ok(())
+    fn stop_administrator_mode(
+        &self,
+        lease: AdminModeLease,
+    ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        let events = Arc::clone(&self.events);
+        let error = self.admin_stop_error.clone();
+        let abort = self.admin_stop_abort;
+        let started = self.admin_stop_started.clone();
+        let release = self.admin_stop_release.clone();
+        let task = tokio::spawn(async move {
+            events.lock().unwrap().push("stop-admin".to_string());
+            if let Some(started) = started {
+                started.notify_one();
+            }
+            if let Some(release) = release {
+                release.notified().await;
+            }
+            let cleanup = lease.shutdown().await.map(|_| ());
+            if let Some(message) = error {
+                anyhow::bail!(message);
+            }
+            cleanup
+        });
+        if abort {
+            task.abort();
+        }
+        task
     }
 
     async fn launch_codex(

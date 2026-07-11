@@ -126,21 +126,81 @@ impl std::fmt::Debug for LaunchHandle {
 
 impl LaunchHandle {
     pub async fn wait_for_codex_exit(&self) -> anyhow::Result<()> {
-        let mut result = self
+        let wait_result = self
             .hooks
             .wait_for_codex_exit(&self.launch, self.debug_port)
             .await;
-        if let Some(lease) = self.administrator_mode.lock().await.take()
-            && let Err(error) = self.hooks.stop_administrator_mode(lease).await
-        {
-            if result.is_ok() {
-                result = Err(error);
-            }
-        }
+        let cleanup_task = self
+            .administrator_mode
+            .lock()
+            .await
+            .take()
+            .map(|lease| self.hooks.stop_administrator_mode(lease));
+        let owns_cleanup = cleanup_task.is_some();
+        let cleanup_result = match cleanup_task {
+            Some(task) => match task.await {
+                Ok(result) => result,
+                Err(error) => Err(anyhow::Error::new(error)
+                    .context("Administrator Mode cleanup task failed to complete")),
+            },
+            None => Ok(()),
+        };
         if self.helper_started {
             self.hooks.shutdown_helper(self.helper_port).await;
         }
-        result
+        if owns_cleanup {
+            let (status, message, state, error_component) =
+                match (wait_result.is_err(), cleanup_result.is_err()) {
+                    (false, false) => (
+                        "stopped",
+                        "Codex exited; Administrator Mode stopped",
+                        "stopped",
+                        None,
+                    ),
+                    (true, false) => (
+                        "failed",
+                        "Codex wait failed; Administrator Mode stopped",
+                        "failed",
+                        Some("codex_wait".to_string()),
+                    ),
+                    (false, true) => (
+                        "failed",
+                        "Administrator Mode cleanup failed",
+                        "failed",
+                        Some("cleanup".to_string()),
+                    ),
+                    (true, true) => (
+                        "failed",
+                        "Codex wait and Administrator Mode cleanup failed",
+                        "failed",
+                        Some("cleanup".to_string()),
+                    ),
+                };
+            let final_status = launch_status_with_administrator_mode(
+                status,
+                message,
+                self.debug_port,
+                self.helper_port,
+                &self.app_dir,
+                AdministratorModeStatus {
+                    requested: true,
+                    state: state.to_string(),
+                    exec_elevated: false,
+                    computer_use_elevated: false,
+                    error_component,
+                },
+            );
+            self.status_store.save_latest(&final_status)?;
+            self.hooks.write_status(status).await;
+        }
+        match (wait_result, cleanup_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(wait), Ok(())) => Err(wait),
+            (Ok(()), Err(cleanup)) => Err(cleanup),
+            (Err(wait), Err(cleanup)) => Err(anyhow::anyhow!(
+                "Codex wait failed: {wait:#}; Administrator Mode cleanup failed: {cleanup:#}"
+            )),
+        }
     }
 }
 
@@ -198,8 +258,11 @@ pub trait LaunchHooks: Send + Sync {
             .await?;
         Ok(Some(AdminModeLease::new(runtime)))
     }
-    async fn stop_administrator_mode(&self, lease: AdminModeLease) -> anyhow::Result<()> {
-        lease.shutdown().await.map(|_| ())
+    fn stop_administrator_mode(
+        &self,
+        lease: AdminModeLease,
+    ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        tokio::spawn(async move { lease.shutdown().await.map(|_| ()) })
     }
     async fn launch_codex(
         &self,
@@ -299,6 +362,33 @@ struct ComputerUseGuardWatchdogRuntime {
 
 pub async fn launch_and_inject(options: LaunchOptions) -> anyhow::Result<LaunchHandle> {
     launch_and_inject_with_hooks(options, DefaultLaunchHooks::shared()).await
+}
+
+pub async fn activate_existing_administrator_session_with<Find, Activate, Wait, WaitFuture>(
+    max_attempts: usize,
+    mut find_processes: Find,
+    mut activate_window: Activate,
+    mut wait: Wait,
+) -> anyhow::Result<u32>
+where
+    Find: FnMut() -> Vec<u32>,
+    Activate: FnMut(u32) -> bool,
+    Wait: FnMut() -> WaitFuture,
+    WaitFuture: Future<Output = ()>,
+{
+    for attempt in 0..max_attempts {
+        for process_id in find_processes() {
+            if activate_window(process_id) {
+                return Ok(process_id);
+            }
+        }
+        if attempt + 1 < max_attempts {
+            wait().await;
+        }
+    }
+    anyhow::bail!(
+        "administrator_mode:activation: existing Codex window was not available before deadline"
+    )
 }
 
 pub async fn launch_and_inject_with_hooks<H>(

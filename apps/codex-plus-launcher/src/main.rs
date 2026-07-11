@@ -10,6 +10,7 @@ use codex_plus_core::user_scripts::UserScriptManager;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Clone)]
 struct LauncherHooks {
@@ -199,7 +200,7 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
         );
     }
     if settings.administrator_mode_enabled {
-        return activate_existing_administrator_session(options, &app_dir);
+        return activate_existing_administrator_session(options, &app_dir).await;
     }
     let launch_result = hooks
         .launch_codex(
@@ -262,28 +263,35 @@ fn should_finalize_pending_remote_control_recovery(
     has_pending_recovery && blocking_process_ids.is_empty()
 }
 
-fn activate_existing_administrator_session(
+async fn activate_existing_administrator_session(
     options: &LaunchOptions,
     app_dir: &Path,
 ) -> anyhow::Result<()> {
-    let process_ids = codex_plus_core::watcher::find_codex_processes();
-    let mut activated = false;
-    #[cfg(windows)]
-    {
-        for process_id in &process_ids {
-            if codex_plus_core::windows_activate_process_window(*process_id) {
-                activated = true;
-                break;
-            }
-        }
-    }
+    let activated_process_id =
+        codex_plus_core::launcher::activate_existing_administrator_session_with(
+            101,
+            codex_plus_core::watcher::find_codex_processes,
+            |process_id| {
+                #[cfg(windows)]
+                {
+                    codex_plus_core::windows_activate_process_window(process_id)
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = process_id;
+                    false
+                }
+            },
+            || tokio::time::sleep(Duration::from_millis(100)),
+        )
+        .await?;
     let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
         "launcher.activate_existing_administrator_session",
         json!({
             "app_dir": app_dir.to_string_lossy(),
             "debug_port": options.debug_port,
-            "process_ids": process_ids,
-            "activated": activated
+            "process_id": activated_process_id,
+            "activated": true
         }),
     );
     Ok(())
@@ -514,11 +522,11 @@ impl LaunchHooks for LauncherHooks {
         self.core.start_administrator_mode(settings, app_dir).await
     }
 
-    async fn stop_administrator_mode(
+    fn stop_administrator_mode(
         &self,
         lease: codex_plus_core::launcher::AdminModeLease,
-    ) -> anyhow::Result<()> {
-        self.core.stop_administrator_mode(lease).await
+    ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        self.core.stop_administrator_mode(lease)
     }
 
     async fn launch_codex(

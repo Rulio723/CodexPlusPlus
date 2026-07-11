@@ -155,6 +155,29 @@ fn administrator_second_invocation_only_activates_existing_session() {
     }
     assert!(admin_activation.contains("find_codex_processes"));
     assert!(admin_activation.contains("windows_activate_process_window"));
+    assert!(admin_activation.contains("activate_existing_administrator_session_with"));
+    assert!(admin_activation.contains("101"));
+    assert!(admin_activation.contains("Duration::from_millis(100)"));
+    assert!(admin_activation.contains(".await?"));
+    assert!(admin_activation.contains("\"activated\": true"));
+
+    let core_launcher = manifest_dir
+        .parent()
+        .and_then(std::path::Path::parent)
+        .unwrap()
+        .join("../crates/codex-plus-core/src/launcher.rs");
+    let core_source = std::fs::read_to_string(core_launcher).expect("read core launcher.rs");
+    let polling = core_source
+        .split("pub async fn activate_existing_administrator_session_with")
+        .nth(1)
+        .unwrap()
+        .split("pub async fn launch_and_inject_with_hooks")
+        .next()
+        .unwrap();
+    assert!(polling.contains("for attempt in 0..max_attempts"));
+    assert!(polling.contains("if activate_window(process_id)"));
+    assert!(polling.contains("wait().await"));
+    assert!(polling.contains("before deadline"));
 }
 
 #[test]
