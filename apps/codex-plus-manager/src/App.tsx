@@ -147,6 +147,14 @@ type PathState = {
   path: string | null;
 };
 
+type AdministratorModeStatus = {
+  requested: boolean;
+  state: "off" | "starting" | "active" | "failed" | string;
+  execElevated: boolean;
+  computerUseElevated: boolean;
+  errorComponent: string | null;
+};
+
 type LaunchStatus = {
   status: string;
   message: string;
@@ -154,6 +162,7 @@ type LaunchStatus = {
   debug_port: number | null;
   helper_port: number | null;
   codex_app: string | null;
+  administrator_mode: AdministratorModeStatus;
 };
 
 type OverviewResult = CommandResult<{
@@ -2960,6 +2969,8 @@ export function App() {
               overview={overview}
               watcher={watcher}
               settings={settings}
+              form={settingsForm}
+              onFormChange={setSettingsForm}
               launchForm={launchForm}
               onLaunchFormChange={setLaunchForm}
               removeOwnedData={removeOwnedData}
@@ -5202,6 +5213,8 @@ function MaintenanceScreen({
   overview,
   watcher,
   settings,
+  form,
+  onFormChange,
   launchForm,
   onLaunchFormChange,
   removeOwnedData,
@@ -5211,6 +5224,8 @@ function MaintenanceScreen({
   overview: OverviewResult | null;
   watcher: WatcherResult | null;
   settings: SettingsResult | null;
+  form: BackendSettings;
+  onFormChange: (value: BackendSettings) => void;
   launchForm: { appPath: string; debugPort: string; helperPort: string };
   onLaunchFormChange: (next: { appPath: string; debugPort: string; helperPort: string }) => void;
   removeOwnedData: boolean;
@@ -5220,6 +5235,29 @@ function MaintenanceScreen({
   const savedCodexAppPath = settings?.settings.codexAppPath ?? "";
   return (
     <>
+      <Panel>
+        <CardHead
+          title={t("管理员模式")}
+          detail={t("通过 Codex++ 启动时，同时为终端、Agent 命令和 Computer Use 提供管理员能力。启动失败时不会回退到普通权限。")}
+        />
+        <CardContent>
+          <label className="administrator-mode-switch">
+            <input
+              checked={form.administratorModeEnabled}
+              onChange={(event) => onFormChange({ ...form, administratorModeEnabled: event.currentTarget.checked })}
+              type="checkbox"
+            />
+            <span>
+              <strong>{t("开启管理员模式")}</strong>
+              <small>{t("设置会在下一次通过 codex-plus-plus.exe 启动 Codex 时生效。")}</small>
+            </span>
+          </label>
+          <AdministratorModeCapabilities status={overview?.latest_launch?.administrator_mode ?? null} />
+          <Toolbar>
+            <Button onClick={() => void actions.saveSettings()}>{t("保存管理员模式")}</Button>
+          </Toolbar>
+        </CardContent>
+      </Panel>
       <Panel>
         <CardHead title={t("检查与修复")} detail={t("检查入口、Codex 应用和 Watcher 状态")} />
         <CardContent>
@@ -5315,6 +5353,78 @@ function MaintenanceScreen({
       </Panel>
     </>
   );
+}
+
+function AdministratorModeCapabilities({ status }: { status: AdministratorModeStatus | null }) {
+  const state: "off" | "starting" | "active" | "failed" = status?.state === "starting" || status?.state === "active" || status?.state === "failed"
+    ? status.state
+    : "off";
+  const stateLabel = {
+    off: t("关闭"),
+    starting: t("启动中"),
+    active: t("已启用"),
+    failed: t("启动失败"),
+  }[state];
+
+  return (
+    <div className={`administrator-mode-status ${state}`}>
+      <div className="administrator-mode-status-head">
+        <strong>{t("管理员能力状态")}</strong>
+        <span className="administrator-mode-state">{stateLabel}</span>
+      </div>
+      {state === "off" ? <p>{t("当前 Codex 会话使用官方普通权限行为。")}</p> : null}
+      {state === "starting" ? <p>{t("正在验证管理员命令执行与管理员 Computer Use。")}</p> : null}
+      {state === "active" ? (
+        <div className="administrator-mode-capabilities">
+          <span className={status?.execElevated ? "verified" : ""}>
+            <CheckCircle2 className="h-4 w-4" />
+            {t("管理员命令执行")}
+          </span>
+          <span className={status?.computerUseElevated ? "verified" : ""}>
+            <CheckCircle2 className="h-4 w-4" />
+            {t("管理员 Computer Use")}
+          </span>
+        </div>
+      ) : null}
+      {state === "failed" ? (
+        <div className="administrator-mode-error" role="alert">
+          <strong>{administratorModeErrorText(status?.errorComponent)}</strong>
+          <span>{t("请从 codex-plus-plus.exe 重新启动 Codex；管理员模式不会回退到普通权限。")}</span>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function administratorModeErrorText(component: string | null | undefined) {
+  switch (component) {
+    case "exec":
+    case "admin_exec_readiness":
+      return t("管理员命令执行服务未通过安全检查。")
+    case "computer_use":
+    case "computer_use_admin":
+    case "computer_use_contract_incompatible":
+      return t("管理员 Computer Use 服务未通过兼容性或安全检查。")
+    case "environment":
+      return t("管理员命令环境未能安全安装或恢复。")
+    case "recovery":
+      return t("上一次管理员模式状态未能安全恢复。")
+    case "identity":
+    case "job":
+      return t("当前 Windows 管理员身份未通过安全检查。")
+    case "shim":
+      return t("管理员模式运行组件缺失或不可用。")
+    case "activation":
+      return t("Codex 启动失败，管理员服务已关闭。")
+    case "cleanup":
+      return t("管理员模式清理失败，请重新启动 Codex++。")
+    case "codex_wait":
+      return t("Codex 会话状态检查失败，管理员服务已关闭。")
+    case "runtime":
+      return t("管理员模式运行服务未能启动。")
+    default:
+      return t("管理员模式启动失败。")
+  }
 }
 
 function AboutScreen({

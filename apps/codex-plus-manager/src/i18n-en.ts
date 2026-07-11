@@ -5,6 +5,37 @@
 
 // Plain strings: t("中文") -> EN_PLAIN["中文"].
 export const EN_PLAIN: Record<string, string> = {
+  "管理员模式": "Administrator Mode",
+  "通过 Codex++ 启动时，同时为终端、Agent 命令和 Computer Use 提供管理员能力。启动失败时不会回退到普通权限。":
+    "When launched through Codex++, terminal and Agent commands plus Computer Use receive administrator capabilities together. Startup failures never fall back to ordinary privileges.",
+  "开启管理员模式": "Enable Administrator Mode",
+  "设置会在下一次通过 codex-plus-plus.exe 启动 Codex 时生效。":
+    "This setting takes effect the next time Codex is launched through codex-plus-plus.exe.",
+  "保存管理员模式": "Save Administrator Mode",
+  "启动中": "Starting",
+  "已启用": "Active",
+  "启动失败": "Failed",
+  "管理员能力状态": "Administrator capability status",
+  "当前 Codex 会话使用官方普通权限行为。": "The current Codex session uses the official ordinary-privilege behavior.",
+  "正在验证管理员命令执行与管理员 Computer Use。":
+    "Verifying administrator command execution and administrator Computer Use.",
+  "管理员命令执行": "Administrator command execution",
+  "管理员 Computer Use": "Administrator Computer Use",
+  "请从 codex-plus-plus.exe 重新启动 Codex；管理员模式不会回退到普通权限。":
+    "Restart Codex from codex-plus-plus.exe. Administrator Mode will not fall back to ordinary privileges.",
+  "管理员命令执行服务未通过安全检查。": "The administrator command service did not pass its security check.",
+  "管理员 Computer Use 服务未通过兼容性或安全检查。":
+    "The administrator Computer Use service did not pass its compatibility or security check.",
+  "管理员命令环境未能安全安装或恢复。": "The administrator command environment could not be safely installed or restored.",
+  "上一次管理员模式状态未能安全恢复。": "The previous Administrator Mode state could not be safely recovered.",
+  "当前 Windows 管理员身份未通过安全检查。": "The current Windows administrator identity did not pass its security check.",
+  "管理员模式运行组件缺失或不可用。": "An Administrator Mode runtime component is missing or unavailable.",
+  "Codex 启动失败，管理员服务已关闭。": "Codex failed to launch, and the administrator services were stopped.",
+  "管理员模式清理失败，请重新启动 Codex++。": "Administrator Mode cleanup failed. Restart Codex++.",
+  "Codex 会话状态检查失败，管理员服务已关闭。":
+    "The Codex session status check failed, and the administrator services were stopped.",
+  "管理员模式运行服务未能启动。": "The Administrator Mode runtime service could not start.",
+  "管理员模式启动失败。": "Administrator Mode failed to start.",
   "API Key 模式下扩展插件市场请求，尽量显示完整插件列表；官方/混合模式通常不需要。":
     "Expands plugin marketplace requests in API Key mode to show the full plugin list. Usually unnecessary in official/mixed mode.",
   "API Key 环境变量": "API Key environment variable",

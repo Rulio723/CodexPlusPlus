@@ -4799,6 +4799,7 @@ fn default_log_lines() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_plus_core::status::AdministratorModeStatus;
 
     static CODEX_HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -4931,6 +4932,53 @@ mod tests {
             result.payload.silent_shortcut.status.as_str(),
             "installed" | "missing"
         ));
+    }
+
+    #[test]
+    fn administrator_mode_payload_is_camel_case_and_secret_free() {
+        let payload = OverviewPayload {
+            codex_app: PathState {
+                status: "found".to_string(),
+                path: None,
+            },
+            codex_version: None,
+            silent_shortcut: PathState {
+                status: "installed".to_string(),
+                path: None,
+            },
+            management_shortcut: PathState {
+                status: "installed".to_string(),
+                path: None,
+            },
+            latest_launch: Some(LaunchStatus {
+                status: "failed".to_string(),
+                message: "Administrator Mode failed to start".to_string(),
+                started_at_ms: 1,
+                debug_port: None,
+                helper_port: None,
+                codex_app: None,
+                administrator_mode: AdministratorModeStatus {
+                    requested: true,
+                    state: "failed".to_string(),
+                    exec_elevated: false,
+                    computer_use_elevated: false,
+                    error_component: Some("admin_exec_readiness".to_string()),
+                },
+            }),
+            current_version: "1.2.34".to_string(),
+            update_status: "idle".to_string(),
+            settings_path: "settings.json".to_string(),
+            logs_path: "latest-status.json".to_string(),
+        };
+
+        let serialized = serde_json::to_string(&payload).unwrap();
+
+        assert!(serialized.contains(r#""execElevated":false"#));
+        assert!(serialized.contains(r#""computerUseElevated":false"#));
+        assert!(serialized.contains(r#""errorComponent":"admin_exec_readiness""#));
+        for forbidden in ["pipeName", "sessionId", "sessionProof", "helperArgs"] {
+            assert!(!serialized.contains(forbidden));
+        }
     }
 
     #[test]

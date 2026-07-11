@@ -2942,6 +2942,88 @@ body {
   padding: 0;
 }
 
+.administrator-mode-switch {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 14px;
+  cursor: pointer;
+}
+
+.administrator-mode-switch input {
+  width: 18px;
+  height: 18px;
+  margin-top: 2px;
+  padding: 0;
+}
+
+.administrator-mode-switch span,
+.administrator-mode-error {
+  display: grid;
+  gap: 4px;
+}
+
+.administrator-mode-switch small,
+.administrator-mode-status p,
+.administrator-mode-error span {
+  color: hsl(var(--muted-foreground));
+}
+
+.administrator-mode-status {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 14px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--background));
+  padding: 14px;
+}
+
+.administrator-mode-status.active {
+  border-color: color-mix(in srgb, #16a34a 45%, hsl(var(--border)));
+}
+
+.administrator-mode-status.failed {
+  border-color: color-mix(in srgb, #dc2626 45%, hsl(var(--border)));
+}
+
+.administrator-mode-status-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.administrator-mode-state {
+  border-radius: 999px;
+  background: hsl(var(--muted));
+  padding: 3px 9px;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.administrator-mode-capabilities {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.administrator-mode-capabilities span {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: hsl(var(--muted-foreground));
+}
+
+.administrator-mode-capabilities span.verified {
+  color: #15803d;
+  font-weight: 650;
+}
+
+.administrator-mode-error strong {
+  color: #b91c1c;
+}
+
 .log-view {
   min-height: 180px;
   margin-top: 10px;
