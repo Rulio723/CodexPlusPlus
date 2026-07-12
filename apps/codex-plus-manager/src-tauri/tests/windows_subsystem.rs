@@ -95,6 +95,31 @@ fn launcher_binary_embeds_codex_icon_resource() {
 }
 
 #[test]
+fn all_entrypoints_use_the_custom_codexplusplus_icon() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest_dir
+        .parent()
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::parent)
+        .unwrap();
+    let icon_dir = manifest_dir.join("icons");
+    let asset_dir = root.join("assets/images");
+
+    assert_eq!(
+        std::fs::read(icon_dir.join("icon.ico")).expect("read manager ico"),
+        std::fs::read(asset_dir.join("codex-plus-plus.ico")).expect("read custom ico")
+    );
+    assert_eq!(
+        std::fs::read(icon_dir.join("icon.png")).expect("read manager png"),
+        std::fs::read(asset_dir.join("codex-plus-plus.png")).expect("read custom png")
+    );
+
+    let shim_build = std::fs::read_to_string(root.join("apps/codex-plus-admin-shim/build.rs"))
+        .expect("read administrator shim build.rs");
+    assert!(shim_build.contains("codex-plus-manager/src-tauri/icons/icon.ico"));
+}
+
+#[test]
 fn launcher_recovers_administrator_state_before_single_instance_activation() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let launcher_main = manifest_dir
@@ -291,7 +316,7 @@ fn administrator_runtime_is_staged_with_fixed_executable_roles() {
     assert!(!launcher_build.contains("codex-plus-admin-shim"));
     assert!(shim_build.contains("windows-app-manifest.xml"));
     assert!(!shim_build.contains("codex-plus-launcher"));
-    assert!(!shim_build.contains("codex-plus-manager"));
+    assert!(!shim_build.contains("codex-plus-manager/src-tauri/windows-app-manifest.xml"));
     assert!(launcher_manifest.contains("requireAdministrator"));
     assert!(manager_manifest.contains("requireAdministrator"));
     assert!(shim_manifest.contains("asInvoker"));
