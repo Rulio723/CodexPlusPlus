@@ -184,7 +184,6 @@ pub struct ImportSessionArchiveRequest {
     pub options: codex_plus_data::SessionArchiveImportOptions,
 }
 
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalSessionsPayload {
