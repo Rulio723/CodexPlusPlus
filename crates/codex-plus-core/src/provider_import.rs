@@ -207,6 +207,7 @@ fn relay_profile_from_request(
         vlm_model: String::new(),
         vlm_base_url: String::new(),
         user_agent: String::new(),
+        official_codex_fingerprint: false,
         sub2api_enabled: false,
         sub2api_multiplier: String::new(),
         model_routes: Vec::new(),

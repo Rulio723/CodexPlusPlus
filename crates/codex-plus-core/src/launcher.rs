@@ -17,7 +17,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 use crate::settings::{BackendSettings, SettingsStore, normalize_codex_extra_args};
-use crate::status::{LaunchStatus, StatusStore};
+use crate::status::{AdministratorModeStatus, LaunchStatus, StatusStore};
 
 pub use crate::admin_mode::AdminModeLease;
 
@@ -244,16 +244,18 @@ pub trait LaunchHooks: Send + Sync {
             return Ok(None);
         }
         let current_exe = std::env::current_exe().context("administrator_mode:shim")?;
-        let shim_path = current_exe
+        let install_dir = current_exe
             .parent()
-            .context("administrator_mode:shim: launcher has no parent directory")?
-            .join("codex-plus-admin-shim.exe");
+            .context("administrator_mode:shim: launcher has no parent directory")?;
+        let shim_path = install_dir.join("codex-plus-admin-shim.exe");
+        let terminal_shim_path = install_dir.join("admin-terminal").join("pwsh.exe");
         let runtime =
             crate::admin_mode::AdminModeRuntime::start(crate::admin_mode::AdminModeConfig {
                 codex_home: &crate::codex_home::default_codex_home_dir(),
                 state_dir: &crate::paths::default_app_state_dir(),
                 app_dir,
                 shim_path: &shim_path,
+                terminal_shim_path: &terminal_shim_path,
             })
             .await?;
         Ok(Some(AdminModeLease::new(runtime)))

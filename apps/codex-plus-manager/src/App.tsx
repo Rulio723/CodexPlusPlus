@@ -293,6 +293,7 @@ export type RelayProfile = {
   vlmModel: string;
   vlmBaseUrl: string;
   userAgent: string;
+  officialCodexFingerprint?: boolean;
   sub2apiEnabled: boolean;
   sub2apiMultiplier: string;
   modelRoutes?: RelayModelRoute[];
@@ -478,6 +479,11 @@ type RelayProfileTestResult = CommandResult<{
   httpStatus: number;
   endpoint: string;
   responsePreview: string;
+}>;
+
+type RelayLatencyResult = CommandResult<{
+  latencyMs: number | null;
+  httpStatus: number | null;
 }>;
 
 type StepwiseTestResult = CommandResult<{
@@ -2424,6 +2430,20 @@ export function App() {
     if (result) showNotice(t("供应商测试"), result.message, result.status);
   };
 
+  const measureRelayLatency = async (
+    url: string,
+    apiKey: string,
+    officialCodexFingerprint = false,
+  ) => {
+    return await run(() =>
+      call<RelayLatencyResult>("measure_relay_latency", {
+        url,
+        apiKey,
+        officialCodexFingerprint,
+      }),
+    );
+  };
+
   const diagnoseRelayProfile = async (profile: RelayProfile) => {
     const result = await run(() => call<ProviderDoctorResult>("diagnose_relay_profile", { profile }));
     if (result) showNotice("Provider Doctor", result.message, result.status);
@@ -2899,6 +2919,7 @@ export function App() {
       deleteContextEntry,
       extractRelayCommonConfig,
       testRelayProfile,
+      measureRelayLatency,
       diagnoseRelayProfile,
       testStepwiseSettings,
       fetchRelayProfileModels,
@@ -3269,6 +3290,7 @@ type Actions = {
   deleteContextEntry: (settings: BackendSettings, kind: ContextKind, id: string) => Promise<BackendSettings | null>;
   extractRelayCommonConfig: (configContents: string) => Promise<ExtractRelayCommonConfigResult | null>;
   testRelayProfile: (profile: RelayProfile) => Promise<void>;
+  measureRelayLatency: (url: string, apiKey: string, officialCodexFingerprint?: boolean) => Promise<RelayLatencyResult | null>;
   diagnoseRelayProfile: (profile: RelayProfile) => Promise<ProviderDoctorResult | null>;
   testStepwiseSettings: (settings: BackendSettings) => Promise<void>;
   fetchRelayProfileModels: (profile: RelayProfile) => Promise<string[] | null>;
@@ -6473,6 +6495,8 @@ function RelayProfileEditor({
   setModelWindowRows: (value: ModelWindowRow[]) => void;
 }) {
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [latencyBusy, setLatencyBusy] = useState(false);
+  const [latencyText, setLatencyText] = useState("");
   // 纯 Responses 模式（非聚合）下 VLM/Strip 不生效，禁用下拉
   const vlmUnsupportedProtocol = profile.protocol === "responses" && !isAggregateRelayProfile(profile);
   if (isAggregateRelayProfile(profile)) {
@@ -6495,6 +6519,25 @@ function RelayProfileEditor({
   const canFetchSub2ApiRate = profile.sub2apiEnabled && Boolean(sub2apiBaseUrl && profile.apiKey.trim());
   const updateDraft = (patch: Partial<RelayProfile>) => {
     onProfileChange(applyRelayProfilePatchToFiles(profile, patch, { allowGenerateFiles: isNew }));
+  };
+  const testLatency = async () => {
+    const targetUrl = profile.upstreamBaseUrl.trim() || profile.baseUrl.trim();
+    if (!targetUrl || !profile.apiKey.trim()) {
+      setLatencyText(t("请先填写 Base URL 和 API Key。"));
+      return;
+    }
+    setLatencyBusy(true);
+    const result = await actions.measureRelayLatency(
+      targetUrl,
+      profile.apiKey,
+      profile.officialCodexFingerprint === true,
+    );
+    setLatencyBusy(false);
+    setLatencyText(
+      result && isSuccessStatus(result.status) && result.latencyMs !== null
+        ? `${result.latencyMs} ms (HTTP ${result.httpStatus ?? 200})`
+        : result?.message || t("延迟测试失败。"),
+    );
   };
   const modelRoutes = normalizeRelayModelRoutes(profile.modelRoutes);
   const modelRouteTargets = form.relayProfiles.filter(
@@ -6913,6 +6956,28 @@ function RelayProfileEditor({
               onChange={(event) => updateDraft({ userAgent: event.currentTarget.value })}
               placeholder={t("留空使用默认值")}
             />
+          </Field>
+        ) : null}
+        {showApiFields ? (
+          <Field className="relay-field-official-fingerprint" label={t("传输兼容")}>
+            <label className="inline-check">
+              <input
+                checked={profile.officialCodexFingerprint === true}
+                onChange={(event) => updateDraft({ officialCodexFingerprint: event.currentTarget.checked })}
+                type="checkbox"
+              />
+              <span>{t("模拟官方 Codex 指纹")}</span>
+            </label>
+            <p className="field-hint">
+              {t("为此供应商启用固定的 Codex 风格 User-Agent、TLS/HTTP2 协商参数；默认关闭。")}
+            </p>
+            <Toolbar>
+              <Button disabled={latencyBusy} onClick={() => void testLatency()} type="button" variant="secondary">
+                <TestTube className="h-4 w-4" />
+                {latencyBusy ? t("正在测试延迟…") : t("测试延迟")}
+              </Button>
+              {latencyText ? <span className="field-hint">{latencyText}</span> : null}
+            </Toolbar>
           </Field>
         ) : null}
       </div>

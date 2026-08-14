@@ -62,7 +62,6 @@ pub struct RenameOfficialAccountRequest {
     pub label: String,
 }
 
-
 #[derive(Debug, Clone, Serialize)]
 pub struct PathState {
     pub status: String,
@@ -283,6 +282,13 @@ pub struct RelayFilesPayload {
     pub auth_path: String,
     pub config_contents: String,
     pub auth_contents: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayLatencyPayload {
+    pub latency_ms: Option<u64>,
+    pub http_status: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3961,6 +3967,36 @@ fn format_multiplier(value: f64) -> String {
         text.pop();
     }
     text
+}
+
+#[tauri::command]
+pub async fn measure_relay_latency(
+    url: String,
+    api_key: String,
+    official_codex_fingerprint: Option<bool>,
+) -> CommandResult<RelayLatencyPayload> {
+    match codex_plus_core::relay_latency::measure_relay_latency_with_transport(
+        &url,
+        &api_key,
+        official_codex_fingerprint.unwrap_or(false),
+    )
+    .await
+    {
+        Ok(measurement) => ok(
+            "目标 URL 延迟检测完成。",
+            RelayLatencyPayload {
+                latency_ms: Some(measurement.latency_ms),
+                http_status: Some(measurement.http_status),
+            },
+        ),
+        Err(error) => failed(
+            &format!("目标 URL 延迟检测失败：{error}"),
+            RelayLatencyPayload {
+                latency_ms: None,
+                http_status: None,
+            },
+        ),
+    }
 }
 
 #[tauri::command]

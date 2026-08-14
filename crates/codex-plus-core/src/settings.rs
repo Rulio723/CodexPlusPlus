@@ -107,6 +107,10 @@ pub struct RelayProfile {
         skip_serializing_if = "String::is_empty"
     )]
     pub user_agent: String,
+    /// 为当前供应商启用官方 Codex 风格的请求与传输参数。
+    /// 该能力按供应商 opt-in，旧配置默认关闭。
+    #[serde(rename = "officialCodexFingerprint", default)]
+    pub official_codex_fingerprint: bool,
     #[serde(rename = "sub2apiEnabled", default)]
     pub sub2api_enabled: bool,
     #[serde(
@@ -192,6 +196,7 @@ impl Default for RelayProfile {
             vlm_model: String::new(),
             vlm_base_url: String::new(),
             user_agent: String::new(),
+            official_codex_fingerprint: false,
             sub2api_enabled: false,
             sub2api_multiplier: String::new(),
             model_routes: Vec::new(),
@@ -619,6 +624,7 @@ impl BackendSettings {
                 vlm_model: String::new(),
                 vlm_base_url: String::new(),
                 user_agent: String::new(),
+                official_codex_fingerprint: false,
                 sub2api_enabled: false,
                 sub2api_multiplier: String::new(),
                 model_routes: Vec::new(),
@@ -672,6 +678,7 @@ impl BackendSettings {
             vlm_model: String::new(),
             vlm_base_url: String::new(),
             user_agent: String::new(),
+            official_codex_fingerprint: false,
             sub2api_enabled: false,
             sub2api_multiplier: String::new(),
             model_routes: Vec::new(),
