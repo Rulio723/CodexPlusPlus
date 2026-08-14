@@ -3030,6 +3030,7 @@ fn launch_status(
         debug_port: Some(debug_port),
         helper_port: Some(helper_port),
         codex_app: Some(app_dir.to_string_lossy().to_string()),
+        administrator_mode: crate::status::AdministratorModeStatus::default(),
     }
 }
 

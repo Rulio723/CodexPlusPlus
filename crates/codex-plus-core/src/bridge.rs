@@ -112,6 +112,25 @@ pub async fn send_cdp_command(
         .await
 }
 
+pub async fn evaluate_script_and_run_if_waiting(
+    websocket_url: &str,
+    script: &str,
+) -> anyhow::Result<Value> {
+    let socket = connect_cdp_websocket(websocket_url).await?;
+    let mut session = CdpSession::new(socket);
+    let result = session
+        .send_command(
+            1,
+            "Runtime.evaluate",
+            runtime_evaluate_params_with_await_promise(script, true),
+        )
+        .await?;
+    session
+        .send_command(2, "Runtime.runIfWaitingForDebugger", json!({}))
+        .await?;
+    Ok(result)
+}
+
 pub async fn capture_page_screenshot(
     websocket_url: &str,
     output_path: &Path,

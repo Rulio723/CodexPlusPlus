@@ -2,6 +2,29 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::Context;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdministratorModeStatus {
+    pub requested: bool,
+    pub state: String,
+    pub exec_elevated: bool,
+    pub computer_use_elevated: bool,
+    pub error_component: Option<String>,
+}
+
+impl Default for AdministratorModeStatus {
+    fn default() -> Self {
+        Self {
+            requested: false,
+            state: "off".to_string(),
+            exec_elevated: false,
+            computer_use_elevated: false,
+            error_component: None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LaunchStatus {
@@ -11,6 +34,8 @@ pub struct LaunchStatus {
     pub debug_port: Option<u16>,
     pub helper_port: Option<u16>,
     pub codex_app: Option<String>,
+    #[serde(default)]
+    pub administrator_mode: AdministratorModeStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +102,7 @@ mod tests {
             debug_port: Some(9222),
             helper_port: Some(4545),
             codex_app: Some("Codex".to_string()),
+            administrator_mode: AdministratorModeStatus::default(),
         };
 
         store.save_latest(&status).unwrap();
@@ -100,5 +126,18 @@ mod tests {
         let store = StatusStore::new(path);
 
         assert_eq!(store.load_latest().unwrap(), None);
+    }
+
+    #[test]
+    fn old_launch_status_defaults_administrator_mode_off() {
+        let status: LaunchStatus = serde_json::from_str(
+            r#"{
+              "status":"running","message":"ready","started_at_ms":1,
+              "debug_port":9229,"helper_port":57321,"codex_app":"Codex"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(status.administrator_mode.state, "off");
     }
 }
