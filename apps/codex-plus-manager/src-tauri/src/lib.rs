@@ -64,6 +64,13 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::backend_version,
             commands::startup_options,
+            commands::list_official_accounts,
+            commands::save_current_official_account,
+            commands::create_pending_official_account,
+            commands::capture_pending_official_account,
+            commands::switch_official_account,
+            commands::rename_official_account,
+            commands::delete_official_account,
             commands::load_overview,
             commands::launch_codex_plus,
             commands::restart_codex_plus,

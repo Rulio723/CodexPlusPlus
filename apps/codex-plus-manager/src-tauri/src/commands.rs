@@ -13,7 +13,7 @@ use codex_plus_core::settings::{BackendSettings, RelayProfile, SettingsStore};
 use codex_plus_core::status::{LaunchStatus, StatusStore};
 use codex_plus_core::user_scripts::UserScriptManager;
 use codex_plus_core::zed_remote::{ZedOpenStrategy, ZedRemoteProject};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::install::{self, InstallActionResult, InstallOptions};
@@ -33,6 +33,35 @@ where
 pub struct VersionPayload {
     pub version: String,
 }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficialAccountSwitchPayload {
+    pub inventory: codex_plus_core::official_accounts::OfficialAccountInventory,
+    pub selected: Option<codex_plus_core::official_accounts::OfficialAccountSummary>,
+    pub restart_required: bool,
+    pub backup_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveOfficialAccountRequest {
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficialAccountIdRequest {
+    pub account_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameOfficialAccountRequest {
+    pub account_id: String,
+    pub label: String,
+}
+
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PathState {
@@ -500,6 +529,202 @@ where
     S: AsRef<str>,
 {
     args.into_iter().any(|arg| arg.as_ref() == "--show-update") || env_value == Some("1")
+}
+
+#[tauri::command]
+pub fn list_official_accounts()
+-> CommandResult<codex_plus_core::official_accounts::OfficialAccountInventory> {
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let data_dir = codex_plus_core::paths::default_official_accounts_data_dir();
+    list_official_accounts_from_paths(&home, &data_dir)
+}
+
+#[tauri::command]
+pub fn save_current_official_account(
+    request: SaveOfficialAccountRequest,
+) -> CommandResult<codex_plus_core::official_accounts::OfficialAccountInventory> {
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let data_dir = codex_plus_core::paths::default_official_accounts_data_dir();
+    save_current_official_account_from_paths(&home, &data_dir, request.label.as_deref())
+}
+
+#[tauri::command]
+pub fn create_pending_official_account(
+    request: SaveOfficialAccountRequest,
+) -> CommandResult<codex_plus_core::official_accounts::PendingOfficialAccountResult> {
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let data_dir = codex_plus_core::paths::default_official_accounts_data_dir();
+    create_pending_official_account_from_paths(&home, &data_dir, request.label.as_deref())
+}
+
+#[tauri::command]
+pub fn capture_pending_official_account(
+    request: OfficialAccountIdRequest,
+) -> CommandResult<codex_plus_core::official_accounts::OfficialAccountInventory> {
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let data_dir = codex_plus_core::paths::default_official_accounts_data_dir();
+    capture_pending_official_account_from_paths(&home, &data_dir, &request.account_id)
+}
+
+#[tauri::command]
+pub fn switch_official_account(
+    request: OfficialAccountIdRequest,
+) -> CommandResult<OfficialAccountSwitchPayload> {
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let data_dir = codex_plus_core::paths::default_official_accounts_data_dir();
+    switch_official_account_from_paths(&home, &data_dir, &request.account_id)
+}
+
+#[tauri::command]
+pub fn rename_official_account(
+    request: RenameOfficialAccountRequest,
+) -> CommandResult<codex_plus_core::official_accounts::OfficialAccountInventory> {
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let data_dir = codex_plus_core::paths::default_official_accounts_data_dir();
+    match codex_plus_core::official_accounts::rename_official_account(
+        &home,
+        &data_dir,
+        &request.account_id,
+        &request.label,
+    ) {
+        Ok(inventory) => ok("官方账号名称已更新。", inventory),
+        Err(error) => failed(
+            &format!("重命名官方账号失败：{error}"),
+            empty_official_account_inventory(),
+        ),
+    }
+}
+
+#[tauri::command]
+pub fn delete_official_account(
+    request: OfficialAccountIdRequest,
+) -> CommandResult<codex_plus_core::official_accounts::OfficialAccountInventory> {
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let data_dir = codex_plus_core::paths::default_official_accounts_data_dir();
+    match codex_plus_core::official_accounts::delete_official_account(
+        &home,
+        &data_dir,
+        &request.account_id,
+    ) {
+        Ok(inventory) => ok("已删除保存的官方账号副本。", inventory),
+        Err(error) => failed(
+            &format!("删除官方账号失败：{error}"),
+            empty_official_account_inventory(),
+        ),
+    }
+}
+
+fn list_official_accounts_from_paths(
+    home: &Path,
+    data_dir: &Path,
+) -> CommandResult<codex_plus_core::official_accounts::OfficialAccountInventory> {
+    match codex_plus_core::official_accounts::list_official_accounts(home, data_dir) {
+        Ok(inventory) => ok("官方账号列表已读取。", inventory),
+        Err(error) => failed(
+            &format!("读取官方账号列表失败：{error}"),
+            empty_official_account_inventory(),
+        ),
+    }
+}
+
+fn save_current_official_account_from_paths(
+    home: &Path,
+    data_dir: &Path,
+    label: Option<&str>,
+) -> CommandResult<codex_plus_core::official_accounts::OfficialAccountInventory> {
+    match codex_plus_core::official_accounts::save_current_official_account(home, data_dir, label) {
+        Ok(inventory) => ok("当前官方账号已加密保存。", inventory),
+        Err(error) => failed(
+            &format!("保存当前官方账号失败：{error}"),
+            empty_official_account_inventory(),
+        ),
+    }
+}
+
+fn create_pending_official_account_from_paths(
+    home: &Path,
+    data_dir: &Path,
+    label: Option<&str>,
+) -> CommandResult<codex_plus_core::official_accounts::PendingOfficialAccountResult> {
+    match codex_plus_core::official_accounts::create_pending_official_account(home, data_dir, label)
+    {
+        Ok(result) => ok(
+            "待登录账号已创建。请重启 Codex，登录新的官方账号后再保存登录凭据。",
+            result,
+        ),
+        Err(error) => failed(
+            &format!("创建待登录账号失败：{error}"),
+            codex_plus_core::official_accounts::PendingOfficialAccountResult {
+                inventory: empty_official_account_inventory(),
+                pending: empty_official_account_summary(),
+                restart_required: false,
+                backup_path: None,
+            },
+        ),
+    }
+}
+
+fn capture_pending_official_account_from_paths(
+    home: &Path,
+    data_dir: &Path,
+    account_id: &str,
+) -> CommandResult<codex_plus_core::official_accounts::OfficialAccountInventory> {
+    match codex_plus_core::official_accounts::capture_pending_official_account(
+        home, data_dir, account_id,
+    ) {
+        Ok(inventory) => ok("新的官方账号登录凭据已加密保存。", inventory),
+        Err(error) => failed(
+            &format!("保存待登录账号失败：{error}"),
+            empty_official_account_inventory(),
+        ),
+    }
+}
+
+fn switch_official_account_from_paths(
+    home: &Path,
+    data_dir: &Path,
+    account_id: &str,
+) -> CommandResult<OfficialAccountSwitchPayload> {
+    match codex_plus_core::official_accounts::switch_official_account(home, data_dir, account_id) {
+        Ok(result) => ok(
+            "官方账号已切换。请手动重启 Codex 后生效。",
+            OfficialAccountSwitchPayload {
+                inventory: result.inventory,
+                selected: Some(result.selected),
+                restart_required: result.restart_required,
+                backup_path: result.backup_path,
+            },
+        ),
+        Err(error) => failed(
+            &format!("切换官方账号失败：{error}"),
+            OfficialAccountSwitchPayload {
+                inventory: empty_official_account_inventory(),
+                selected: None,
+                restart_required: false,
+                backup_path: None,
+            },
+        ),
+    }
+}
+
+fn empty_official_account_inventory() -> codex_plus_core::official_accounts::OfficialAccountInventory
+{
+    codex_plus_core::official_accounts::OfficialAccountInventory {
+        accounts: Vec::new(),
+        current_account_label: None,
+    }
+}
+
+fn empty_official_account_summary() -> codex_plus_core::official_accounts::OfficialAccountSummary {
+    codex_plus_core::official_accounts::OfficialAccountSummary {
+        id: String::new(),
+        label: String::new(),
+        account_hint: None,
+        created_at: 0,
+        updated_at: 0,
+        active: false,
+        pending_login: false,
+    }
 }
 
 #[tauri::command]
@@ -3265,6 +3490,17 @@ pub fn switch_relay_profile(
     ) {
         Ok(result) => {
             let status = codex_plus_core::relay_config::relay_status_from_home(&home);
+            if let Err(error) =
+                codex_plus_core::official_accounts::mark_official_accounts_unused_after_provider_switch(
+                    &home,
+                    &codex_plus_core::paths::default_official_accounts_data_dir(),
+                )
+            {
+                log_manager_event(
+                    "manager.switch_relay_profile.official_account_marker_failed",
+                    json!({ "error": error.to_string() }),
+                );
+            }
             log_manager_event(
                 "manager.switch_relay_profile.ok",
                 json!({
