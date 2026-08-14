@@ -163,6 +163,28 @@ pub struct PendingProviderImportPayload {
     pub pending: Option<codex_plus_core::provider_import::ProviderImportRequest>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportSessionArchiveRequest {
+    #[serde(default)]
+    pub session_ids: Vec<String>,
+    pub output_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InspectSessionArchiveRequest {
+    pub archive_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSessionArchiveRequest {
+    pub archive_path: String,
+    pub options: codex_plus_data::SessionArchiveImportOptions,
+}
+
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalSessionsPayload {
@@ -1807,6 +1829,90 @@ pub fn list_local_sessions(
             &format!("读取部分本地会话失败：{}", errors.join("; ")),
             payload,
         )
+    }
+}
+
+fn session_transfer_requires_closed_codex<T: Serialize + Default>(
+    payload: T,
+) -> Option<CommandResult<T>> {
+    if codex_plus_core::watcher::find_codex_processes().is_empty() {
+        None
+    } else {
+        Some(failed(
+            "请先完全退出 Codex，再进行会话导入或导出，避免 SQLite 和 rollout 文件仍在写入。",
+            payload,
+        ))
+    }
+}
+
+#[tauri::command]
+pub async fn export_session_archive(
+    request: ExportSessionArchiveRequest,
+) -> CommandResult<codex_plus_data::SessionArchiveExportResult> {
+    if let Some(result) = session_transfer_requires_closed_codex(Default::default()) {
+        return result;
+    }
+    let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+    let output_path = PathBuf::from(request.output_path);
+    let session_ids = request.session_ids;
+    match tokio::task::spawn_blocking(move || {
+        codex_plus_data::export_session_archive(&home, &output_path, &session_ids)
+    })
+    .await
+    {
+        Ok(Ok(payload)) => ok(
+            &format!("已导出 {} 个会话。", payload.session_count),
+            payload,
+        ),
+        Ok(Err(error)) => failed(&format!("导出会话失败：{error}"), Default::default()),
+        Err(error) => failed(&format!("导出会话任务失败：{error}"), Default::default()),
+    }
+}
+
+#[tauri::command]
+pub async fn inspect_session_archive(
+    request: InspectSessionArchiveRequest,
+) -> CommandResult<codex_plus_data::SessionArchivePreview> {
+    let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+    let archive_path = PathBuf::from(request.archive_path);
+    match tokio::task::spawn_blocking(move || {
+        codex_plus_data::inspect_session_archive(&home, &archive_path)
+    })
+    .await
+    {
+        Ok(Ok(payload)) => ok("会话迁移包已读取。", payload),
+        Ok(Err(error)) => failed(&format!("读取会话迁移包失败：{error}"), Default::default()),
+        Err(error) => failed(
+            &format!("读取会话迁移包任务失败：{error}"),
+            Default::default(),
+        ),
+    }
+}
+
+#[tauri::command]
+pub async fn import_session_archive(
+    request: ImportSessionArchiveRequest,
+) -> CommandResult<codex_plus_data::SessionArchiveImportResult> {
+    if let Some(result) = session_transfer_requires_closed_codex(Default::default()) {
+        return result;
+    }
+    let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+    let archive_path = PathBuf::from(request.archive_path);
+    let options = request.options;
+    match tokio::task::spawn_blocking(move || {
+        codex_plus_data::import_session_archive(&home, &archive_path, &options)
+    })
+    .await
+    {
+        Ok(Ok(payload)) => ok(
+            &format!(
+                "会话导入完成：导入 {} 个，跳过 {} 个。",
+                payload.imported_count, payload.skipped_count
+            ),
+            payload,
+        ),
+        Ok(Err(error)) => failed(&format!("导入会话失败：{error:#}"), Default::default()),
+        Err(error) => failed(&format!("导入会话任务失败：{error}"), Default::default()),
     }
 }
 
