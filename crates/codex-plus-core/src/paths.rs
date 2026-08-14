@@ -35,6 +35,11 @@ pub fn default_pending_provider_import_path() -> PathBuf {
     default_app_state_dir().join(PENDING_PROVIDER_IMPORT_FILE)
 }
 
+/// 官方账号保险库与密钥材料保存在应用状态目录中，避免写入 Codex HOME。
+pub fn default_official_accounts_data_dir() -> PathBuf {
+    default_app_state_dir()
+}
+
 pub fn default_pending_remote_control_recovery_path() -> PathBuf {
     default_app_state_dir().join(PENDING_REMOTE_CONTROL_RECOVERY_FILE)
 }
