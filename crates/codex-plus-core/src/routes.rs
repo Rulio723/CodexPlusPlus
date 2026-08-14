@@ -1,8 +1,10 @@
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
 use crate::models::{DeleteResult, DeleteStatus, ExportResult, ExportStatus, SessionRef};
@@ -118,6 +120,9 @@ pub trait BridgeDataService: Send + Sync {
     ) -> anyhow::Result<Value>;
     async fn thread_sort_key(&self, session: SessionRef) -> anyhow::Result<Value>;
     async fn thread_sort_keys(&self, sessions: Vec<SessionRef>) -> anyhow::Result<Value>;
+    async fn recover_remote_control_session(&self, _thread_id: String) -> anyhow::Result<Value> {
+        anyhow::bail!("Remote Control session recovery is unavailable")
+    }
 }
 
 pub async fn handle_bridge_request(
@@ -177,9 +182,13 @@ pub async fn handle_bridge_request(
         "/devtools/open" => ctx.runtime.open_devtools().await,
         "/manager/open" => ctx.runtime.open_manager().await,
         "/manager/open-transient" => ctx.runtime.open_transient_manager().await,
-        "/backend/status" => ctx.runtime.backend_status().await,
+        "/backend/status" => backend_status_value(
+            ctx.runtime.backend_status().await,
+            ctx.settings.get_settings().await,
+        ),
         "/codex-model-catalog" | "/codex-config-model" => ctx.runtime.codex_model_catalog().await,
         "/diagnostics/log" => diagnostic_log_value(payload.clone()),
+        "/llm-proxy" => llm_proxy_value(payload.clone()).await,
         "/ads" => ctx.runtime.ads().await,
         "/zed-remote/status" => ctx.runtime.zed_remote_status().await,
         "/zed-remote/resolve-host" => ctx.runtime.resolve_zed_remote_host(payload.clone()).await,
@@ -261,6 +270,15 @@ pub async fn handle_bridge_request(
             ctx.data
                 .thread_sort_keys(sessions_from_payload(&payload))
                 .await
+        }
+        "/remote-control-session/recover" => {
+            let thread_id = payload
+                .get("thread_id")
+                .or_else(|| payload.get("threadId"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            ctx.data.recover_remote_control_session(thread_id).await
         }
         _ => {
             let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -647,6 +665,20 @@ async fn settings_value(
     settings_payload_value(settings, codex_app_version)
 }
 
+fn backend_status_value(
+    status: anyhow::Result<Value>,
+    settings: anyhow::Result<BackendSettings>,
+) -> anyhow::Result<Value> {
+    let mut status = status?;
+    if let Some(object) = status.as_object_mut() {
+        let hide = settings
+            .map(|settings| crate::assets::hide_official_usage_alert_config(&settings))
+            .unwrap_or(false);
+        object.insert("hideOfficialUsageAlert".to_string(), Value::Bool(hide));
+    }
+    Ok(status)
+}
+
 fn result_value<T>(result: anyhow::Result<T>) -> anyhow::Result<Value>
 where
     T: serde::Serialize,
@@ -679,6 +711,173 @@ async fn stepwise_test_value(
 ) -> anyhow::Result<Value> {
     let settings = crate::stepwise::settings_with_payload(result?, &payload);
     crate::stepwise::test_connection(&settings).await
+}
+
+async fn llm_proxy_value(payload: Value) -> anyhow::Result<Value> {
+    let url = validate_llm_proxy_url(
+        payload
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    )?;
+    let method = payload
+        .get("method")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("POST");
+    if !method.eq_ignore_ascii_case("POST") {
+        anyhow::bail!("LLM Bridge 仅支持 POST 请求");
+    }
+
+    let timeout_ms = payload
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(60_000)
+        .clamp(1_000, 60_000);
+    let body = payload
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if body.len() > 1_048_576 {
+        anyhow::bail!("LLM Bridge 请求体过大");
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(timeout_ms))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let response = client
+        .post(url)
+        .headers(llm_proxy_headers(&payload)?)
+        .body(body)
+        .send()
+        .await?;
+    let http_status = response.status().as_u16();
+    let ok = response.status().is_success();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    if let Some(length) = response.content_length() {
+        if length > 4 * 1024 * 1024 {
+            anyhow::bail!("LLM Bridge 响应体过大");
+        }
+    }
+    let bytes = response.bytes().await?;
+    if bytes.len() > 4 * 1024 * 1024 {
+        anyhow::bail!("LLM Bridge 响应体过大");
+    }
+    let body_text = String::from_utf8_lossy(&bytes).to_string();
+    let body_json = if content_type
+        .split(';')
+        .next()
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("application/json"))
+    {
+        serde_json::from_slice::<Value>(&bytes).ok()
+    } else {
+        None
+    };
+
+    Ok(json!({
+        "status": "ok",
+        "http_status": http_status,
+        "ok": ok,
+        "body_text": body_text,
+        "body_json": body_json,
+    }))
+}
+
+fn validate_llm_proxy_url(raw: &str) -> anyhow::Result<reqwest::Url> {
+    let url = reqwest::Url::parse(raw.trim()).map_err(|_| anyhow::anyhow!("Base URL 格式无效"))?;
+    if url.scheme() != "https" {
+        anyhow::bail!("Base URL 必须使用 HTTPS");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("Base URL 不得包含用户名或密码");
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("Base URL 缺少主机名"))?;
+    if is_blocked_llm_proxy_host(host) {
+        anyhow::bail!("Base URL 不得指向本机或私有网络");
+    }
+    Ok(url)
+}
+
+fn is_blocked_llm_proxy_host(host: &str) -> bool {
+    let host = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_lowercase();
+    if host.is_empty()
+        || host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+    {
+        return true;
+    }
+    if let Ok(ip) = std::net::IpAddr::from_str(&host) {
+        return match ip {
+            std::net::IpAddr::V4(ip) => {
+                ip.is_loopback()
+                    || ip.is_private()
+                    || ip.is_link_local()
+                    || ip.is_multicast()
+                    || ip.is_broadcast()
+                    || ip.is_documentation()
+                    || ip.octets()[0] == 0
+                    || ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1])
+            }
+            std::net::IpAddr::V6(ip) => {
+                ip.is_loopback()
+                    || ip.is_unspecified()
+                    || ip.is_multicast()
+                    || (ip.segments()[0] & 0xfe00) == 0xfc00
+                    || (ip.segments()[0] & 0xffc0) == 0xfe80
+            }
+        };
+    }
+    false
+}
+
+fn llm_proxy_headers(payload: &Value) -> anyhow::Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    let Some(raw_headers) = payload.get("headers").and_then(Value::as_object) else {
+        return Ok(headers);
+    };
+    for (name, value) in raw_headers {
+        if !is_allowed_llm_proxy_header(name) {
+            continue;
+        }
+        let Some(value) = value.as_str() else {
+            continue;
+        };
+        let header_name = HeaderName::from_bytes(name.as_bytes())?;
+        let header_value = HeaderValue::from_str(value)?;
+        headers.insert(header_name, header_value);
+    }
+    Ok(headers)
+}
+
+fn is_allowed_llm_proxy_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "accept"
+            | "api-key"
+            | "anthropic-beta"
+            | "anthropic-version"
+            | "authorization"
+            | "content-type"
+            | "openai-organization"
+            | "openai-project"
+            | "x-api-key"
+    )
 }
 
 fn diagnostic_log_value(payload: Value) -> anyhow::Result<Value> {
