@@ -993,9 +993,6 @@ fn validate_theme(
         "projectLabel",
         "statusText",
         "quote",
-        "promoTitle",
-        "promoSub",
-        "promoUrl",
         "appearance",
         "art",
         "colors",
@@ -1028,8 +1025,6 @@ fn validate_theme(
         "projectLabel",
         "statusText",
         "quote",
-        "promoTitle",
-        "promoSub",
     ] {
         if object.get(key).is_some_and(|value| {
             value
@@ -1039,11 +1034,7 @@ fn validate_theme(
             bail!("theme.json.{key} 无效");
         }
     }
-    if object.get("promoUrl").is_some_and(|value| {
-        value
-            .as_str()
-            .is_none_or(|text| !safe_manifest_text(text, 0, 512, false))
-    }) || object.get("appearance").is_some_and(|value| {
+    if object.get("appearance").is_some_and(|value| {
         value
             .as_str()
             .is_none_or(|appearance| !matches!(appearance, "auto" | "light" | "dark"))

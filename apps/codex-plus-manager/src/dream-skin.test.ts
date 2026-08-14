@@ -87,6 +87,9 @@ describe("dream skin theme helpers", () => {
       width: 96,
       side: "right",
     });
+    assert.equal(theme.promoTitle, undefined);
+    assert.equal(theme.promoSub, undefined);
+    assert.equal(theme.promoUrl, undefined);
     assert.deepEqual(theme.customTargetField, { nested: true });
   });
 

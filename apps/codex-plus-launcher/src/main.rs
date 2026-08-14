@@ -61,7 +61,15 @@ async fn main() -> Result<()> {
 async fn launcher_main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let helper_only = args.iter().any(|arg| arg == "--helper-only");
+    let recover_only = args.iter().any(|arg| arg == "--recover-admin-mode");
     let options = parse_launch_options(args.iter());
+    if recover_only {
+        codex_plus_core::admin_mode::recover_stale_admin_mode_for_shutdown(
+            &codex_plus_core::codex_home::default_codex_home_dir(),
+            &codex_plus_core::paths::default_app_state_dir(),
+        )?;
+        return Ok(());
+    }
     if helper_only {
         let hooks = LauncherHooks::default();
         hooks.start_helper(options.helper_port).await?;
@@ -77,29 +85,55 @@ async fn launcher_main() -> Result<()> {
     tokio::spawn(async {
         let _ = notify_manager_when_update_available().await;
     });
+    stop_standard_codex_before_administrator_launch()?;
     let hooks = LauncherHooks::default();
     let handle = launch_and_inject_with_hooks(options, &hooks).await?;
     handle.wait_for_codex_exit().await?;
     Ok(())
 }
 
+fn stop_standard_codex_before_administrator_launch() -> anyhow::Result<()> {
+    let settings = codex_plus_core::settings::SettingsStore::default().load()?;
+    if settings.administrator_mode_enabled {
+        codex_plus_core::watcher::stop_codex_processes_and_wait();
+    }
+    Ok(())
+}
+
 async fn prepare_administrator_mode_startup(_options: &LaunchOptions) -> anyhow::Result<()> {
     let settings = codex_plus_core::settings::SettingsStore::default().load()?;
+    let recovery = codex_plus_core::admin_mode::recover_stale_admin_mode(
+        &codex_plus_core::codex_home::default_codex_home_dir(),
+        &codex_plus_core::paths::default_app_state_dir(),
+    );
+    if let Err(error) = recovery {
+        if settings.administrator_mode_enabled {
+            return Err(error.context("administrator_mode:recovery"));
+        }
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "launcher.stale_admin_recovery_failed_nonfatal",
+            json!({
+                "message": "stale administrator state could not be fully recovered",
+                "component": "administrator_mode"
+            }),
+        );
+    }
     if !settings.administrator_mode_enabled {
         return Ok(());
     }
-    codex_plus_core::admin_mode::recover_stale_admin_mode(
-        &codex_plus_core::codex_home::default_codex_home_dir(),
-        &codex_plus_core::paths::default_app_state_dir(),
-    )?;
     let current_exe = std::env::current_exe().context("administrator_mode:shim")?;
-    let shim_path = current_exe
+    let install_dir = current_exe
         .parent()
-        .context("administrator_mode:shim: launcher has no parent directory")?
-        .join("codex-plus-admin-shim.exe");
+        .context("administrator_mode:shim: launcher has no parent directory")?;
+    let shim_path = install_dir.join("codex-plus-admin-shim.exe");
     anyhow::ensure!(
         shim_path.is_file(),
         "administrator_mode:shim: administrator shim is missing"
+    );
+    let terminal_shim_path = install_dir.join("admin-terminal").join("pwsh.exe");
+    anyhow::ensure!(
+        terminal_shim_path.is_file(),
+        "administrator_mode:terminal: PowerShell compatibility shim is missing"
     );
     Ok(())
 }

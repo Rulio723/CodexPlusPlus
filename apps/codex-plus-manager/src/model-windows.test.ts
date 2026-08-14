@@ -37,6 +37,7 @@ const _profileTypeCheck: RelayProfile = {
   vlmModel: "",
   vlmBaseUrl: "",
   userAgent: "",
+  officialCodexFingerprint: false,
   sub2apiEnabled: false,
   sub2apiMultiplier: "",
 };

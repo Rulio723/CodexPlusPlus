@@ -16,19 +16,22 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   ArrowLeft,
   ArrowRight,
   Bell,
   CheckCircle2,
-  ChevronDown,
   Camera,
+  ChevronDown,
+  CircleAlert,
   CircleArrowUp,
   Copy,
   Download,
   Edit3,
-  Eye,
+  FileUp,
+  FolderUp,
+  Gauge,
   GripVertical,
   Info,
   ImagePlus,
@@ -44,7 +47,6 @@ import {
   Play,
   MessageCircle,
   MoreHorizontal,
-  PackageOpen,
   FileCode2,
   Moon,
   Network,
@@ -65,6 +67,7 @@ import {
   Sun,
   TestTube,
   Trash2,
+  Upload,
   Wrench,
   type LucideIcon,
 } from "lucide-react";
@@ -94,6 +97,11 @@ import {
   type ImageHandling,
   type ModelWindowRow,
 } from "./model-windows";
+import {
+  administratorCapabilityState,
+  administratorLaunchStatusSettled,
+} from "./administrator-mode";
+import { officialAccountsAfterProviderSwitch } from "./official-accounts";
 import { relayAuthForLiveDraft } from "./relay-live-files";
 import { resolveProviderSyncCompletion } from "./provider-sync-flow";
 import {
@@ -103,8 +111,6 @@ import {
   normalizeDreamSkinTheme,
   type DreamSkinCheck,
   type DreamSkinColors,
-  type DreamSkinCommunityResult,
-  type DreamSkinCommunityTheme,
   type DreamSkinImageResult,
   type DreamSkinMarketResult,
   type DreamSkinMarketTheme,
@@ -132,8 +138,6 @@ type CommandResult<T> = T & {
   status: Status;
   message: string;
 };
-
-type PendingDreamSkinCommunityResult = CommandResult<{ versionId: string }>;
 
 type PendingDreamSkinRestart = {
   currentThemeKey: string | null;
@@ -213,12 +217,14 @@ type BackendSettings = {
   computerUseGuardEnabled: boolean;
   administratorModeEnabled: boolean;
   codexAppPluginMarketplaceUnlock: boolean;
+  codexAppPluginAutoExpand: boolean;
   codexAppModelWhitelistUnlock: boolean;
   codexAppSessionDelete: boolean;
   codexAppMarkdownExport: boolean;
   codexAppPasteFix: boolean;
   codexAppForceChineseLocale: boolean;
   codexAppFastStartup: boolean;
+  codexAppClassicProjectSidebar: boolean;
   codexAppProjectMove: boolean;
   codexAppThreadIdBadge: boolean;
   codexAppConversationView: boolean;
@@ -294,7 +300,7 @@ export type RelayProfile = {
   vlmModel: string;
   vlmBaseUrl: string;
   userAgent: string;
-  officialCodexFingerprint?: boolean;
+  officialCodexFingerprint: boolean;
   sub2apiEnabled: boolean;
   sub2apiMultiplier: string;
   modelRoutes?: RelayModelRoute[];
@@ -343,6 +349,27 @@ type CodexContextEntries = {
   skills: CodexContextEntry[];
   plugins: CodexContextEntry[];
 };
+
+type InstalledSkill = {
+  id: string;
+  name: string;
+  description: string;
+  path: string;
+  source: "user" | "system" | "plugin" | string;
+  enabled: boolean;
+  readOnly: boolean;
+  valid: boolean;
+  error: string | null;
+  pluginId: string | null;
+  invocation: string;
+};
+
+type SkillInventoryResult = CommandResult<{
+  codexHome: string;
+  userSkillsDir: string;
+  disabledSkillsDir: string;
+  skills: InstalledSkill[];
+}>;
 
 type RelayProtocol = "responses" | "chatCompletions";
 type RelayMode = "official" | "mixedApi" | "pureApi" | "aggregate";
@@ -418,6 +445,56 @@ type LocalSessionsResult = CommandResult<{
   hasMore: boolean;
 }>;
 
+type SessionPathMapping = {
+  from: string;
+  to: string;
+};
+
+type SessionArchiveExportResult = CommandResult<{
+  archivePath: string;
+  sessionCount: number;
+  requestedCount: number;
+  relatedSessionCount: number;
+  rolloutBytes: number;
+  assetCount: number;
+  assetBytes: number;
+  warnings: string[];
+}>;
+
+type SessionArchivePreviewItem = {
+  id: string;
+  title: string;
+  cwd: string;
+  archived: boolean;
+  conflict: boolean;
+  hasRollout: boolean;
+};
+
+type SessionArchivePreviewResult = CommandResult<{
+  archivePath: string;
+  formatVersion: number;
+  exportedAt: string;
+  sourceVersion: string;
+  sessionCount: number;
+  assetCount: number;
+  conflictCount: number;
+  missingProjectRoots: string[];
+  sessions: SessionArchivePreviewItem[];
+  warnings: string[];
+}>;
+
+type SessionArchiveImportResult = CommandResult<{
+  archivePath: string;
+  importedCount: number;
+  skippedCount: number;
+  overwrittenCount: number;
+  restoredRolloutCount: number;
+  restoredAssetCount: number;
+  missingTables: string[];
+  backupPath: string;
+  warnings: string[];
+}>;
+
 type ZedRemoteProject = {
   id: string;
   label: string;
@@ -482,11 +559,6 @@ type RelayProfileTestResult = CommandResult<{
   responsePreview: string;
 }>;
 
-type RelayLatencyResult = CommandResult<{
-  latencyMs: number | null;
-  httpStatus: number | null;
-}>;
-
 type StepwiseTestResult = CommandResult<{
   itemCount: number;
   error: string;
@@ -495,18 +567,6 @@ type StepwiseTestResult = CommandResult<{
 type RelayProfileModelsResult = CommandResult<{
   models: string[];
   endpoint: string;
-}>;
-
-type Sub2ApiBillingResult = CommandResult<{
-  endpoint: string;
-  groupRateMultiplier: number;
-  userRateMultiplier?: number | null;
-  resolvedRateMultiplier: number;
-  peakRateEnabled: boolean;
-  peakRateMultiplier?: number | null;
-  appliedPeakMultiplier?: number | null;
-  effectiveRateMultiplier: number;
-  observedAt: string;
 }>;
 
 type ProviderDoctorCheck = {
@@ -561,6 +621,11 @@ type EnvConflict = {
 
 type EnvConflictsResult = CommandResult<{
   conflicts: EnvConflict[];
+}>;
+
+type RelayLatencyResult = CommandResult<{
+  latencyMs: number | null;
+  httpStatus: number | null;
 }>;
 
 type RelayEnvironmentResult = CommandResult<{
@@ -691,6 +756,7 @@ type OfficialAccountSummary = {
   createdAt: number;
   updatedAt: number;
   active: boolean;
+  pendingLogin: boolean;
 };
 
 type OfficialAccountsResult = CommandResult<{
@@ -704,6 +770,16 @@ type OfficialAccountSwitchResult = CommandResult<{
     currentAccountLabel?: string | null;
   };
   selected?: OfficialAccountSummary | null;
+  restartRequired: boolean;
+  backupPath?: string | null;
+}>;
+
+type PendingOfficialAccountResult = CommandResult<{
+  inventory: {
+    accounts: OfficialAccountSummary[];
+    currentAccountLabel?: string | null;
+  };
+  pending: OfficialAccountSummary;
   restartRequired: boolean;
   backupPath?: string | null;
 }>;
@@ -796,7 +872,7 @@ type StartupResult = CommandResult<{
   showUpdate: boolean;
 }>;
 
-type Route = "overview" | "relay" | "relayEnvironment" | "sessions" | "context" | "enhance" | "dreamSkin" | "zedRemote" | "userScripts" | "maintenance" | "about" | "settings";
+type Route = "overview" | "relay" | "relayEnvironment" | "sessions" | "context" | "enhance" | "dreamSkin" | "zedRemote" | "userScripts" | "recommendations" | "maintenance" | "about" | "settings";
 type Theme = "dark" | "light";
 
 const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string }> = [
@@ -826,12 +902,14 @@ const defaultSettings: BackendSettings = {
   computerUseGuardEnabled: false,
   administratorModeEnabled: false,
   codexAppPluginMarketplaceUnlock: true,
+  codexAppPluginAutoExpand: true,
   codexAppModelWhitelistUnlock: true,
   codexAppSessionDelete: true,
   codexAppMarkdownExport: true,
   codexAppPasteFix: false,
   codexAppForceChineseLocale: true,
   codexAppFastStartup: false,
+  codexAppClassicProjectSidebar: false,
   codexAppProjectMove: true,
   codexAppThreadIdBadge: false,
   codexAppConversationView: false,
@@ -895,8 +973,10 @@ const defaultSettings: BackendSettings = {
       vlmModel: "",
       vlmBaseUrl: "",
       userAgent: "",
+      officialCodexFingerprint: false,
       sub2apiEnabled: false,
       sub2apiMultiplier: "",
+      modelRoutes: [],
     },
   ],
   relayCommonConfigContents: "",
@@ -931,8 +1011,13 @@ export function App() {
   const [ccsProviders, setCcsProviders] = useState<CcsProvidersResult | null>(null);
   const [pendingProviderImport, setPendingProviderImport] = useState<ProviderImportRequest | null>(null);
   const [localSessions, setLocalSessions] = useState<LocalSessionsResult | null>(null);
+  const [sessionImportPreview, setSessionImportPreview] = useState<SessionArchivePreviewResult | null>(null);
+  const [sessionImportError, setSessionImportError] = useState("");
+  const [sessionTransferBusy, setSessionTransferBusy] = useState(false);
   const [zedRemoteProjects, setZedRemoteProjects] = useState<ZedRemoteProjectsResult | null>(null);
   const [liveContextEntries, setLiveContextEntries] = useState<CodexContextEntries | null>(null);
+  const [skillInventory, setSkillInventory] = useState<SkillInventoryResult | null>(null);
+  const [skillOperationBusy, setSkillOperationBusy] = useState(false);
   const [logs, setLogs] = useState<LogsResult | null>(null);
   const [diagnostics, setDiagnostics] = useState<DiagnosticsResult | null>(null);
   const [watcher, setWatcher] = useState<WatcherResult | null>(null);
@@ -940,8 +1025,6 @@ export function App() {
   const [dreamSkinVerification, setDreamSkinVerification] = useState<DreamSkinVerificationResult | null>(null);
   const [dreamSkinLibrary, setDreamSkinLibrary] = useState<DreamSkinThemeLibrary | null>(null);
   const [dreamSkinMarket, setDreamSkinMarket] = useState<DreamSkinMarketResult | null>(null);
-  const [dreamSkinCommunity, setDreamSkinCommunity] = useState<DreamSkinCommunityResult | null>(null);
-  const [pendingDreamSkinCommunity, setPendingDreamSkinCommunity] = useState("");
   const [selectedDreamSkinTheme, setSelectedDreamSkinTheme] = useState("builtin");
   const [savedDreamSkinThemeDraft, setSavedDreamSkinThemeDraft] = useState<DreamSkinThemeDraft | null>(null);
   const [dreamSkinThemeDraft, setDreamSkinThemeDraft] = useState<DreamSkinThemeDraft | null>(null);
@@ -1006,19 +1089,42 @@ export function App() {
     }
   };
 
-  const refreshOverview = async (silent = false) => {
+  const refreshOverview = async (silent = false, detectCrash = true) => {
     const result = await run(() => call<OverviewResult>("load_overview"));
     if (result) {
       // 崩溃检测：进程从运行状态变为停止/失败 → 弹出通知
       const prev = prevLaunchStatusRef.current;
       const current = result.latest_launch?.status;
-      if (prev && prev === "running" && current && (current === "stopped" || current === "failed" || current === "crashed")) {
+      if (detectCrash && prev && prev === "running" && current && (current === "stopped" || current === "failed" || current === "crashed")) {
         showNotice(t("Codex 意外停止"), tf("进程状态：{0}。是否要重新启动？", [current]), "failed");
       }
       prevLaunchStatusRef.current = current ?? null;
       setOverview(result);
       if (!silent) showResultNotice(t("概览已检查"), result, { silentSuccess: true });
     }
+    return result;
+  };
+
+  const refreshOverviewAfterLaunch = async (
+    previousStartedAtMs: number,
+    expectedAdministratorMode: boolean,
+  ) => {
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+      const result = await refreshOverview(true, false);
+      if (
+        result
+        && administratorLaunchStatusSettled(
+          previousStartedAtMs,
+          expectedAdministratorMode,
+          result.latest_launch,
+        )
+      ) {
+        return;
+      }
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 250));
+    }
+    await refreshOverview(true, false);
   };
 
   const refreshSettings = async (silent = false) => {
@@ -1050,7 +1156,7 @@ export function App() {
     if (result) {
       setDreamSkinStatus(result);
       if (!silent || !isSuccessStatus(result.status)) {
-        showResultNotice(t("Dream Skin 状态"), result, { silentSuccess: true });
+        showResultNotice(t("Dream Skin 状态"), result);
       }
     }
     return result;
@@ -1133,6 +1239,46 @@ export function App() {
       if (result) {
         setOfficialAccounts(result);
         showNotice(t("保存官方账号"), result.message, result.status);
+      }
+    } finally {
+      setOfficialAccountBusy(false);
+    }
+  };
+
+  const createPendingOfficialAccount = async (label?: string) => {
+    if (officialAccountBusy) return;
+    setOfficialAccountBusy(true);
+    try {
+      const result = await run(() =>
+        call<PendingOfficialAccountResult>("create_pending_official_account", {
+          request: { label: label?.trim() || null },
+        }),
+      );
+      if (result) {
+        setOfficialAccounts({
+          status: result.status,
+          message: result.message,
+          ...result.inventory,
+        });
+        showNotice(t("添加官方账号"), result.message, result.status);
+      }
+    } finally {
+      setOfficialAccountBusy(false);
+    }
+  };
+
+  const capturePendingOfficialAccount = async (accountId: string) => {
+    if (officialAccountBusy) return;
+    setOfficialAccountBusy(true);
+    try {
+      const result = await run(() =>
+        call<OfficialAccountsResult>("capture_pending_official_account", {
+          request: { accountId },
+        }),
+      );
+      if (result) {
+        setOfficialAccounts(result);
+        showNotice(t("保存新账号登录凭据"), result.message, result.status);
       }
     } finally {
       setOfficialAccountBusy(false);
@@ -1388,96 +1534,6 @@ export function App() {
     return result;
   };
 
-  const refreshDreamSkinCommunity = async (silent = false) => {
-    const result = await run(() => call<DreamSkinCommunityResult>("refresh_dream_skin_community"));
-    if (result) {
-      setDreamSkinCommunity(result);
-      if (!silent || !isSuccessStatus(result.status)) {
-        showResultNotice(t("DreamSkin 社区"), result, { silentSuccess: true });
-      }
-    }
-    return result;
-  };
-
-  const installDreamSkinCommunityTheme = async (theme: DreamSkinCommunityTheme) => {
-    const result = await run(() => call<DreamSkinCommunityResult>(
-      "install_dream_skin_community_theme",
-      { id: theme.id },
-    ));
-    if (!result) return false;
-    setDreamSkinCommunity(result);
-    showResultNotice(t("DreamSkin 社区"), result);
-    if (!isSuccessStatus(result.status)) return false;
-    await refreshDreamSkinLibrary(true);
-    const draft = await loadDreamSkinThemeDraft(theme.themeId);
-    if (draft) setDreamSkinDraftSelection(`stored:${theme.themeId}`, draft);
-    return true;
-  };
-
-  const refreshPendingDreamSkinCommunity = async () => {
-    const result = await run(() => call<PendingDreamSkinCommunityResult>("load_pending_dream_skin_community"));
-    if (result) setPendingDreamSkinCommunity(result.versionId);
-    return result;
-  };
-
-  const confirmPendingDreamSkinCommunity = async () => {
-    const result = await run(() => call<DreamSkinCommunityResult>("confirm_pending_dream_skin_community"));
-    if (!result) return;
-    setDreamSkinCommunity(result);
-    showResultNotice(t("DreamSkin 社区"), result);
-    if (!isSuccessStatus(result.status)) return;
-    setPendingDreamSkinCommunity("");
-    setRoute("dreamSkin");
-    await refreshDreamSkinLibrary(true);
-    if (result.installedThemeId) {
-      const draft = await loadDreamSkinThemeDraft(result.installedThemeId);
-      if (draft) {
-        setDreamSkinDraftSelection(`stored:${result.installedThemeId}`, draft);
-        await activateDreamSkinDraft(draft);
-      }
-    }
-  };
-
-  const dismissPendingDreamSkinCommunity = async () => {
-    const result = await run(() => call<PendingDreamSkinCommunityResult>("dismiss_pending_dream_skin_community"));
-    if (!result) return;
-    if (isSuccessStatus(result.status)) setPendingDreamSkinCommunity("");
-    else showResultNotice(t("DreamSkin 社区"), result);
-  };
-
-  const importDreamSkinThemePackage = async () => {
-    let selected: string | string[] | null;
-    try {
-      selected = await open({
-        title: t("导入 DreamSkin 主题包"),
-        multiple: false,
-        directory: false,
-        filters: [{ name: "DreamSkin ZIP", extensions: ["zip"] }],
-      });
-    } catch (error) {
-      showNotice(t("主题库"), tf("打开选择器失败：{0}", [stringifyError(error)]), "failed");
-      return;
-    }
-    const path = Array.isArray(selected) ? selected[0] : selected;
-    if (!path) return;
-    const previousIds = new Set(dreamSkinLibrary?.themes.map((item) => item.id) ?? []);
-    const result = await run(() => call<DreamSkinThemeLibraryResult>(
-      "import_dream_skin_theme_package",
-      { path },
-    ));
-    if (!result) return;
-    showResultNotice(t("主题库"), result);
-    if (!isSuccessStatus(result.status)) return;
-    const library = { themes: result.themes, activeDraft: result.activeDraft };
-    setDreamSkinLibrary(library);
-    const imported = result.themes.find((item) => item.kind === "stored" && !previousIds.has(item.id));
-    if (imported) {
-      const draft = await loadDreamSkinThemeDraft(imported.id);
-      if (draft) setDreamSkinDraftSelection(imported.key, draft);
-    }
-    await refreshDreamSkinCommunity(true);
-  };
-
   const installDreamSkinMarketTheme = async (theme: DreamSkinMarketTheme) => {
     const result = await run(() => call<DreamSkinMarketResult>("install_dream_skin_market_theme", { id: theme.id }));
     if (!result) return false;
@@ -1621,17 +1677,18 @@ export function App() {
     }
   };
 
-  const activateDreamSkinDraft = async (initialDraft: DreamSkinThemeDraft) => {
+  const activateDreamSkinTheme = async () => {
+    if (!dreamSkinThemeDraft) return;
     const currentTheme = pendingDreamSkinRestart
       ? {
           key: pendingDreamSkinRestart.currentThemeKey,
           name: pendingDreamSkinRestart.currentThemeName,
         }
       : dreamSkinLibrary?.themes.find((item) => item.active) ?? null;
-    let draft = initialDraft;
+    let draft = dreamSkinThemeDraft;
     if (draft.builtin && dreamSkinDraftDirty) {
       const stored = await saveDreamSkinThemeDraft();
-      if (!stored) return false;
+      if (!stored) return;
       draft = stored;
     }
     const saved = await persistDreamSkinSettings({
@@ -1639,7 +1696,7 @@ export function App() {
       codexAppDreamSkinEnabled: true,
       codexAppDreamSkinPaused: false,
     });
-    if (!saved) return false;
+    if (!saved) return;
     const ports = dreamSkinRequest().request;
     const result = await run(() => call<DreamSkinThemeActivationResult>("activate_dream_skin_theme", {
       request: {
@@ -1650,7 +1707,7 @@ export function App() {
     }));
     if (!result || !isSuccessStatus(result.status)) {
       if (result) showResultNotice(t("主题库"), result);
-      return false;
+      return;
     }
     setDreamSkinLibrary(result.library);
     setDreamSkinStatus({ ...result.runtime, status: result.status, message: result.message });
@@ -1668,12 +1725,6 @@ export function App() {
     } else {
       setPendingDreamSkinRestart(null);
     }
-    return true;
-  };
-
-  const activateDreamSkinTheme = async () => {
-    if (!dreamSkinThemeDraft) return;
-    await activateDreamSkinDraft(dreamSkinThemeDraft);
   };
 
   const renameDreamSkinTheme = async (item: DreamSkinThemeSummary) => {
@@ -1775,6 +1826,100 @@ export function App() {
     await refreshLocalSessions(true, localSessions?.offset ?? 0);
   };
 
+  const exportSessionArchive = async (sessionIds: string[]) => {
+    const date = new Date().toISOString().slice(0, 10);
+    let outputPath: string | null;
+    try {
+      outputPath = await save({
+        defaultPath: `Codex-Sessions-${date}.codexbackup`,
+        title: t("导出会话迁移包"),
+        filters: [{ name: t("Codex++ 会话迁移包"), extensions: ["codexbackup"] }],
+      });
+    } catch (error) {
+      showNotice(t("会话导出"), tf("打开保存选择器失败：{0}", [stringifyError(error)]), "failed");
+      return;
+    }
+    if (!outputPath?.trim()) return;
+    setSessionTransferBusy(true);
+    try {
+      const result = await run(() =>
+        call<SessionArchiveExportResult>("export_session_archive", {
+          request: { sessionIds, outputPath: outputPath.trim() },
+        }),
+      );
+      if (result) showResultNotice(t("会话导出"), result);
+    } finally {
+      setSessionTransferBusy(false);
+    }
+  };
+
+  const chooseSessionArchive = async () => {
+    let selected: unknown;
+    try {
+      selected = await open({
+        directory: false,
+        multiple: false,
+        title: t("选择会话迁移包"),
+        filters: [{ name: t("Codex++ 会话迁移包"), extensions: ["codexbackup", "zip"] }],
+      });
+    } catch (error) {
+      showNotice(t("会话导入"), tf("打开选择器失败：{0}", [stringifyError(error)]), "failed");
+      return;
+    }
+    if (typeof selected !== "string" || !selected.trim()) return;
+    setSessionTransferBusy(true);
+    try {
+      const result = await run(() =>
+        call<SessionArchivePreviewResult>("inspect_session_archive", {
+          request: { archivePath: selected.trim() },
+        }),
+      );
+      if (result && isSuccessStatus(result.status)) {
+        setSessionImportError("");
+        setSessionImportPreview(result);
+      } else if (result) {
+        showResultNotice(t("会话导入"), result);
+      }
+    } finally {
+      setSessionTransferBusy(false);
+    }
+  };
+
+  const importSessionArchive = async (
+    conflictPolicy: "skip" | "overwrite",
+    pathMappings: SessionPathMapping[],
+  ) => {
+    if (!sessionImportPreview?.archivePath) return;
+    setSessionTransferBusy(true);
+    setSessionImportError("");
+    try {
+      let result: SessionArchiveImportResult;
+      try {
+        result = await call<SessionArchiveImportResult>("import_session_archive", {
+          request: {
+            archivePath: sessionImportPreview.archivePath,
+            options: { conflictPolicy, pathMappings },
+          },
+        });
+      } catch (error) {
+        const message = stringifyError(error);
+        setSessionImportError(message);
+        showNotice(t("会话导入"), message, "failed");
+        return;
+      }
+      showResultNotice(t("会话导入"), result);
+      if (isSuccessStatus(result.status)) {
+        setSessionImportPreview(null);
+        setSessionImportError("");
+        await refreshLocalSessions(true);
+      } else {
+        setSessionImportError(result.message || t("失败"));
+      }
+    } finally {
+      setSessionTransferBusy(false);
+    }
+  };
+
   const refreshLiveContextEntries = async (silent = false) => {
     const result = await run(() => call<LiveContextEntriesResult>("read_live_context_entries"));
     if (result) {
@@ -1782,6 +1927,113 @@ export function App() {
       if (!silent || !isSuccessStatus(result.status)) showResultNotice(t("工具与插件"), result, { silentSuccess: true });
     }
     return result;
+  };
+
+  const refreshSkills = async (silent = false) => {
+    const result = await run(() => call<SkillInventoryResult>("list_skills"));
+    if (result) {
+      setSkillInventory(result);
+      if (!silent || !isSuccessStatus(result.status)) {
+        showResultNotice(t("Skill 管理"), result, { silentSuccess: true });
+      }
+    }
+    return result;
+  };
+
+  const importSkill = async (mode: "folder" | "file") => {
+    if (skillOperationBusy) return;
+    let selected: unknown;
+    try {
+      selected = await open(
+        mode === "folder"
+          ? {
+              directory: true,
+              multiple: false,
+              title: t("选择包含 SKILL.md 的 Skill 文件夹"),
+            }
+          : {
+              directory: false,
+              multiple: false,
+              title: t("选择 SKILL.md 或 ZIP Skill 包"),
+              filters: [{ name: t("Codex Skill"), extensions: ["md", "zip"] }],
+            },
+      );
+    } catch (error) {
+      showNotice(t("安装 Skill"), tf("打开选择器失败：{0}", [stringifyError(error)]), "failed");
+      return;
+    }
+    if (typeof selected !== "string" || !selected.trim()) return;
+
+    setSkillOperationBusy(true);
+    try {
+      const result = await run(() =>
+        call<SkillInventoryResult>("import_skill", {
+          request: { sourcePath: selected.trim() },
+        }),
+      );
+      if (result) {
+        setSkillInventory(result);
+        showResultNotice(t("安装 Skill"), result);
+      }
+    } finally {
+      setSkillOperationBusy(false);
+    }
+  };
+
+  const setInstalledSkillEnabled = async (skill: InstalledSkill, enabled: boolean) => {
+    if (skillOperationBusy || skill.readOnly) return;
+    setSkillOperationBusy(true);
+    try {
+      const result = await run(() =>
+        call<SkillInventoryResult>("set_skill_enabled", {
+          request: { skillId: skill.id, enabled },
+        }),
+      );
+      if (result) {
+        setSkillInventory(result);
+        showResultNotice(t("Skill 管理"), result);
+      }
+    } finally {
+      setSkillOperationBusy(false);
+    }
+  };
+
+  const uninstallInstalledSkill = async (skill: InstalledSkill) => {
+    if (skillOperationBusy || skill.readOnly) return;
+    const confirmed = await new Promise<boolean>((resolve) => {
+      setConfirmDialog({
+        title: t("卸载 Skill"),
+        message: tf("卸载 Skill“{0}”？文件会移动到安全备份目录，可手动恢复。", [skill.name]),
+        confirmText: t("确认卸载"),
+        cancelText: t("取消"),
+        resolve,
+      });
+    });
+    if (!confirmed) return;
+
+    setSkillOperationBusy(true);
+    try {
+      const result = await run(() =>
+        call<SkillInventoryResult>("uninstall_skill", {
+          request: { skillId: skill.id },
+        }),
+      );
+      if (result) {
+        setSkillInventory(result);
+        showResultNotice(t("卸载 Skill"), result);
+      }
+    } finally {
+      setSkillOperationBusy(false);
+    }
+  };
+
+  const copySkillInvocation = async (skill: InstalledSkill) => {
+    try {
+      await navigator.clipboard.writeText(skill.invocation || `$${skill.name}`);
+      showNotice(t("使用 Skill"), tf("已复制调用词 {0}，粘贴到 Codex 输入框即可使用。", [skill.invocation || `$${skill.name}`]), "ok");
+    } catch (error) {
+      showNotice(t("复制失败"), stringifyError(error), "failed");
+    }
   };
 
   const syncLiveContextEntries = async (next: BackendSettings, silent = false) => {
@@ -1854,6 +2106,7 @@ export function App() {
       await refreshSettings(true);
       await refreshRelayFiles(true);
       await refreshLiveContextEntries(true);
+      await refreshSkills(true);
     }
     if (next === "dreamSkin") {
       await refreshSettings(true);
@@ -1861,7 +2114,6 @@ export function App() {
       await refreshDreamSkinStatus(true);
       await refreshDreamSkinLibrary(true);
       await refreshDreamSkinMarket(true);
-      await refreshDreamSkinCommunity(true);
     }
     if (next === "settings") await refreshSettings(true);
     if (next === "userScripts") {
@@ -1880,19 +2132,22 @@ export function App() {
   };
 
   const launch = async () => {
+    const previousStartedAtMs = overview?.latest_launch?.started_at_ms ?? 0;
+    const expectedAdministratorMode = settings?.settings.administratorModeEnabled ?? false;
     const result = await launchCommand("launch_codex_plus");
     if (result) {
       showNotice(t("启动任务"), result.message, result.status);
-      await refreshOverview(true);
+      await refreshOverviewAfterLaunch(previousStartedAtMs, expectedAdministratorMode);
     }
   };
 
   const restart = async (syncActiveRelay = false) => {
-    const result = await launchCommand("restart_codex_plus", syncActiveRelay);
-    if (result) {
+    const previousStartedAtMs = overview?.latest_launch?.started_at_ms ?? 0;
+    const expectedAdministratorMode = settings?.settings.administratorModeEnabled ?? false;
+    const result = await launchCommand("restart_codex_plus", syncActiveRelay);    if (result) {
       showNotice(t("重启 Codex++"), result.message, result.status);
       if (isSuccessStatus(result.status)) setPendingDreamSkinRestart(null);
-      await refreshOverview(true);
+      await refreshOverviewAfterLaunch(previousStartedAtMs, expectedAdministratorMode);
     }
     return !!result && isSuccessStatus(result.status);
   };
@@ -2405,11 +2660,7 @@ export function App() {
     if (result) showNotice(t("供应商测试"), result.message, result.status);
   };
 
-  const measureRelayLatency = async (
-    url: string,
-    apiKey: string,
-    officialCodexFingerprint = false,
-  ) => {
+  const measureRelayLatency = async (url: string, apiKey: string, officialCodexFingerprint = false) => {
     return await run(() =>
       call<RelayLatencyResult>("measure_relay_latency", {
         url,
@@ -2427,19 +2678,13 @@ export function App() {
 
   const testStepwiseSettings = async (settings: BackendSettings) => {
     const result = await run(() => call<StepwiseTestResult>("test_stepwise_settings", { settings }));
-    if (result) showNotice("Stepwise 测试", result.message, result.status);
+    if (result) showNotice(t("Stepwise 测试"), result.message, result.status);
   };
 
   const fetchRelayProfileModels = async (profile: RelayProfile) => {
     const result = await run(() => call<RelayProfileModelsResult>("fetch_relay_profile_models", { profile }));
     if (result) showNotice(t("模型列表"), result.message, result.status);
     return result && isSuccessStatus(result.status) ? result.models : null;
-  };
-
-  const fetchSub2ApiBilling = async (profile: RelayProfile) => {
-    const result = await run(() => call<Sub2ApiBillingResult>("fetch_sub2api_billing", { profile }));
-    if (result) showNotice("Sub2API", result.message, result.status);
-    return result && isSuccessStatus(result.status) ? result : null;
   };
 
   const switchOfficialMode = async () => {
@@ -2533,6 +2778,7 @@ export function App() {
         return;
       }
       const currentSelected = activeRelayProfile(selectedSettings);
+      setOfficialAccounts((current) => officialAccountsAfterProviderSwitch(current));
       logDiagnostic("switchRelayProfile.ok", {
         targetRelayId: currentSelected.id,
         launchMode: selectedSettings.launchMode,
@@ -2601,20 +2847,12 @@ export function App() {
 
   useEffect(() => {
     void (async () => {
-      const startup = await run(() => call<StartupResult>("startup_options"));
-      if (startup?.showUpdate) {
-        setRoute("about");
-        void checkUpdate(false);
-      } else {
-        void checkUpdate(true);
-      }
       await refreshOverview(true);
       await refreshSettings(true);
       await refreshRelay(true);
       await refreshEnvConflicts(true);
       await refreshProviderSyncTargets(true);
       await refreshPendingProviderImport(true);
-      await refreshPendingDreamSkinCommunity();
       await refreshRemotePluginMarketplace(true);
     })();
   }, []);
@@ -2633,7 +2871,6 @@ export function App() {
   useEffect(() => {
     const timer = window.setInterval(() => {
       void refreshPendingProviderImport(true);
-      void refreshPendingDreamSkinCommunity();
     }, 1200);
     return () => window.clearInterval(timer);
   }, []);
@@ -2696,7 +2933,7 @@ export function App() {
     let screenshotPath: string | undefined;
     if (withScreenshot) {
       try {
-        const selected = await saveDialog({
+        const selected = await save({
           title: t("保存 Dream Skin 截图"),
           defaultPath: "codex-dream-skin-verification.png",
           filters: [{ name: "PNG", extensions: ["png"] }],
@@ -2820,10 +3057,7 @@ export function App() {
       }),
       refreshDreamSkinLibrary,
       refreshDreamSkinMarket,
-      refreshDreamSkinCommunity,
       installDreamSkinMarketTheme,
-      installDreamSkinCommunityTheme,
-      importDreamSkinThemePackage,
       createDreamSkinTheme: async () => runAfterDreamSkinDraftGuard(() => void createDreamSkinTheme()),
       saveDreamSkinTheme: saveDreamSkinThemeDraft,
       selectDreamSkinTheme,
@@ -2864,6 +3098,8 @@ export function App() {
       refreshRelayFiles,
       refreshOfficialAccounts,
       saveCurrentOfficialAccount,
+      createPendingOfficialAccount,
+      capturePendingOfficialAccount,
       switchOfficialAccount,
       renameOfficialAccount,
       deleteOfficialAccount,
@@ -2874,6 +3110,12 @@ export function App() {
       importCcsProviders,
       refreshLiveContextEntries,
       syncLiveContextEntries,
+      refreshSkills,
+      importSkill,
+      setInstalledSkillEnabled,
+      uninstallInstalledSkill,
+      copySkillInvocation,
+      skillOperationBusy,
       refreshScriptMarket,
       installMarketScript,
       setUserScriptEnabled,
@@ -2881,6 +3123,10 @@ export function App() {
       refreshLocalSessions,
       deleteLocalSession,
       deleteLocalSessions,
+      exportSessionArchive,
+      chooseSessionArchive,
+      importSessionArchive,
+      sessionTransferBusy,
       refreshZedRemoteProjects,
       openZedRemoteProject,
       forgetZedRemoteProject,
@@ -2897,7 +3143,6 @@ export function App() {
       diagnoseRelayProfile,
       testStepwiseSettings,
       fetchRelayProfileModels,
-      fetchSub2ApiBilling,
       switchRelayProfile,
       relaySwitching,
       switchOfficialMode,
@@ -2921,7 +3166,7 @@ export function App() {
       disableWatcher: () => watcherAction("disable_watcher"),
       toggleTheme: () => setTheme((current) => (current === "dark" ? "light" : "dark")),
     }),
-    [route, launchForm, settingsForm, settings, overview, removeOwnedData, update, updateInstallProgress.active, officialAccountBusy, logs, diagnostics, theme, relayFiles, localSessions, zedRemoteProjects, selectedProviderSyncTarget, envConflicts, relayEnvironment, ccsProviders, dreamSkinLibrary, dreamSkinMarket, dreamSkinCommunity, selectedDreamSkinTheme, savedDreamSkinThemeDraft, dreamSkinThemeDraft, dreamSkinDraftDirty, pendingDreamSkinRestart],
+    [route, launchForm, settingsForm, settings, overview, removeOwnedData, update, updateInstallProgress.active, officialAccountBusy, logs, diagnostics, theme, relayFiles, localSessions, zedRemoteProjects, selectedProviderSyncTarget, envConflicts, relayEnvironment, ccsProviders, sessionImportPreview, sessionImportError, sessionTransferBusy, skillOperationBusy, dreamSkinLibrary, dreamSkinMarket, selectedDreamSkinTheme, savedDreamSkinThemeDraft, dreamSkinThemeDraft, dreamSkinDraftDirty, pendingDreamSkinRestart],
   );
   const hasUpdate = update?.updateAvailable === true;
 
@@ -3041,6 +3286,7 @@ export function App() {
             <ContextScreen
               form={settingsForm}
               liveEntries={liveContextEntries}
+              skillInventory={skillInventory}
               relayFiles={relayFiles}
               onFormChange={setSettingsForm}
               actions={actions}
@@ -3061,7 +3307,6 @@ export function App() {
               form={settingsForm}
               library={dreamSkinLibrary}
               market={dreamSkinMarket}
-              community={dreamSkinCommunity}
               draft={dreamSkinThemeDraft}
               dirty={dreamSkinDraftDirty}
               pendingRestart={pendingDreamSkinRestart}
@@ -3102,7 +3347,13 @@ export function App() {
             />
           ) : null}
           {route === "settings" ? (
-            <SettingsScreen settings={settings} theme={theme} form={settingsForm} onFormChange={setSettingsForm} actions={actions} />
+            <SettingsScreen
+              settings={settings}
+              theme={theme}
+              form={settingsForm}
+              onFormChange={setSettingsForm}
+              actions={actions}
+            />
           ) : null}
         </section>
       </main>
@@ -3169,11 +3420,17 @@ export function App() {
           onDismiss={() => void dismissPendingProviderImport()}
         />
       ) : null}
-      {pendingDreamSkinCommunity ? (
-        <DreamSkinCommunityLinkDialog
-          versionId={pendingDreamSkinCommunity}
-          onConfirm={() => void confirmPendingDreamSkinCommunity()}
-          onDismiss={() => void dismissPendingDreamSkinCommunity()}
+      {sessionImportPreview ? (
+        <SessionImportDialog
+          busy={sessionTransferBusy}
+          errorMessage={sessionImportError}
+          key={sessionImportPreview.archivePath}
+          preview={sessionImportPreview}
+          onCancel={() => {
+            setSessionImportPreview(null);
+            setSessionImportError("");
+          }}
+          onConfirm={(conflictPolicy, pathMappings) => void importSessionArchive(conflictPolicy, pathMappings)}
         />
       ) : null}
     </div>
@@ -3206,9 +3463,6 @@ type Actions = {
   refreshDreamSkinLibrary: (silent?: boolean) => Promise<DreamSkinThemeLibrary | null>;
   refreshDreamSkinMarket: (silent?: boolean) => Promise<DreamSkinMarketResult | null>;
   installDreamSkinMarketTheme: (theme: DreamSkinMarketTheme) => Promise<boolean>;
-  refreshDreamSkinCommunity: (silent?: boolean) => Promise<DreamSkinCommunityResult | null>;
-  installDreamSkinCommunityTheme: (theme: DreamSkinCommunityTheme) => Promise<boolean>;
-  importDreamSkinThemePackage: () => Promise<void>;
   createDreamSkinTheme: () => Promise<void>;
   saveDreamSkinTheme: () => Promise<DreamSkinThemeDraft | null>;
   selectDreamSkinTheme: (item: DreamSkinThemeSummary) => void;
@@ -3228,6 +3482,8 @@ type Actions = {
   refreshRelayFiles: () => Promise<RelayFilesResult | null>;
   refreshOfficialAccounts: (silent?: boolean) => Promise<OfficialAccountsResult | null>;
   saveCurrentOfficialAccount: (label?: string) => Promise<void>;
+  createPendingOfficialAccount: (label?: string) => Promise<void>;
+  capturePendingOfficialAccount: (accountId: string) => Promise<void>;
   switchOfficialAccount: (accountId: string) => Promise<void>;
   renameOfficialAccount: (accountId: string, label: string) => Promise<void>;
   deleteOfficialAccount: (accountId: string) => Promise<void>;
@@ -3238,6 +3494,12 @@ type Actions = {
   importCcsProviders: () => Promise<void>;
   refreshLiveContextEntries: () => Promise<LiveContextEntriesResult | null>;
   syncLiveContextEntries: (settings: BackendSettings, silent?: boolean) => Promise<LiveContextEntriesResult | null>;
+  refreshSkills: (silent?: boolean) => Promise<SkillInventoryResult | null>;
+  importSkill: (mode: "folder" | "file") => Promise<void>;
+  setInstalledSkillEnabled: (skill: InstalledSkill, enabled: boolean) => Promise<void>;
+  uninstallInstalledSkill: (skill: InstalledSkill) => Promise<void>;
+  copySkillInvocation: (skill: InstalledSkill) => Promise<void>;
+  skillOperationBusy: boolean;
   refreshScriptMarket: () => Promise<void>;
   installMarketScript: (id: string) => Promise<void>;
   setUserScriptEnabled: (key: string, enabled: boolean) => Promise<void>;
@@ -3245,6 +3507,10 @@ type Actions = {
   refreshLocalSessions: (silent?: boolean, offset?: number) => Promise<LocalSessionsResult | null>;
   deleteLocalSession: (session: LocalSession) => Promise<void>;
   deleteLocalSessions: (sessions: LocalSession[]) => Promise<void>;
+  exportSessionArchive: (sessionIds: string[]) => Promise<void>;
+  chooseSessionArchive: () => Promise<void>;
+  importSessionArchive: (conflictPolicy: "skip" | "overwrite", pathMappings: SessionPathMapping[]) => Promise<void>;
+  sessionTransferBusy: boolean;
   refreshZedRemoteProjects: () => Promise<ZedRemoteProjectsResult | null>;
   openZedRemoteProject: (project: ZedRemoteProject, strategy?: ZedOpenStrategy) => Promise<void>;
   forgetZedRemoteProject: (project: ZedRemoteProject) => Promise<void>;
@@ -3266,7 +3532,6 @@ type Actions = {
   diagnoseRelayProfile: (profile: RelayProfile) => Promise<ProviderDoctorResult | null>;
   testStepwiseSettings: (settings: BackendSettings) => Promise<void>;
   fetchRelayProfileModels: (profile: RelayProfile) => Promise<string[] | null>;
-  fetchSub2ApiBilling: (profile: RelayProfile) => Promise<Sub2ApiBillingResult | null>;
   switchRelayProfile: (settings: BackendSettings, previousActiveRelayId?: string) => Promise<void>;
   relaySwitching: boolean;
   switchOfficialMode: () => Promise<void>;
@@ -3356,6 +3621,154 @@ function OverviewScreen({
   );
 }
 
+function OfficialAccountsCard({
+  accounts,
+  busy,
+  actions,
+}: {
+  accounts: OfficialAccountsResult | null;
+  busy: boolean;
+  actions: Actions;
+}) {
+  const [label, setLabel] = useState("");
+  const items = accounts?.accounts ?? [];
+  return (
+    <Panel>
+      <CardHead
+        title={t("官方账号")}
+        detail={t("只切换 auth.json 官方登录凭据；不会修改供应商、config.toml 或混入 API Key")}
+      />
+      <CardContent>
+        <div className="official-account-current">
+          <ShieldCheck className="h-5 w-5" />
+          <div>
+            <strong>{t("当前官方登录")}</strong>
+            <span>{accounts?.currentAccountLabel || t("未检测到有效的 ChatGPT 官方登录")}</span>
+          </div>
+        </div>
+        <div className="official-account-save-row">
+          <Input
+            disabled={busy}
+            onChange={(event) => setLabel(event.currentTarget.value)}
+            placeholder={t("账号名称（可选）")}
+            value={label}
+          />
+          <Button
+            disabled={busy}
+            onClick={() => {
+              void actions.saveCurrentOfficialAccount(label);
+              setLabel("");
+            }}
+          >
+            <Save className="h-4 w-4" />
+            {t("保存当前账号")}
+          </Button>
+          <Button
+            disabled={busy || items.some((account) => account.pendingLogin)}
+            onClick={() => {
+              if (
+                !window.confirm(
+                  t("添加新账号会先加密保存当前官方登录并退出登录。是否继续？"),
+                )
+              ) {
+                return;
+              }
+              void actions.createPendingOfficialAccount(label);
+              setLabel("");
+            }}
+            variant="secondary"
+          >
+            <Plus className="h-4 w-4" />
+            {t("添加新账号")}
+          </Button>
+          <Button disabled={busy} onClick={() => void actions.refreshOfficialAccounts()} variant="secondary">
+            <RefreshCw className="h-4 w-4" />
+            {t("刷新")}
+          </Button>
+        </div>
+        <div className="official-account-note">
+          {t("切换后请手动重启 Codex。现有供应商配置和混入 API Key 将保持不变。")}
+        </div>
+        {items.length ? (
+          <div className="official-account-list">
+            {items.map((account) => (
+              <div
+                className={`official-account-row ${account.active ? "active" : ""} ${account.pendingLogin ? "pending" : ""}`}
+                key={account.id}
+              >
+                <div className="official-account-summary">
+                  <strong>{account.label}</strong>
+                  <span>
+                    {account.pendingLogin
+                      ? t("待登录：请重启 Codex 并登录新的官方账号")
+                      : account.accountHint || t("未解析到账号标识")}
+                  </span>
+                  <small>
+                    {account.pendingLogin
+                      ? t("登录完成后回到这里保存登录凭据")
+                      : tf("保存时间：{0}", [formatTime(account.updatedAt * 1000)])}
+                  </small>
+                </div>
+                <div className="official-account-actions">
+                  <Button
+                    disabled={busy || account.active}
+                    onClick={() =>
+                      account.pendingLogin
+                        ? void actions.capturePendingOfficialAccount(account.id)
+                        : void actions.switchOfficialAccount(account.id)
+                    }
+                    size="sm"
+                    variant={account.active ? "secondary" : "default"}
+                  >
+                    {account.pendingLogin ? (
+                      <Save className="h-4 w-4" />
+                    ) : (
+                      <CheckCircle2 className="h-4 w-4" />
+                    )}
+                    {account.pendingLogin
+                      ? t("保存登录凭据")
+                      : account.active
+                        ? t("当前使用")
+                        : t("切换")}
+                  </Button>
+                  <Button
+                    disabled={busy}
+                    onClick={() => {
+                      const next = window.prompt(t("输入新的账号名称"), account.label);
+                      if (next?.trim() && next.trim() !== account.label) {
+                        void actions.renameOfficialAccount(account.id, next.trim());
+                      }
+                    }}
+                    size="icon"
+                    title={t("重命名")}
+                    variant="ghost"
+                  >
+                    <Edit3 className="h-4 w-4" />
+                  </Button>
+                  <Button
+                    disabled={busy}
+                    onClick={() => {
+                      if (!window.confirm(tf("删除保存的官方账号“{0}”？当前 live 登录不会被删除。", [account.label]))) return;
+                      void actions.deleteOfficialAccount(account.id);
+                    }}
+                    size="icon"
+                    title={t("删除保存副本")}
+                    variant="ghost"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="empty">{t("尚未保存官方账号。请先在 Codex 中登录，然后保存当前账号。")}</div>
+        )}
+      </CardContent>
+    </Panel>
+  );
+}
+
 function RelayEnvironmentScreen({ result, actions }: { result: RelayEnvironmentResult | null; actions: Actions }) {
   const proxyVariables = result?.proxyEnvironment.variables ?? [];
   const proxyVariableLabels = proxyVariables.map((item) => {
@@ -3425,113 +3838,6 @@ function RelayEnvironmentScreen({ result, actions }: { result: RelayEnvironmentR
             {t("重新检测")}
           </Button>
         </Toolbar>
-      </CardContent>
-    </Panel>
-  );
-}
-
-function OfficialAccountsCard({
-  accounts,
-  busy,
-  actions,
-}: {
-  accounts: OfficialAccountsResult | null;
-  busy: boolean;
-  actions: Actions;
-}) {
-  const [label, setLabel] = useState("");
-  const items = accounts?.accounts ?? [];
-  return (
-    <Panel>
-      <CardHead
-        title={t("官方账号")}
-        detail={t("只切换 auth.json 官方登录凭据；不会修改供应商、config.toml 或混入 API Key")}
-      />
-      <CardContent>
-        <div className="official-account-current">
-          <ShieldCheck className="h-5 w-5" />
-          <div>
-            <strong>{t("当前官方登录")}</strong>
-            <span>{accounts?.currentAccountLabel || t("未检测到有效的 ChatGPT 官方登录")}</span>
-          </div>
-        </div>
-        <div className="official-account-save-row">
-          <Input
-            disabled={busy}
-            onChange={(event) => setLabel(event.currentTarget.value)}
-            placeholder={t("账号名称（可选）")}
-            value={label}
-          />
-          <Button
-            disabled={busy}
-            onClick={() => {
-              void actions.saveCurrentOfficialAccount(label);
-              setLabel("");
-            }}
-          >
-            <Save className="h-4 w-4" />
-            {t("保存当前账号")}
-          </Button>
-          <Button disabled={busy} onClick={() => void actions.refreshOfficialAccounts()} variant="secondary">
-            <RefreshCw className="h-4 w-4" />
-            {t("刷新")}
-          </Button>
-        </div>
-        <div className="official-account-note">
-          {t("切换后请手动重启 Codex。现有供应商配置和混入 API Key 将保持不变。")}
-        </div>
-        {items.length ? (
-          <div className="official-account-list">
-            {items.map((account) => (
-              <div className={`official-account-row ${account.active ? "active" : ""}`} key={account.id}>
-                <div className="official-account-summary">
-                  <strong>{account.label}</strong>
-                  <span>{account.accountHint || t("未解析到账号标识")}</span>
-                  <small>{tf("保存时间：{0}", [formatTime(account.updatedAt * 1000)])}</small>
-                </div>
-                <div className="official-account-actions">
-                  <Button
-                    disabled={busy || account.active}
-                    onClick={() => void actions.switchOfficialAccount(account.id)}
-                    size="sm"
-                    variant={account.active ? "secondary" : "default"}
-                  >
-                    <CheckCircle2 className="h-4 w-4" />
-                    {account.active ? t("当前使用") : t("切换")}
-                  </Button>
-                  <Button
-                    disabled={busy}
-                    onClick={() => {
-                      const next = window.prompt(t("输入新的账号名称"), account.label);
-                      if (next?.trim() && next.trim() !== account.label) {
-                        void actions.renameOfficialAccount(account.id, next.trim());
-                      }
-                    }}
-                    size="icon"
-                    title={t("重命名")}
-                    variant="ghost"
-                  >
-                    <Edit3 className="h-4 w-4" />
-                  </Button>
-                  <Button
-                    disabled={busy}
-                    onClick={() => {
-                      if (!window.confirm(tf("删除保存的官方账号“{0}”？当前 live 登录不会被删除。", [account.label]))) return;
-                      void actions.deleteOfficialAccount(account.id);
-                    }}
-                    size="icon"
-                    title={t("删除保存副本")}
-                    variant="ghost"
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </Button>
-                </div>
-              </div>
-            ))}
-          </div>
-        ) : (
-          <div className="empty">{t("尚未保存官方账号。请先在 Codex 中登录，然后保存当前账号。")}</div>
-        )}
       </CardContent>
     </Panel>
   );
@@ -3830,6 +4136,7 @@ function EnhanceScreen({
           <div className="enhance-feature-groups">
             <FeatureGroup title={t("插件与模型")} detail={t("管理插件市场、模型列表和服务档位相关增强。")}>
               <FeatureToggle title={t("插件市场解锁")} detail={t("API Key 模式下扩展插件市场请求，尽量显示完整插件列表；官方/混合模式通常不需要。")} checked={form.codexAppPluginMarketplaceUnlock} disabled={!masterEnabled || !patchMode} onChange={(value) => setEnhanceFlag("codexAppPluginMarketplaceUnlock", value)} />
+              <FeatureToggle title={t("插件列表全量展示")} detail={t("进入插件页后自动连续展开“更多”，尽量一次显示完整插件列表。")} checked={form.codexAppPluginAutoExpand} disabled={!masterEnabled || !patchMode} onChange={(value) => setEnhanceFlag("codexAppPluginAutoExpand", value)} />
               <FeatureToggle title={t("模型白名单解锁")} detail={t("从环境变量和 config.toml 的 /v1/models 拉取模型并补进模型列表。")} checked={form.codexAppModelWhitelistUnlock} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppModelWhitelistUnlock", value)} />
               <FeatureToggle title={t("Fast 按钮")} detail={t("显示服务模式切换按钮；Fast 仅支持 gpt-5.4 / gpt-5.5，其他模型按 Standard 发送。")} checked={form.codexAppServiceTierControls} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppServiceTierControls", value)} />
               <div className="feature-action-row">
@@ -3873,6 +4180,7 @@ function EnhanceScreen({
               {isWindowsPlatform ? <FeatureToggle title={t("桌宠跟随真实鼠标")} detail={t("仅支持 V2 桌宠；不会修改宠物文件。将 V2 的 Computer Use 光标朝向动作映射到真实鼠标，V1 开启后安全不生效；拖拽、原生悬停或 Computer Use 活跃时自动让步。")} checked={form.codexAppPetRealMouseLook} disabled={!masterEnabled} onChange={(value) => setPersistedEnhanceFlag("codexAppPetRealMouseLook", value)} /> : null}
               <FeatureToggle title={t("强制中文界面")} detail={t("强制启用 Codex App 内置 zh-CN 语言包，避免 Statsig/VPN 不通时回退英文。需重启 Codex 才能完整生效。")} checked={form.codexAppForceChineseLocale} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppForceChineseLocale", value)} />
               <FeatureToggle title={t("快速启动")} detail={t("默认关闭；无 VPN 时可开启，让 Statsig 初始化快速失败，减少启动时长。需重启 Codex 才生效。")} checked={form.codexAppFastStartup} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppFastStartup", value)} />
+              <FeatureToggle title={t("经典项目侧栏")} detail={t("忽略 Codex 的侧栏 A/B 实验，固定使用项目和会话直接展开的经典布局。需重启 Codex 才能生效。")} checked={form.codexAppClassicProjectSidebar} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppClassicProjectSidebar", value)} />
               <FeatureToggle title={t("原生菜单栏位置")} detail={t("把 Codex++ 菜单插入 Codex 顶部原生菜单栏。")} checked={form.codexAppNativeMenuPlacement} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppNativeMenuPlacement", value)} />
               <FeatureToggle title={t("原生菜单汉化")} detail={t("启动时通过本地主进程调试端口汉化 Codex 原生菜单；不修改安装包。需重启 Codex 才生效。")} checked={form.codexAppNativeMenuLocalization} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppNativeMenuLocalization", value)} />
             </FeatureGroup>
@@ -3894,17 +4202,17 @@ function EnhanceScreen({
           <TaskProgressBox progress={remotePluginMarketplaceProgress} title={t("官方远端插件缓存进度")} />
           <div className="zed-remote-settings">
             <Field label={t("Zed 默认打开策略")}>
-              <AppSelect
+              <select
+                className="select-input"
                 disabled={!masterEnabled}
-                onChange={(value) => onFormChange({ ...form, zedRemoteOpenStrategy: value })}
-                options={[
-                  { value: "addToFocusedWorkspace", label: t("加入当前工作区") },
-                  { value: "reuseWindow", label: t("复用窗口") },
-                  { value: "newWindow", label: t("新窗口") },
-                  { value: "default", label: t("Zed 默认行为") },
-                ]}
+                onChange={(event) => onFormChange({ ...form, zedRemoteOpenStrategy: event.currentTarget.value as ZedOpenStrategy })}
                 value={form.zedRemoteOpenStrategy}
-              />
+              >
+                <option value="addToFocusedWorkspace">{t("加入当前工作区")}</option>
+                <option value="reuseWindow">{t("复用窗口")}</option>
+                <option value="newWindow">{t("新窗口")}</option>
+                <option value="default">{t("Zed 默认行为")}</option>
+              </select>
             </Field>
           </div>
           <div className="hint-line">
@@ -3924,7 +4232,6 @@ function DreamSkinScreen({
   form,
   library,
   market,
-  community,
   draft,
   dirty,
   pendingRestart,
@@ -3938,7 +4245,6 @@ function DreamSkinScreen({
   form: BackendSettings;
   library: DreamSkinThemeLibrary | null;
   market: DreamSkinMarketResult | null;
-  community: DreamSkinCommunityResult | null;
   draft: DreamSkinThemeDraft | null;
   dirty: boolean;
   pendingRestart: PendingDreamSkinRestart | null;
@@ -3949,7 +4255,7 @@ function DreamSkinScreen({
   onDraftChange: (value: DreamSkinThemeDraft | null) => void;
   actions: Actions;
 }) {
-  const [themeView, setThemeView] = useState<"market" | "community" | "local">("community");
+  const [themeView, setThemeView] = useState<"market" | "local">("market");
   const companionInputRef = useRef<HTMLInputElement>(null);
   const [companionError, setCompanionError] = useState("");
   const masterEnabled = form.enhancementsEnabled;
@@ -4113,17 +4419,6 @@ function DreamSkinScreen({
         <CardContent>
           <div aria-label={t("主题视图")} className="dream-skin-view-tabs" role="tablist">
             <button
-              aria-selected={themeView === "community"}
-              className={themeView === "community" ? "is-active" : ""}
-              onClick={() => setThemeView("community")}
-              role="tab"
-              type="button"
-            >
-              <Github className="h-4 w-4" />
-              {t("DreamSkin 社区")}
-              <span>{community?.items.length ?? 0}</span>
-            </button>
-            <button
               aria-selected={themeView === "market"}
               className={themeView === "market" ? "is-active" : ""}
               onClick={() => setThemeView("market")}
@@ -4147,13 +4442,7 @@ function DreamSkinScreen({
             </button>
           </div>
 
-          {themeView === "community" ? (
-            <DreamSkinCommunitySection
-              community={community}
-              actions={actions}
-              onInstalled={() => setThemeView("local")}
-            />
-          ) : themeView === "market" ? (
+          {themeView === "market" ? (
             <section className="dream-skin-market">
               <div className="dream-skin-library-head">
                 <div>
@@ -4172,6 +4461,10 @@ function DreamSkinScreen({
                   <Button onClick={() => void actions.openExternalUrl(market?.repositoryUrl || "https://github.com/BigPizzaV3/CodexPlusPlus-Themes")} variant="outline">
                     <Github className="h-4 w-4" />
                     {t("投稿主题")}
+                  </Button>
+                  <Button onClick={() => void actions.openExternalUrl("https://github.com/Chiody/agent-skin-hub")} variant="outline">
+                    <ExternalLink className="h-4 w-4" />
+                    {t("壁纸资源（外链）")}
                   </Button>
                 </Toolbar>
               </div>
@@ -4211,10 +4504,6 @@ function DreamSkinScreen({
                 </small>
               </div>
               <Toolbar>
-                <Button variant="outline" onClick={() => void actions.importDreamSkinThemePackage()}>
-                  <PackageOpen className="h-4 w-4" />
-                  {t("导入主题包")}
-                </Button>
                 <Button
                   disabled={!masterEnabled || !draft}
                   onClick={() => void actions.activateDreamSkinTheme()}
@@ -4372,23 +4661,23 @@ function DreamSkinScreen({
                     />
                   </Field>
                   <Field label={t("显示位置") }>
-                    <AppSelect
+                    <select
+                      className="select-input"
                       disabled={!companionDataUrl}
                       value={companion?.side ?? "right"}
-                      onChange={(value) => updateCompanion({ side: value })}
-                      options={[
-                        { value: "auto", label: t("自动") },
-                        { value: "left", label: t("左侧") },
-                        { value: "right", label: t("右侧") },
-                      ]}
-                    />
+                      onChange={(event) => updateCompanion({ side: event.currentTarget.value as "auto" | "left" | "right" })}
+                    >
+                      <option value="auto">{t("自动")}</option>
+                      <option value="left">{t("左侧")}</option>
+                      <option value="right">{t("右侧")}</option>
+                    </select>
                   </Field>
                   <Field label={t("水平偏移") }>
                     <Input
                       disabled={!companionDataUrl}
                       inputMode="numeric"
-                      max={48}
-                      min={-48}
+                      max={160}
+                      min={-160}
                       type="number"
                       value={companion?.offsetX ?? 0}
                       onChange={(event) => updateCompanion({ offsetX: Math.max(-48, Math.min(48, Number(event.currentTarget.value) || 0)) })}
@@ -4643,167 +4932,6 @@ function DreamSkinMarketCard({
   );
 }
 
-function DreamSkinCommunitySection({
-  community,
-  actions,
-  onInstalled,
-}: {
-  community: DreamSkinCommunityResult | null;
-  actions: Actions;
-  onInstalled: () => void;
-}) {
-  const [query, setQuery] = useState("");
-  const [sort, setSort] = useState<"latest" | "popular" | "name">("latest");
-  const items = useMemo(() => {
-    const normalized = query.trim().toLowerCase();
-    const filtered = (community?.items ?? []).filter((item) => {
-      if (!normalized) return true;
-      return [item.name, item.authorDisplayName, item.themeId, item.license]
-        .some((value) => value.toLowerCase().includes(normalized));
-    });
-    return [...filtered].sort((left, right) => {
-      if (sort === "popular") return right.downloadCount - left.downloadCount;
-      if (sort === "name") return left.name.localeCompare(right.name, "zh-CN");
-      return right.reviewedAt.localeCompare(left.reviewedAt);
-    });
-  }, [community?.items, query, sort]);
-
-  return (
-    <section className="dream-skin-community">
-      <div className="dream-skin-library-head">
-        <div>
-          <strong>{t("DreamSkin 社区主题")}</strong>
-          <small>
-            {community?.total
-              ? tf("来自 DreamSkin.cc 的已审核主题，共 {0} 套；安装前仍会在本机再次校验。", [String(community.total)])
-              : t("从 DreamSkin.cc 加载已审核主题包。")}
-          </small>
-        </div>
-        <Toolbar>
-          <Button onClick={() => void actions.refreshDreamSkinCommunity()} variant="secondary">
-            <RefreshCw className="h-4 w-4" />
-            {t("刷新社区")}
-          </Button>
-          <Button onClick={() => void actions.openExternalUrl("https://dreamskin.cc/gallery")} variant="outline">
-            <ExternalLink className="h-4 w-4" />
-            {t("在线主题库")}
-          </Button>
-          <Button onClick={() => void actions.openExternalUrl("https://dreamskin.cc/studio")} variant="outline">
-            <Palette className="h-4 w-4" />
-            {t("在线 Studio")}
-          </Button>
-        </Toolbar>
-      </div>
-      {community?.warning ? (
-        <div className="dream-skin-market-warning">
-          <Info className="h-4 w-4" />
-          <span>{community.warning}</span>
-        </div>
-      ) : null}
-      <div className="dream-skin-community-controls">
-        <Input
-          aria-label={t("搜索社区主题")}
-          onChange={(event) => setQuery(event.currentTarget.value)}
-          placeholder={t("搜索主题名称、作者或许可证")}
-          value={query}
-        />
-        <AppSelect
-          onChange={(value) => setSort(value as typeof sort)}
-          options={[
-            { value: "latest", label: t("最新审核") },
-            { value: "popular", label: t("下载最多") },
-            { value: "name", label: t("名称排序") },
-          ]}
-          title={t("社区主题排序")}
-          value={sort}
-        />
-      </div>
-      {items.length ? (
-        <div className="dream-skin-community-grid">
-          {items.map((item) => (
-            <DreamSkinCommunityCard
-              actions={actions}
-              key={item.id}
-              onInstalled={onInstalled}
-              theme={item}
-            />
-          ))}
-        </div>
-      ) : (
-        <div className="empty">
-          {!community
-            ? t("正在加载 DreamSkin 社区…")
-            : community.status === "failed"
-              ? community.message
-              : query.trim()
-                ? t("没有匹配的社区主题。")
-                : t("DreamSkin 社区暂时没有可用主题。")}
-        </div>
-      )}
-    </section>
-  );
-}
-
-function DreamSkinCommunityCard({
-  theme,
-  actions,
-  onInstalled,
-}: {
-  theme: DreamSkinCommunityTheme;
-  actions: Actions;
-  onInstalled: () => void;
-}) {
-  const status = theme.updateAvailable
-    ? t("可更新")
-    : theme.installed
-      ? tf("已安装 {0}", [theme.installedVersion])
-      : t("未安装");
-  const packageSize = theme.packageBytes >= 1024 * 1024
-    ? `${(theme.packageBytes / 1024 / 1024).toFixed(1)} MiB`
-    : `${Math.ceil(theme.packageBytes / 1024)} KiB`;
-  return (
-    <article className="dream-skin-community-card">
-      <div className="dream-skin-community-preview">
-        <img
-          alt={theme.name}
-          loading="lazy"
-          onError={(event) => {
-            event.currentTarget.onerror = null;
-            event.currentTarget.src = isWindowsPlatform ? dreamSkinWindowsPreviewUrl : dreamSkinMacPreviewUrl;
-          }}
-          src={theme.previewUrl}
-        />
-        <UiBadge variant={theme.updateAvailable ? "default" : theme.installed ? "secondary" : "outline"}>{status}</UiBadge>
-      </div>
-      <div className="dream-skin-community-copy">
-        <div className="dream-skin-market-title">
-          <strong title={theme.name}>{theme.name}</strong>
-          <span>v{theme.version}</span>
-        </div>
-        <small>{tf("作者：{0} · {1} · {2} 次下载", [theme.authorDisplayName, theme.license, String(theme.downloadCount)])}</small>
-        <small>{tf("主题包：{0}", [packageSize])}</small>
-      </div>
-      <div className="dream-skin-community-actions">
-        <Button
-          disabled={!theme.applyCompatible}
-          onClick={async () => {
-            if (await actions.installDreamSkinCommunityTheme(theme)) onInstalled();
-          }}
-          size="sm"
-          title={theme.applyCompatible ? t("下载、校验并安装主题包") : t("此主题仅支持在线预览或下载")}
-        >
-          <Download className="h-4 w-4" />
-          {theme.updateAvailable ? t("更新") : theme.installed ? t("重新安装") : t("安装")}
-        </Button>
-        <Button onClick={() => void actions.openExternalUrl(`https://dreamskin.cc/preview?themeVersion=${encodeURIComponent(theme.id)}`)} size="sm" variant="outline">
-          <Eye className="h-4 w-4" />
-          {t("预览")}
-        </Button>
-      </div>
-    </article>
-  );
-}
-
 function DreamSkinCheckList({ title, checks, emptyText }: { title: string; checks: DreamSkinCheck[]; emptyText: string }) {
   return (
     <section className="dream-skin-check-section">
@@ -4910,16 +5038,16 @@ function ZedRemoteScreen({
           </div>
           <div className="zed-remote-settings">
             <Field label={t("默认打开策略")}>
-              <AppSelect
-                onChange={(value) => onFormChange({ ...form, zedRemoteOpenStrategy: value })}
-                options={[
-                  { value: "addToFocusedWorkspace", label: t("加入当前工作区") },
-                  { value: "reuseWindow", label: t("复用窗口") },
-                  { value: "newWindow", label: t("新窗口") },
-                  { value: "default", label: t("Zed 默认行为") },
-                ]}
+              <select
+                className="select-input"
+                onChange={(event) => onFormChange({ ...form, zedRemoteOpenStrategy: event.currentTarget.value as ZedOpenStrategy })}
                 value={form.zedRemoteOpenStrategy}
-              />
+              >
+                <option value="addToFocusedWorkspace">{t("加入当前工作区")}</option>
+                <option value="reuseWindow">{t("复用窗口")}</option>
+                <option value="newWindow">{t("新窗口")}</option>
+                <option value="default">{t("Zed 默认行为")}</option>
+              </select>
             </Field>
             <label className="switch-row compact">
               <input
@@ -5024,14 +5152,7 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
     const query = marketSearch.trim().toLocaleLowerCase();
     if (!query) return marketScripts;
     return marketScripts.filter((script) => {
-      const haystack = [
-        script.name,
-        script.author,
-        script.description,
-        script.version,
-        script.homepage,
-        ...script.tags,
-      ]
+      const haystack = [script.name, script.author, script.description, script.version, script.homepage, ...script.tags]
         .filter(Boolean)
         .join(" ")
         .toLocaleLowerCase();
@@ -5067,41 +5188,19 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
         </CardContent>
       </Panel>
       <Panel>
-        <CardHead
-          title={t("市场脚本")}
-          detail={
-            market?.market.updatedAt
-              ? tf("清单更新时间：{0}，当前显示 {1} / {2}", [market.market.updatedAt, filteredMarketScripts.length, marketScripts.length])
-              : t("从 GitHub 静态清单加载")
-          }
-        />
+        <CardHead title={t("市场脚本")} detail={market?.market.updatedAt ? tf("清单更新时间：{0}，当前显示 {1} / {2}", [market.market.updatedAt, filteredMarketScripts.length, marketScripts.length]) : t("从 GitHub 静态清单加载")} />
         <CardContent>
           <div className="script-market-toolbar">
             <div className="script-market-search">
               <Search className="h-4 w-4" />
-              <Input
-                aria-label={t("搜索市场脚本")}
-                onChange={(event) => setMarketSearch(event.currentTarget.value)}
-                placeholder={t("搜索名称、作者、描述或标签")}
-                value={marketSearch}
-              />
+              <Input aria-label={t("搜索市场脚本")} onChange={(event) => setMarketSearch(event.currentTarget.value)} placeholder={t("搜索名称、作者、描述或标签")} value={marketSearch} />
             </div>
             <div className="script-market-view-toggle" role="group" aria-label={t("脚本市场排版")}>
-              <Button
-                aria-pressed={marketView === "grid"}
-                onClick={() => setMarketView("grid")}
-                size="sm"
-                variant={marketView === "grid" ? "secondary" : "ghost"}
-              >
+              <Button aria-pressed={marketView === "grid"} onClick={() => setMarketView("grid")} size="sm" variant={marketView === "grid" ? "secondary" : "ghost"}>
                 <LayoutGrid className="h-4 w-4" />
                 {t("板块")}
               </Button>
-              <Button
-                aria-pressed={marketView === "list"}
-                onClick={() => setMarketView("list")}
-                size="sm"
-                variant={marketView === "list" ? "secondary" : "ghost"}
-              >
+              <Button aria-pressed={marketView === "list"} onClick={() => setMarketView("list")} size="sm" variant={marketView === "list" ? "secondary" : "ghost"}>
                 <List className="h-4 w-4" />
                 {t("列表")}
               </Button>
@@ -5110,13 +5209,9 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
           {marketScripts.length ? (
             filteredMarketScripts.length ? (
               <div className={marketView === "list" ? "script-market-list" : "script-market-grid"}>
-                {filteredMarketScripts.map((script) => (
-                  <MarketScriptCard key={script.id} script={script} actions={actions} view={marketView} />
-                ))}
+                {filteredMarketScripts.map((script) => <MarketScriptCard key={script.id} script={script} actions={actions} view={marketView} />)}
               </div>
-            ) : (
-              <div className="empty">{t("没有匹配的市场脚本。")}</div>
-            )
+            ) : <div className="empty">{t("没有匹配的市场脚本。")}</div>
           ) : (
             <div className="empty">{market?.status === "failed" ? market.message : t("点击刷新市场加载远程脚本。")}</div>
           )}
@@ -5221,25 +5316,33 @@ function SessionsScreen({
           </div>
           <div className="form-row">
             <Field label={t("同步目标")}>
-              <AppSelect
+              <select
+                className="select-input"
                 disabled={providerSyncProgress.active || !(providerSyncTargets?.targets ?? []).length}
                 value={selectedProviderSyncTarget}
-                onChange={(value) => actions.setProviderSyncTarget(value)}
-                options={
-                  (providerSyncTargets?.targets ?? []).length
-                    ? (providerSyncTargets?.targets ?? []).map((target) => ({
-                        value: target.id,
-                        label: `${target.id}${t("（")}${providerSyncTargetLabel(target)}${t("）")}`,
-                      }))
-                    : [{ value: "", label: t("当前配置 provider"), disabled: true }]
-                }
-              />
+                onChange={(event) => actions.setProviderSyncTarget(event.currentTarget.value)}
+              >
+                {(providerSyncTargets?.targets ?? []).map((target) => (
+                  <option key={target.id} value={target.id}>
+                    {target.id}{t("（")}{providerSyncTargetLabel(target)}{t("）")}
+                  </option>
+                ))}
+                {!(providerSyncTargets?.targets ?? []).length ? <option value="">{t("当前配置 provider")}</option> : null}
+              </select>
             </Field>
           </div>
           <Toolbar>
             <Button onClick={() => void actions.refreshLocalSessions()}>
               <RefreshCw className="h-4 w-4" />
               {t("刷新会话")}
+            </Button>
+            <Button disabled={actions.sessionTransferBusy || !items.length} onClick={() => void actions.exportSessionArchive([])} variant="outline">
+              <Download className="h-4 w-4" />
+              {actions.sessionTransferBusy ? t("正在处理…") : t("导出全部")}
+            </Button>
+            <Button disabled={actions.sessionTransferBusy} onClick={() => void actions.chooseSessionArchive()} variant="outline">
+              <Upload className="h-4 w-4" />
+              {t("导入会话包")}
             </Button>
             <Button disabled={providerSyncProgress.active} onClick={() => void actions.syncProvidersNow()} variant="outline">
               <RefreshCw className="h-4 w-4" />
@@ -5265,6 +5368,10 @@ function SessionsScreen({
           <div className="hint-line">
             <Info className="h-4 w-4" />
             <span>{t("删除会创建本地备份；如果 Codex App 正在使用该会话，建议先关闭对应会话窗口再操作。")}</span>
+          </div>
+          <div className="hint-line">
+            <Info className="h-4 w-4" />
+            <span>{t("导入或导出会话迁移包前必须完全退出 Codex；迁移包包含完整对话和本地项目路径，但不包含账号、API Key 或项目源码。")}</span>
           </div>
           <label className="switch-row">
             <input
@@ -5299,6 +5406,15 @@ function SessionsScreen({
                   </Button>
                   <Button disabled={!selectedCount || bulkDeleting} onClick={clearSelectedSessions} size="sm" variant="outline">
                     {t("清空选择")}
+                  </Button>
+                  <Button
+                    disabled={!selectedCount || bulkDeleting || actions.sessionTransferBusy}
+                    onClick={() => void actions.exportSessionArchive(selectedSessions.map((session) => session.id))}
+                    size="sm"
+                    variant="outline"
+                  >
+                    <Download className="h-4 w-4" />
+                    {t("导出已选")}
                   </Button>
                   <Button disabled={(selectionMode && !selectedCount) || bulkDeleting} onClick={() => void deleteSelectedSessions()} size="sm" variant="outline">
                     {selectionMode ? <Trash2 className="h-4 w-4" /> : null}
@@ -5401,7 +5517,7 @@ function MaintenanceScreen({
       <Panel>
         <CardHead
           title={t("管理员模式")}
-          detail={t("通过 Codex++ 启动时，同时为终端、Agent 命令和 Computer Use 提供管理员能力。启动失败时不会回退到普通权限。")}
+          detail={t("管理员兼容模式会提升 Agent 受控命令、底部终端与 Computer Use；主 app-server 保持官方普通权限，以确保稳定兼容。")}
         />
         <CardContent>
           <label className="administrator-mode-switch">
@@ -5519,15 +5635,19 @@ function MaintenanceScreen({
 }
 
 function AdministratorModeCapabilities({ status }: { status: AdministratorModeStatus | null }) {
-  const state: "off" | "starting" | "active" | "failed" = status?.state === "starting" || status?.state === "active" || status?.state === "failed"
+  const state: "off" | "stopped" | "starting" | "active" | "failed" = status?.state === "stopped" || status?.state === "starting" || status?.state === "active" || status?.state === "failed"
     ? status.state
     : "off";
   const stateLabel = {
     off: t("关闭"),
+    stopped: t("未运行"),
     starting: t("启动中"),
     active: t("已启用"),
     failed: t("启动失败"),
   }[state];
+  const execState = administratorCapabilityState(status?.execElevated === true);
+  const terminalState = administratorCapabilityState(status?.execElevated === true);
+  const computerUseState = administratorCapabilityState(status?.computerUseElevated === true);
 
   return (
     <div className={`administrator-mode-status ${state}`}>
@@ -5536,18 +5656,29 @@ function AdministratorModeCapabilities({ status }: { status: AdministratorModeSt
         <span className="administrator-mode-state">{stateLabel}</span>
       </div>
       {state === "off" ? <p>{t("当前 Codex 会话使用官方普通权限行为。")}</p> : null}
-      {state === "starting" ? <p>{t("正在验证管理员命令执行与管理员 Computer Use。")}</p> : null}
+      {state === "stopped" ? <p>{t("Codex++ launcher 当前未运行；管理员能力会在下一次通过 Codex++ 启动 Codex 后重新验证。")}</p> : null}
+      {state === "starting" ? <p>{t("正在验证管理员受控命令、底部终端与管理员 Computer Use。")}</p> : null}
       {state === "active" ? (
-        <div className="administrator-mode-capabilities">
-          <span className={status?.execElevated ? "verified" : ""}>
-            <CheckCircle2 className="h-4 w-4" />
-            {t("管理员命令执行")}
-          </span>
-          <span className={status?.computerUseElevated ? "verified" : ""}>
-            <CheckCircle2 className="h-4 w-4" />
-            {t("管理员 Computer Use")}
-          </span>
-        </div>
+        <>
+          <p>{t("主 app-server：官方普通权限；底部终端：管理员权限（高完整性 Broker）")}</p>
+          <div className="administrator-mode-capabilities">
+            <span className={execState}>
+              {execState === "elevated" ? <CheckCircle2 aria-hidden="true" className="h-4 w-4" /> : <CircleAlert aria-hidden="true" className="h-4 w-4" />}
+              <strong>{t("管理员受控命令")}</strong>
+              <small>{execState === "elevated" ? t("已提升") : t("未提升")}</small>
+            </span>
+            <span className={terminalState}>
+              {terminalState === "elevated" ? <CheckCircle2 aria-hidden="true" className="h-4 w-4" /> : <CircleAlert aria-hidden="true" className="h-4 w-4" />}
+              <strong>{t("管理员底部终端")}</strong>
+              <small>{terminalState === "elevated" ? t("已提升") : t("未提升")}</small>
+            </span>
+            <span className={computerUseState}>
+              {computerUseState === "elevated" ? <CheckCircle2 aria-hidden="true" className="h-4 w-4" /> : <CircleAlert aria-hidden="true" className="h-4 w-4" />}
+              <strong>{t("管理员 Computer Use")}</strong>
+              <small>{computerUseState === "elevated" ? t("已提升") : t("未提升")}</small>
+            </span>
+          </div>
+        </>
       ) : null}
       {state === "failed" ? (
         <div className="administrator-mode-error" role="alert">
@@ -5817,22 +5948,22 @@ function SettingsScreen({
               />
             </Field>
             <Field label={t("背景适配方式")}>
-              <AppSelect
+              <select
+                className="select-input"
                 value={form.codexAppImageOverlayFitMode}
-                onChange={(value) =>
+                onChange={(event) =>
                   onFormChange({
                     ...form,
-                    codexAppImageOverlayFitMode: value,
+                    codexAppImageOverlayFitMode: event.currentTarget.value as ImageOverlayFitMode,
                   })
                 }
-                options={[
-                  { value: "fill", label: t("填充") },
-                  { value: "fit", label: t("适应") },
-                  { value: "stretch", label: t("拉伸") },
-                  { value: "tile", label: t("平铺") },
-                  { value: "center", label: t("居中") },
-                ]}
-              />
+              >
+                <option value="fill">{t("填充")}</option>
+                <option value="fit">{t("适应")}</option>
+                <option value="stretch">{t("拉伸")}</option>
+                <option value="tile">{t("平铺")}</option>
+                <option value="center">{t("居中")}</option>
+              </select>
             </Field>
           </div>
           <Toolbar>
@@ -5993,10 +6124,62 @@ function SortableRelayProfileCard({
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: profile.id });
   const active = profile.id === form.activeRelayId;
+  const latencyTarget = relayProfileLatencyTarget(profile);
+  const latencyApiKey = relayProfileApiKey(profile);
+  const [latency, setLatency] = useState<{
+    status: "idle" | "loading" | "ok" | "failed";
+    latencyMs: number | null;
+  }>({
+    status: latencyTarget ? "loading" : "idle",
+    latencyMs: null,
+  });
   const style: CSSProperties = {
     transform: CSS.Transform.toString(transform),
     transition,
   };
+  const refreshLatency = async () => {
+    if (!latencyTarget) {
+      setLatency({ status: "idle", latencyMs: null });
+      return;
+    }
+    setLatency({ status: "loading", latencyMs: null });
+    const result = await actions.measureRelayLatency(
+      latencyTarget,
+      latencyApiKey,
+      profile.officialCodexFingerprint,
+    );
+    setLatency(
+      result && isSuccessStatus(result.status) && result.latencyMs !== null
+        ? { status: "ok", latencyMs: result.latencyMs }
+        : { status: "failed", latencyMs: null },
+    );
+  };
+
+  useEffect(() => {
+    let mounted = true;
+    if (!latencyTarget) {
+      setLatency({ status: "idle", latencyMs: null });
+      return () => {
+        mounted = false;
+      };
+    }
+    setLatency({ status: "loading", latencyMs: null });
+    void actions.measureRelayLatency(
+      latencyTarget,
+      latencyApiKey,
+      profile.officialCodexFingerprint,
+    ).then((result) => {
+      if (!mounted) return;
+      setLatency(
+        result && isSuccessStatus(result.status) && result.latencyMs !== null
+          ? { status: "ok", latencyMs: result.latencyMs }
+          : { status: "failed", latencyMs: null },
+      );
+    });
+    return () => {
+      mounted = false;
+    };
+  }, [latencyTarget, latencyApiKey, profile.officialCodexFingerprint]);
 
   return (
     <div
@@ -6026,10 +6209,28 @@ function SortableRelayProfileCard({
       <span className="relay-summary">
         <strong>{profile.name || t("未命名供应商")}</strong>
         <small>{relayModeLabel(profile.relayMode)} · {relayProtocolLabel(profile.protocol)} · {relayProfileConfigBrief(profile)}</small>
-        {profile.sub2apiEnabled ? (
-          <small className="relay-sub2api-rate">{relaySub2ApiMultiplierLabel(profile)}</small>
-        ) : null}
       </span>
+      <button
+        className={`relay-latency ${latency.status}`}
+        disabled={!latencyTarget || latency.status === "loading"}
+        onClick={(event) => {
+          event.stopPropagation();
+          void refreshLatency();
+        }}
+        title={latencyTarget ? t("重新检测延迟") : t("此供应商没有单一目标 URL")}
+        type="button"
+      >
+        <Gauge className="h-4 w-4" />
+        <span>
+          {latency.status === "loading"
+            ? "..."
+            : latency.status === "ok" && latency.latencyMs !== null
+              ? tf("{0} ms", [latency.latencyMs])
+              : latency.status === "failed"
+                ? t("不可用")
+                : "--"}
+        </span>
+      </button>
       <span className="relay-card-actions">
         <Button
           className={`relay-use-button ${active ? "active" : ""}`}
@@ -6177,9 +6378,6 @@ function RelayProfileDetail({
   const [modelWindowRows, setModelWindowRows] = useState<ModelWindowRow[]>(
     modelWindowRowsFromProfile(profile.modelList, profile.modelWindows || "", profile.modelVlm),
   );
-  const [doctorResult, setDoctorResult] = useState<ProviderDoctorResult | null>(null);
-  const [doctorOpen, setDoctorOpen] = useState(false);
-  const [doctorRunning, setDoctorRunning] = useState(false);
   const isActive = !isNew && profile.id === form.activeRelayId;
   const profileUsesLiveFiles = relayProfileUsesLiveFiles(profile);
   useEffect(() => {
@@ -6262,68 +6460,21 @@ function RelayProfileDetail({
     });
     void actions.switchRelayProfile(next, previousActiveRelayId);
   };
-  const runProviderDoctor = async () => {
-    setDoctorOpen(true);
-    setDoctorRunning(true);
-    setDoctorResult(null);
-    const draftWithWindows = draftWithModelRows();
-    const result = await actions.diagnoseRelayProfile(deriveRelayProfileFromFiles(draftWithWindows));
-    setDoctorResult(result);
-    setDoctorRunning(false);
-  };
-  const aggregateProfile = isAggregateRelayProfile(draft);
-  const showDoctor = !aggregateProfile && (draft.relayMode !== "official" || draft.officialMixApiKey);
-  const detailStatus = aggregateProfile
-    ? isNew
-      ? t("选择已有供应商作为成员，保存后写入 settings payload")
-      : t("聚合配置只引用已有供应商，不复制 Key 和配置文件")
-    : relayProfileEditorStatus(draft, form, isNew);
   return (
     <div className="relay-detail-page" key={profile.id}>
       <div className="relay-detail-sticky">
-        <div className="relay-editor-heading">
-          <Button aria-label={t("返回列表")} onClick={onBack} size="icon" title={t("返回列表")} type="button" variant="ghost">
+        <Toolbar>
+          <Button onClick={onBack} variant="secondary">
             <ArrowLeft className="h-4 w-4" />
+            {t("返回列表")}
           </Button>
-          <div className="relay-editor-heading-copy">
-            <strong>{draft.name || (aggregateProfile ? t("未命名聚合供应商") : t("未命名供应商"))}</strong>
-            <span>{detailStatus}</span>
-          </div>
-        </div>
-        <div className="relay-editor-actions">
-          {showDoctor ? (
-            <Button disabled={doctorRunning} onClick={() => void runProviderDoctor()} type="button" variant="secondary">
-              <Stethoscope className="h-4 w-4" />
-              {doctorRunning ? t("诊断中") : t("诊断供应商")}
-            </Button>
-          ) : null}
-          {aggregateProfile ? (
-            <UiBadge variant="secondary">{t("聚合")}</UiBadge>
-          ) : isNew ? null : (
-            <Button
-              disabled={!form.relayProfilesEnabled || actions.relaySwitching}
-              onClick={switchDraft}
-              title={!form.relayProfilesEnabled ? t("供应商配置总开关已关闭") : actions.relaySwitching ? t("供应商切换中") : undefined}
-              variant={draft.id === form.activeRelayId ? "secondary" : "default"}
-            >
-              {actions.relaySwitching ? t("切换中") : draft.id === form.activeRelayId ? t("使用中") : t("设为当前")}
-            </Button>
-          )}
-          <Button disabled={!!validationError} onClick={() => void saveDraft()} title={validationError || t("保存")} type="button">
+          <Button disabled={!!validationError} onClick={() => void saveDraft()} title={validationError || t("保存")}>
             <Save className="h-4 w-4" />
             {t("保存")}
           </Button>
-        </div>
+        </Toolbar>
       </div>
-      <RelayProfileEditor
-        profile={draft}
-        form={form}
-        isNew={isNew}
-        onProfileChange={setDraft}
-        actions={actions}
-        modelWindowRows={modelWindowRows}
-        setModelWindowRows={setModelWindowRows}
-      />
+        <RelayProfileEditor profile={draft} form={form} isNew={isNew} onProfileChange={setDraft} onSwitch={switchDraft} actions={actions} modelWindowRows={modelWindowRows} setModelWindowRows={setModelWindowRows} />
       {isAggregateRelayProfile(draft) ? null : (
       <RelayFileEditors
         contextProfile={profile}
@@ -6336,15 +6487,6 @@ function RelayProfileDetail({
         actions={actions}
       />
       )}
-      {doctorOpen ? (
-        <ProviderDoctorModal
-          result={doctorResult}
-          running={doctorRunning}
-          onClose={() => {
-            if (!doctorRunning) setDoctorOpen(false);
-          }}
-        />
-      ) : null}
     </div>
   );
 }
@@ -6352,23 +6494,26 @@ function RelayProfileDetail({
 function ContextScreen({
   form,
   liveEntries,
+  skillInventory,
   relayFiles,
   onFormChange,
   actions,
 }: {
   form: BackendSettings;
   liveEntries: CodexContextEntries | null;
+  skillInventory: SkillInventoryResult | null;
   relayFiles: RelayFilesResult | null;
   onFormChange: (value: BackendSettings) => void;
   actions: Actions;
 }) {
   return (
     <Panel fill>
-      <CardHead title={t("Codex 工具与插件")} detail={t("独立管理 Codex 的 MCP、Skills、Plugins；切换任意供应商都会带上。")} />
+      <CardHead title={t("Codex 工具与插件")} detail={t("管理 MCP、真实 SKILL.md Skills 和 Plugins；Skill 安装状态直接对应 Codex 用户目录。")} />
       <CardContent>
         <RelayContextManager
           form={normalizeSettings(form)}
           liveEntries={liveEntries}
+          skillInventory={skillInventory}
           relayFiles={relayFiles}
           onFormChange={onFormChange}
           actions={actions}
@@ -6383,6 +6528,7 @@ function RelayProfileEditor({
   form,
   isNew = false,
   onProfileChange,
+  onSwitch,
   actions,
   modelWindowRows,
   setModelWindowRows,
@@ -6391,20 +6537,24 @@ function RelayProfileEditor({
   form: BackendSettings;
   isNew?: boolean;
   onProfileChange: (value: RelayProfile) => void;
+  onSwitch: () => void;
   actions: Actions;
   modelWindowRows: ModelWindowRow[];
   setModelWindowRows: (value: ModelWindowRow[]) => void;
 }) {
   const [showAdvanced, setShowAdvanced] = useState(false);
-  const [latencyBusy, setLatencyBusy] = useState(false);
-  const [latencyText, setLatencyText] = useState("");
+  const [doctorResult, setDoctorResult] = useState<ProviderDoctorResult | null>(null);
+  const [doctorOpen, setDoctorOpen] = useState(false);
+  const [doctorRunning, setDoctorRunning] = useState(false);
   // 纯 Responses 模式（非聚合）下 VLM/Strip 不生效，禁用下拉
-  const vlmUnsupportedProtocol = profile.protocol === "responses" && !isAggregateRelayProfile(profile);
+  const vlmUnsupportedProtocol =
+    profile.protocol === "responses" && !isAggregateRelayProfile(profile);
   if (isAggregateRelayProfile(profile)) {
     return (
       <AggregateRelayProfileEditor
         profile={profile}
         form={form}
+        isNew={isNew}
         onProfileChange={onProfileChange}
       />
     );
@@ -6420,25 +6570,6 @@ function RelayProfileEditor({
   const canFetchSub2ApiRate = profile.sub2apiEnabled && Boolean(sub2apiBaseUrl && profile.apiKey.trim());
   const updateDraft = (patch: Partial<RelayProfile>) => {
     onProfileChange(applyRelayProfilePatchToFiles(profile, patch, { allowGenerateFiles: isNew }));
-  };
-  const testLatency = async () => {
-    const targetUrl = profile.upstreamBaseUrl.trim() || profile.baseUrl.trim();
-    if (!targetUrl || !profile.apiKey.trim()) {
-      setLatencyText(t("请先填写 Base URL 和 API Key。"));
-      return;
-    }
-    setLatencyBusy(true);
-    const result = await actions.measureRelayLatency(
-      targetUrl,
-      profile.apiKey,
-      profile.officialCodexFingerprint === true,
-    );
-    setLatencyBusy(false);
-    setLatencyText(
-      result && isSuccessStatus(result.status) && result.latencyMs !== null
-        ? `${result.latencyMs} ms (HTTP ${result.httpStatus ?? 200})`
-        : result?.message || t("延迟测试失败。"),
-    );
   };
   const modelRoutes = normalizeRelayModelRoutes(profile.modelRoutes);
   const modelRouteTargets = form.relayProfiles.filter(
@@ -6456,21 +6587,47 @@ function RelayProfileEditor({
   };
   const removeModelWindowRow = (index: number) => {
     const nextRows = modelWindowRows.filter((_, rowIndex) => rowIndex !== index);
-    setModelWindowRows(nextRows.length ? nextRows : [{ model: "", window: "", imageHandling: "" }]);
+    setModelWindowRows(
+      nextRows.length ? nextRows : [{ model: "", window: "", imageHandling: "" }],
+    );
   };
   const addModelWindowRows = (rows: ModelWindowRow[]) => {
     setModelWindowRows(mergeModelWindowRows(modelWindowRows, rows));
   };
-  const fetchSub2ApiRate = async () => {
-    const result = await actions.fetchSub2ApiBilling(deriveRelayProfileFromFiles(profile));
-    if (!result) return;
-    updateDraft({
-      sub2apiEnabled: true,
-      sub2apiMultiplier: formatMultiplierValue(result.effectiveRateMultiplier),
-    });
+  const runProviderDoctor = async () => {
+    setDoctorOpen(true);
+    setDoctorRunning(true);
+    setDoctorResult(null);
+    const serializedRows = serializeModelWindowRows(modelWindowRows);
+    const result = await actions.diagnoseRelayProfile(
+      deriveRelayProfileFromFiles({
+        ...profile,
+        modelList: serializedRows.modelList,
+        modelWindows: serializedRows.modelWindows,
+        modelVlm: serializedRows.modelVlm,
+      }),
+    );
+    setDoctorResult(result);
+    setDoctorRunning(false);
   };
   return (
     <div className="relay-profile-editor">
+      <div className="relay-editor-head">
+        <div>
+          <strong>{profile.name || t("未命名供应商")}</strong>
+          <span>{relayProfileEditorStatus(profile, form, isNew)}</span>
+        </div>
+        {isNew ? null : (
+          <Button
+            disabled={!form.relayProfilesEnabled || actions.relaySwitching}
+            onClick={onSwitch}
+            title={!form.relayProfilesEnabled ? t("供应商配置总开关已关闭") : actions.relaySwitching ? t("供应商切换中") : undefined}
+            variant={profile.id === form.activeRelayId ? "secondary" : "default"}
+          >
+            {actions.relaySwitching ? t("切换中") : profile.id === form.activeRelayId ? t("使用中") : t("设为当前")}
+          </Button>
+        )}
+      </div>
       {isNew ? (
         <ProviderPresetSelector
           onSelect={(patch: PresetPatch) => {
@@ -6486,16 +6643,17 @@ function RelayProfileEditor({
           />
         </Field>
         <Field className="relay-field-mode" label={t("接入模式")}>
-          <AppSelect
+          <select
+            className="field-select"
             value={profile.relayMode}
-            onChange={(relayMode) => {
+            onChange={(event) => {
+              const relayMode = event.currentTarget.value as RelayMode;
               updateDraft(relayMode === "official" ? { relayMode, officialMixApiKey: false } : { relayMode });
             }}
-            options={[
-              { value: "official", label: t("官方登录") },
-              { value: "pureApi", label: t("纯 API") },
-            ]}
-          />
+          >
+            <option value="official">{t("官方登录")}</option>
+            <option value="pureApi">{t("纯 API")}</option>
+          </select>
         </Field>
         <Field className="relay-field-config-model" label={t("配置模型")}>
           <Input
@@ -6523,6 +6681,19 @@ function RelayProfileEditor({
           {goalsFeatureState.inherited ? (
             <p className="field-hint">{t("当前继承公共配置；修改后将为该供应商保存独立设置。")}</p>
           ) : null}
+        </Field>
+        <Field className="relay-field-official-fingerprint" label={t("传输兼容")}>
+          <label className="inline-check">
+            <input
+              checked={profile.officialCodexFingerprint}
+              onChange={(event) => updateDraft({ officialCodexFingerprint: event.currentTarget.checked })}
+              type="checkbox"
+            />
+            <span>{t("模拟官方 Codex 指纹")}</span>
+          </label>
+          <p className="field-hint">
+            {t("为此供应商启用固定的 Codex 风格 User-Agent、TLS/HTTP2 协商参数；默认关闭。")}
+          </p>
         </Field>
         {profile.relayMode === "official" ? (
           <Field className="relay-field-official-usage-alert" label={t("官方登录")}>
@@ -6625,161 +6796,132 @@ function RelayProfileEditor({
                 </button>
               </div>
             </Field>
-            <Field className="relay-field-sub2api" label="Sub2API">
-              <div className="sub2api-field">
-                <label className="inline-check">
-                  <input
-                    checked={profile.sub2apiEnabled}
-                    onChange={(event) => {
-                      const checked = event.currentTarget.checked;
-                      updateDraft({
-                        sub2apiEnabled: checked,
-                        sub2apiMultiplier: checked ? profile.sub2apiMultiplier || "" : "",
-                      });
-                      if (checked && sub2apiBaseUrl && profile.apiKey.trim()) {
-                        void fetchSub2ApiRate();
-                      }
-                    }}
-                    type="checkbox"
-                  />
-                  <span>{t("尝试从sub2api获取倍率显示")}</span>
-                </label>
-                <Button
-                  disabled={!canFetchSub2ApiRate}
-                  onClick={() => void fetchSub2ApiRate()}
-                  size="sm"
-                  type="button"
-                  variant="secondary"
-                >
-                  <Download className="h-4 w-4" />
-                  {t("获取倍率")}
-                </Button>
-              </div>
-              <p className="field-hint">
-                {profile.sub2apiEnabled
-                  ? profile.sub2apiMultiplier.trim()
-                    ? tf("当前缓存倍率：{0}x", [profile.sub2apiMultiplier.trim()])
-                    : t("保存前可先尝试从 /v1/sub2api/billing 获取上游倍率。")
-                  : t("非 Sub2API 供应商不会请求或显示倍率。")}
-              </p>
-            </Field>
           </div>
         ) : null}
         {showApiFields ? (
-          <section className="relay-config-section relay-field-model-list">
-            <div className="relay-config-section-head">
+          <div className="provider-doctor">
+            <div className="provider-doctor-head">
               <div>
-                <strong>{t("模型列表")}</strong>
-                <span>
-                  {t("每行一个模型；上下文窗口可填")} <code>1M</code>{t("、")}<code>200K</code> {t("或")} <code>1000000</code>{t("，留空表示使用 Codex 默认长度。")}
-                </span>
+                <strong>Provider Doctor</strong>
+                <span>{t("检查配置、模型列表和一次真实请求，定位供应商不可用原因。")}</span>
               </div>
-              <div className="relay-model-list-tools">
-                <Button
-                  onClick={() => setModelWindowRows([...modelWindowRows, { model: "", window: "", imageHandling: "" }])}
-                  size="sm"
-                  type="button"
-                  variant="secondary"
-                >
-                  <Plus className="h-4 w-4" />
-                  {t("添加模型")}
-                </Button>
-                <Button
-                  onClick={async () => {
-                    const serializedRows = serializeModelWindowRows(modelWindowRows);
-                    const models = await actions.fetchRelayProfileModels({
-                      ...profile,
-                      modelList: serializedRows.modelList,
-                      modelWindows: serializedRows.modelWindows,
-                    });
-                    if (models?.length) {
-                      addModelWindowRows(models.map((model) => ({ model, window: "", imageHandling: "" })));
-                    }
-                  }}
-                  size="sm"
-                  type="button"
-                  variant="secondary"
-                >
-                  <Download className="h-4 w-4" />
-                  {t("从上游获取")}
-                </Button>
-              </div>
+              <Button onClick={() => void runProviderDoctor()} size="sm" type="button" variant="secondary">
+                <Stethoscope className="h-4 w-4" />
+                {t("诊断供应商")}
+              </Button>
             </div>
+            <span>{doctorResult?.summary ?? t("点击后会打开诊断弹框，按步骤检查供应商。")}</span>
+          </div>
+        ) : null}
+        {showApiFields ? (
+          <Field className="relay-field-model-list" label={t("模型列表")}>
             <div className="relay-model-row-editor">
               <div className="relay-model-row relay-model-row-head">
                 <span>{t("模型名称")}</span>
                 <span>{t("上下文窗口")}</span>
-                <span>{t("图片处理方式")}</span>
               </div>
               {modelWindowRows.map((row, index) => (
-                <div className="relay-model-row" key={index}>
-                  <Input
-                    value={row.model}
-                    onChange={(event) => updateModelWindowRow(index, { model: event.currentTarget.value })}
-                    placeholder="deepseek/deepseek-v4-flash"
-                  />
-                  <Input
-                    value={row.window}
-                    onChange={(event) => updateModelWindowRow(index, { window: event.currentTarget.value })}
-                    placeholder="1M"
-                  />
-                  <AppSelect
-                    className="text-xs"
-                    value={row.imageHandling}
-                    disabled={vlmUnsupportedProtocol}
-                    onChange={(value) => updateModelWindowRow(index, { imageHandling: value })}
-                    options={[
-                      { value: "", label: t("纯文本模型请配置此项"), disabled: true },
-                      { value: "send-as-is", label: "send-as-is", title: t("原样发送图片") },
-                      { value: "strip", label: "strip images", title: t("为纯文本模型移除消息中的图片") },
-                      { value: "vlm", label: "VLM analysis", title: t("为纯文本模型配置图片分析路由") },
-                    ]}
-                    title={vlmUnsupportedProtocol ? t("VLM 仅支持 Chat Completions 协议和聚合模式") : t("多模态模型（支持图片输入的模型）请保持 send-as-is。")}
-                  />
-                  <Button
-                    aria-label={t("删除模型")}
-                    onClick={() => removeModelWindowRow(index)}
-                    size="icon"
-                    title={t("删除模型")}
-                    type="button"
-                    variant="ghost"
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </Button>
+                <div key={index}>
+                  <div className="relay-model-row">
+                    <Input
+                      value={row.model}
+                      onChange={(event) => updateModelWindowRow(index, { model: event.currentTarget.value })}
+                      placeholder="deepseek/deepseek-v4-flash"
+                    />
+                    <Input
+                      value={row.window}
+                      onChange={(event) => updateModelWindowRow(index, { window: event.currentTarget.value })}
+                      placeholder="1M"
+                    />
+                    <Button
+                      aria-label={t("删除模型")}
+                      onClick={() => removeModelWindowRow(index)}
+                      size="icon"
+                      title={t("删除模型")}
+                      type="button"
+                      variant="ghost"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
+                  </div>
+                  <div className="relay-model-row-actions">
+                    <select
+                      className="field-select text-xs"
+                      value={row.imageHandling}
+                      disabled={vlmUnsupportedProtocol}
+                      onChange={(event) =>
+                        updateModelWindowRow(index, {
+                          imageHandling: event.currentTarget.value as ImageHandling,
+                        })
+                      }
+                      title={
+                        vlmUnsupportedProtocol
+                          ? t("VLM 仅支持 Chat Completions 协议和聚合模式")
+                          : ""
+                      }
+                    >
+                      <option value="" disabled>{t("纯文本模型请配置此项")}</option>
+                      <option value="send-as-is" title={t("原样发送图片")}>send-as-is</option>
+                      <option value="strip" title={t("为纯文本模型移除消息中的图片")}>strip images</option>
+                      <option value="vlm" title={t("为纯文本模型配置图片分析路由")}>VLM analysis</option>
+                    </select>
+                    <span className="relay-model-row-hint">
+                      {t("多模态模型（支持图片输入的模型）请保持 send-as-is。")}
+                    </span>
+                  </div>
                 </div>
               ))}
             </div>
-          </section>
+            <div className="relay-model-list-tools">
+              <Button
+                onClick={() =>
+                  setModelWindowRows([
+                    ...modelWindowRows,
+                    { model: "", window: "", imageHandling: "" },
+                  ])
+                }
+                size="sm"
+                type="button"
+                variant="secondary"
+              >
+                <Plus className="h-4 w-4" />
+                {t("添加模型")}
+              </Button>
+              <Button
+                onClick={async () => {
+                  const serializedRows = serializeModelWindowRows(modelWindowRows);
+                  const models = await actions.fetchRelayProfileModels({
+                    ...profile,
+                    modelList: serializedRows.modelList,
+                    modelWindows: serializedRows.modelWindows,
+                  });
+                  if (models?.length) {
+                    addModelWindowRows(
+                      models.map((model) => ({ model, window: "", imageHandling: "" })),
+                    );
+                  }
+                }}
+                size="sm"
+                type="button"
+                variant="secondary"
+              >
+                <Download className="h-4 w-4" />
+                {t("从上游获取")}
+              </Button>
+            </div>
+            <p className="field-hint">
+              {t("每行一个模型；上下文窗口可填")} <code>1M</code>{t("、")}<code>200K</code> {t("或")} <code>1000000</code>{t("，留空表示使用 Codex 默认长度。")}
+            </p>
+          </Field>
         ) : null}
         {showApiFields ? (
-          <section className="relay-config-section relay-field-model-routes">
-            <div className="relay-config-section-head">
-              <div>
-                <strong>{t("单模型路由")}</strong>
-                <span>{t("仅在当前供应商启用时生效；精确匹配模型名并使用目标供应商的 URL 与 Key。目标必须是 Responses API，且需要从 Codex++ 启动。")}</span>
-              </div>
-              <div className="relay-model-list-tools">
-                <Button
-                  disabled={modelRouteTargets.length === 0}
-                  onClick={() => updateDraft({ modelRoutes: [...modelRoutes, { model: "", targetRelayId: "", targetModel: "" }] })}
-                  size="sm"
-                  title={modelRouteTargets.length === 0 ? t("请先创建一个 Responses API 目标供应商") : t("添加模型路由")}
-                  type="button"
-                  variant="secondary"
-                >
-                  <Plus className="h-4 w-4" />
-                  {t("添加模型路由")}
-                </Button>
-              </div>
-            </div>
+          <Field className="relay-field-model-routes" label={t("单模型路由")}>
             <div className="relay-model-route-editor">
-              {modelRoutes.length ? (
-                <div className="relay-model-route-row relay-model-route-head">
-                  <span>{t("匹配模型")}</span>
-                  <span>{t("目标供应商")}</span>
-                  <span>{t("目标模型（可选）")}</span>
-                </div>
-              ) : null}
+              <div className="relay-model-route-row relay-model-route-head">
+                <span>{t("匹配模型")}</span>
+                <span>{t("目标供应商")}</span>
+                <span>{t("目标模型（可选）")}</span>
+              </div>
               {modelRoutes.map((route, index) => (
                 <div className="relay-model-route-row" key={`model-route-${index}`}>
                   <Input
@@ -6813,7 +6955,23 @@ function RelayProfileEditor({
                 </div>
               ))}
             </div>
-          </section>
+            <div className="relay-model-list-tools">
+              <Button
+                disabled={modelRouteTargets.length === 0}
+                onClick={() => updateDraft({ modelRoutes: [...modelRoutes, { model: "", targetRelayId: "", targetModel: "" }] })}
+                size="sm"
+                title={modelRouteTargets.length === 0 ? t("请先创建一个 Responses API 目标供应商") : t("添加模型路由")}
+                type="button"
+                variant="secondary"
+              >
+                <Plus className="h-4 w-4" />
+                {t("添加模型路由")}
+              </Button>
+            </div>
+            <p className="field-hint">
+              {t("仅在当前供应商启用时生效；精确匹配模型名并使用目标供应商的 URL 与 Key。目标必须是 Responses API，且需要从 Codex++ 启动。")}
+            </p>
+          </Field>
         ) : null}
         {showApiFields && modelWindowRows.some((row) => row.imageHandling === "vlm") ? (
           <div className="relay-vlm-section">
@@ -6859,28 +7017,6 @@ function RelayProfileEditor({
             />
           </Field>
         ) : null}
-        {showApiFields ? (
-          <Field className="relay-field-official-fingerprint" label={t("传输兼容")}>
-            <label className="inline-check">
-              <input
-                checked={profile.officialCodexFingerprint === true}
-                onChange={(event) => updateDraft({ officialCodexFingerprint: event.currentTarget.checked })}
-                type="checkbox"
-              />
-              <span>{t("模拟官方 Codex 指纹")}</span>
-            </label>
-            <p className="field-hint">
-              {t("为此供应商启用固定的 Codex 风格 User-Agent、TLS/HTTP2 协商参数；默认关闭。")}
-            </p>
-            <Toolbar>
-              <Button disabled={latencyBusy} onClick={() => void testLatency()} type="button" variant="secondary">
-                <TestTube className="h-4 w-4" />
-                {latencyBusy ? t("正在测试延迟…") : t("测试延迟")}
-              </Button>
-              {latencyText ? <span className="field-hint">{latencyText}</span> : null}
-            </Toolbar>
-          </Field>
-        ) : null}
       </div>
       {showApiFields && profile.protocol === "chatCompletions" ? (
         <div className="hint-line relay-protocol-hint">
@@ -6892,6 +7028,15 @@ function RelayProfileEditor({
         <ShieldCheck className="h-4 w-4" />
         <span>{relayProfileModeHelp(profile)}</span>
       </div>
+      {doctorOpen ? (
+        <ProviderDoctorModal
+          result={doctorResult}
+          running={doctorRunning}
+          onClose={() => {
+            if (!doctorRunning) setDoctorOpen(false);
+          }}
+        />
+      ) : null}
     </div>
   );
 }
@@ -6899,10 +7044,12 @@ function RelayProfileEditor({
 function AggregateRelayProfileEditor({
   profile,
   form,
+  isNew = false,
   onProfileChange,
 }: {
   profile: RelayProfile;
   form: BackendSettings;
+  isNew?: boolean;
   onProfileChange: (value: RelayProfile) => void;
 }) {
   const candidates = aggregateMemberCandidates(form, profile.id);
@@ -6929,6 +7076,13 @@ function AggregateRelayProfileEditor({
 
   return (
     <div className="relay-profile-editor aggregate-editor">
+      <div className="relay-editor-head">
+        <div>
+          <strong>{profile.name || t("未命名聚合供应商")}</strong>
+          <span>{isNew ? t("选择已有供应商作为成员，保存后写入 settings payload") : t("聚合配置只引用已有供应商，不复制 Key 和配置文件")}</span>
+        </div>
+        <UiBadge variant="secondary">{t("聚合")}</UiBadge>
+      </div>
       <div className="relay-fields aggregate-fields">
         <Field className="relay-field-name" label={t("名称")}>
           <Input
@@ -6945,11 +7099,17 @@ function AggregateRelayProfileEditor({
           />
         </Field>
         <Field className="aggregate-strategy-field" label={t("聚合策略")}>
-          <AppSelect
+          <select
+            className="field-select"
             value={aggregate.strategy}
-            onChange={(value) => updateAggregate({ ...aggregate, strategy: value })}
-            options={aggregateStrategyOptions.map((option) => ({ value: option.value, label: option.label }))}
-          />
+            onChange={(event) => updateAggregate({ ...aggregate, strategy: event.currentTarget.value as RelayAggregateStrategy })}
+          >
+            {aggregateStrategyOptions.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
         </Field>
       </div>
       <div className="aggregate-strategy-grid">
@@ -7024,12 +7184,14 @@ function AggregateRelayProfileEditor({
 function RelayContextManager({
   form,
   liveEntries,
+  skillInventory,
   relayFiles,
   onFormChange,
   actions,
 }: {
   form: BackendSettings;
   liveEntries: CodexContextEntries | null;
+  skillInventory: SkillInventoryResult | null;
   relayFiles: RelayFilesResult | null;
   onFormChange: (value: BackendSettings) => void;
   actions: Actions;
@@ -7039,19 +7201,13 @@ function RelayContextManager({
   const [editor, setEditor] = useState<{ kind: ContextKind; entry?: CodexContextEntry } | null>(null);
   const visibleEntries = contextEntriesByKind(entries, activeKind);
   const label = contextKindLabel(activeKind);
-
-  const syncContextEntries = async (next: BackendSettings) => {
-    const syncResult = await actions.syncLiveContextEntries(next, true);
-    if (!syncResult || !isSuccessStatus(syncResult.status)) return false;
-    await actions.refreshRelayFiles();
-    return true;
-  };
+  const installedSkills = skillInventory?.skills ?? [];
+  const visibleCount = activeKind === "skill" ? installedSkills.length : visibleEntries.length;
 
   const saveEntry = async (kind: ContextKind, id: string, tomlBody: string) => {
     const next = await actions.upsertContextEntry(form, kind, id, tomlBody);
     if (!next) return;
     onFormChange(next);
-    if (!(await syncContextEntries(next))) return;
     setEditor(null);
   };
 
@@ -7060,14 +7216,16 @@ function RelayContextManager({
     const next = await actions.upsertContextEntry(form, entry.kind, entry.id, nextBody);
     if (!next) return;
     onFormChange(next);
-    await syncContextEntries(next);
+    const syncResult = await actions.syncLiveContextEntries(next, true);
+    if (syncResult && isSuccessStatus(syncResult.status)) {
+      void actions.refreshRelayFiles();
+    }
   };
 
   const deleteEntry = async (entry: CodexContextEntry) => {
     const next = await actions.deleteContextEntry(form, entry.kind, entry.id);
     if (!next) return;
     onFormChange(next);
-    await syncContextEntries(next);
   };
 
   return (
@@ -7075,13 +7233,26 @@ function RelayContextManager({
       <div className="relay-context-head">
         <div>
           <strong>{t("Codex 工具与插件")}</strong>
-          <span>{t("MCP、Skills、Plugins 作为全局配置独立管理，切换任意供应商都会合并。")}</span>
+          <span>{t("MCP 与插件配置随供应商同步；Skills 直接读取 Codex 的 SKILL.md 安装目录。")}</span>
         </div>
         <div className="relay-context-head-actions">
-          <Button onClick={() => setEditor({ kind: activeKind })} size="sm" variant="secondary">
-            <Plus className="h-4 w-4" />
-            {t("新增")}{label}
-          </Button>
+          {activeKind === "skill" ? (
+            <>
+              <Button disabled={actions.skillOperationBusy} onClick={() => void actions.importSkill("folder")} size="sm" variant="secondary">
+                <FolderUp className="h-4 w-4" />
+                {t("导入 Skill 文件夹")}
+              </Button>
+              <Button disabled={actions.skillOperationBusy} onClick={() => void actions.importSkill("file")} size="sm" variant="outline">
+                <FileUp className="h-4 w-4" />
+                {t("导入文件 / ZIP")}
+              </Button>
+            </>
+          ) : (
+            <Button onClick={() => setEditor({ kind: activeKind })} size="sm" variant="secondary">
+              <Plus className="h-4 w-4" />
+              {t("新增")}{label}
+            </Button>
+          )}
         </div>
       </div>
       <div className="segmented">
@@ -7089,56 +7260,65 @@ function RelayContextManager({
           <button
             className={activeKind === option.kind ? "active" : ""}
             key={option.kind}
-            onClick={() => setActiveKind(option.kind)}
+            onClick={() => {
+              setActiveKind(option.kind);
+              setEditor(null);
+            }}
             type="button"
           >
             <span>{option.label}</span>
-            <small>{contextEntriesByKind(entries, option.kind).length}</small>
+            <small>{option.kind === "skill" ? installedSkills.length : contextEntriesByKind(entries, option.kind).length}</small>
           </button>
         ))}
       </div>
       <div className="relay-context-summary">
-        {t("当前共有")} {visibleEntries.length} {t("个")}{label}{t("；这些条目独立于供应商保存，会写入所有供应商切换后的 config.toml。")}
+        {activeKind === "skill"
+          ? tf("当前读取到 {0} 个真实 Skill；用户 Skill 可导入、启停和卸载，系统与插件 Skill 为只读。", [visibleCount])
+          : <>{t("当前共有")} {visibleCount} {t("个")}{label}{t("；这些条目独立于供应商保存，会写入所有供应商切换后的 config.toml。")}</>}
       </div>
-      <div className="relay-context-list">
-        {visibleEntries.length ? (
-          visibleEntries.map((entry) => (
-            <div className="relay-context-row" key={`${entry.kind}-${entry.id}`}>
-              <strong className="context-title">{entry.title || entry.id}</strong>
-              <div className="relay-context-actions">
-                <button
-                  aria-checked={entry.enabled}
-                  aria-label={`contextEnabledSwitch-${entry.kind}-${entry.id}`}
-                  className={`context-enabled-switch ${entry.enabled ? "active" : ""}`}
-                  onClick={() => void toggleContextEntryEnabled(entry)}
-                  role="switch"
-                  title={entry.enabled ? t("禁用此扩展项") : t("启用此扩展项")}
-                  type="button"
-                >
-                  <span className="context-switch-track" aria-hidden="true">
-                    <span className="context-switch-thumb" />
-                  </span>
-                </button>
-                <Button onClick={() => setEditor({ kind: entry.kind, entry })} size="icon" title={t("编辑扩展项")} variant="ghost">
-                  <Edit3 className="h-4 w-4" />
-                </Button>
-                <Button
-                  className="relay-context-delete"
-                  onClick={() => void deleteEntry(entry)}
-                  size="icon"
-                  title={t("删除扩展项")}
-                  variant="ghost"
-                >
-                  <Trash2 className="h-4 w-4" />
-                </Button>
+      {activeKind === "skill" ? (
+        <SkillManager inventory={skillInventory} actions={actions} />
+      ) : (
+        <div className="relay-context-list">
+          {visibleEntries.length ? (
+            visibleEntries.map((entry) => (
+              <div className="relay-context-row" key={`${entry.kind}-${entry.id}`}>
+                <strong className="context-title">{entry.title || entry.id}</strong>
+                <div className="relay-context-actions">
+                  <button
+                    aria-checked={entry.enabled}
+                    aria-label={`contextEnabledSwitch-${entry.kind}-${entry.id}`}
+                    className={`context-enabled-switch ${entry.enabled ? "active" : ""}`}
+                    onClick={() => void toggleContextEntryEnabled(entry)}
+                    role="switch"
+                    title={entry.enabled ? t("禁用此扩展项") : t("启用此扩展项")}
+                    type="button"
+                  >
+                    <span className="context-switch-track" aria-hidden="true">
+                      <span className="context-switch-thumb" />
+                    </span>
+                  </button>
+                  <Button onClick={() => setEditor({ kind: entry.kind, entry })} size="icon" title={t("编辑扩展项")} variant="ghost">
+                    <Edit3 className="h-4 w-4" />
+                  </Button>
+                  <Button
+                    className="relay-context-delete"
+                    onClick={() => void deleteEntry(entry)}
+                    size="icon"
+                    title={t("删除扩展项")}
+                    variant="ghost"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </div>
               </div>
-            </div>
-          ))
-        ) : (
-          <div className="empty">{t("暂无")}{label}{t("，可以从通用配置文件或这里新增。")}</div>
-        )}
-      </div>
-      {editor ? (
+            ))
+          ) : (
+            <div className="empty">{t("暂无")}{label}{t("，可以从通用配置文件或这里新增。")}</div>
+          )}
+        </div>
+      )}
+      {editor && activeKind !== "skill" ? (
         <ContextEntryEditor
           entry={editor.entry}
           kind={editor.kind}
@@ -7148,6 +7328,128 @@ function RelayContextManager({
       ) : null}
     </div>
   );
+}
+
+function SkillManager({ inventory, actions }: { inventory: SkillInventoryResult | null; actions: Actions }) {
+  const [query, setQuery] = useState("");
+  const [sourceFilter, setSourceFilter] = useState<"all" | "user" | "system" | "plugin">("all");
+  const skills = inventory?.skills ?? [];
+  const normalizedQuery = query.trim().toLowerCase();
+  const visibleSkills = skills.filter((skill) => {
+    if (sourceFilter !== "all" && skill.source !== sourceFilter) return false;
+    if (!normalizedQuery) return true;
+    return [skill.name, skill.description, skill.pluginId ?? "", skill.path]
+      .some((value) => value.toLowerCase().includes(normalizedQuery));
+  });
+  const enabledCount = skills.filter((skill) => skill.enabled && skill.valid).length;
+  const userCount = skills.filter((skill) => skill.source === "user").length;
+  const pluginCount = skills.filter((skill) => skill.source === "plugin").length;
+
+  return (
+    <div className="skill-manager">
+      <div className="skill-toolbar">
+        <div className="skill-search">
+          <Search className="h-4 w-4" />
+          <Input
+            aria-label={t("搜索 Skill")}
+            placeholder={t("搜索名称、描述或路径")}
+            value={query}
+            onChange={(event) => setQuery(event.currentTarget.value)}
+          />
+        </div>
+        <select
+          className="field-select skill-source-filter"
+          value={sourceFilter}
+          onChange={(event) => setSourceFilter(event.currentTarget.value as typeof sourceFilter)}
+        >
+          <option value="all">{t("全部来源")}</option>
+          <option value="user">{t("用户安装")}</option>
+          <option value="system">{t("系统内置")}</option>
+          <option value="plugin">{t("插件提供")}</option>
+        </select>
+        <Button disabled={actions.skillOperationBusy} onClick={() => void actions.refreshSkills()} size="icon" title={t("刷新 Skill")} variant="outline">
+          <RefreshCw className={`h-4 w-4 ${actions.skillOperationBusy ? "spin" : ""}`} />
+        </Button>
+      </div>
+      <div className="skill-metrics">
+        <span>{tf("启用 {0}", [enabledCount])}</span>
+        <span>{tf("用户 {0}", [userCount])}</span>
+        <span>{tf("插件 {0}", [pluginCount])}</span>
+        <code title={inventory?.userSkillsDir}>{inventory?.userSkillsDir || "~/.codex/skills"}</code>
+      </div>
+      <div className="skill-list">
+        {visibleSkills.length ? (
+          visibleSkills.map((skill) => (
+            <div className={`skill-row ${skill.enabled ? "" : "disabled"} ${skill.valid ? "" : "invalid"}`} key={skill.id}>
+              <div className="skill-main">
+                <div className="skill-title-row">
+                  <strong>{skill.name}</strong>
+                  <UiBadge variant="secondary">{skillSourceLabel(skill)}</UiBadge>
+                  <UiBadge variant={skill.enabled && skill.valid ? "secondary" : "outline"}>
+                    {!skill.valid ? t("配置无效") : skill.enabled ? t("已启用") : t("已禁用")}
+                  </UiBadge>
+                </div>
+                <p>{skill.valid ? skill.description : skill.error || t("无法解析 SKILL.md")}</p>
+                <code title={skill.path}>{skill.path}</code>
+              </div>
+              <div className="skill-actions">
+                {skill.source === "user" ? (
+                  <button
+                    aria-checked={skill.enabled}
+                    aria-label={`skillEnabledSwitch-${skill.id}`}
+                    className={`context-enabled-switch ${skill.enabled ? "active" : ""}`}
+                    disabled={actions.skillOperationBusy || !skill.valid}
+                    onClick={() => void actions.setInstalledSkillEnabled(skill, !skill.enabled)}
+                    role="switch"
+                    title={skill.enabled ? t("禁用 Skill") : t("启用 Skill")}
+                    type="button"
+                  >
+                    <span className="context-switch-track" aria-hidden="true">
+                      <span className="context-switch-thumb" />
+                    </span>
+                  </button>
+                ) : null}
+                <Button
+                  disabled={!skill.enabled || !skill.valid}
+                  onClick={() => void actions.copySkillInvocation(skill)}
+                  size="sm"
+                  title={t("复制调用词")}
+                  variant="outline"
+                >
+                  <Copy className="h-4 w-4" />
+                  {skill.invocation}
+                </Button>
+                {!skill.readOnly ? (
+                  <Button
+                    className="relay-context-delete"
+                    disabled={actions.skillOperationBusy}
+                    onClick={() => void actions.uninstallInstalledSkill(skill)}
+                    size="icon"
+                    title={t("卸载 Skill")}
+                    variant="ghost"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                ) : null}
+              </div>
+            </div>
+          ))
+        ) : (
+          <div className="empty">
+            {skills.length
+              ? t("没有匹配的 Skill。")
+              : t("尚未发现 Skill。可导入包含 SKILL.md 的文件夹、单个 SKILL.md 或 ZIP 包。")}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function skillSourceLabel(skill: InstalledSkill): string {
+  if (skill.source === "system") return t("系统内置");
+  if (skill.source === "plugin") return skill.pluginId ? tf("插件 · {0}", [skill.pluginId]) : t("插件提供");
+  return skill.enabled ? t("用户安装") : t("用户安装 · 已禁用");
 }
 
 function ContextEntryEditor({
@@ -7170,12 +7472,16 @@ function ContextEntryEditor({
     <div className="context-editor">
       <div className="context-editor-fields">
         <Field label={t("类型")}>
-          <AppSelect
+          <select
+            className="field-select"
             disabled={!!entry}
             value={draftKind}
-            onChange={(value) => setDraftKind(value)}
-            options={contextKindOptions.map((option) => ({ value: option.kind, label: option.label }))}
-          />
+            onChange={(event) => setDraftKind(event.currentTarget.value as ContextKind)}
+          >
+            {contextKindOptions.map((option) => (
+              <option key={option.kind} value={option.kind}>{option.label}</option>
+            ))}
+          </select>
         </Field>
         <Field label="ID">
           <Input
@@ -7297,7 +7603,7 @@ function RelayFileEditors({
         <div className="relay-file-head">
           <div>
             <strong>{t("通用配置文件")}</strong>
-            <span>{t("只保留非 MCP、Skills、Plugins 的跨供应商配置；工具与插件在独立页面管理。")}</span>
+            <span>{t("只保留非 MCP、Plugins 的跨供应商配置；真实 Skills 由 SKILL.md 目录独立管理。")}</span>
           </div>
           <Button
             onClick={async () => {
@@ -7781,39 +8087,117 @@ function PendingProviderImportDialog({
   );
 }
 
-function DreamSkinCommunityLinkDialog({
-  versionId,
+function SessionImportDialog({
+  preview,
+  busy,
+  errorMessage,
   onConfirm,
-  onDismiss,
+  onCancel,
 }: {
-  versionId: string;
-  onConfirm: () => void;
-  onDismiss: () => void;
+  preview: SessionArchivePreviewResult;
+  busy: boolean;
+  errorMessage: string;
+  onConfirm: (conflictPolicy: "skip" | "overwrite", pathMappings: SessionPathMapping[]) => void;
+  onCancel: () => void;
 }) {
+  const [conflictPolicy, setConflictPolicy] = useState<"skip" | "overwrite">("skip");
+  const [pathMappings, setPathMappings] = useState<SessionPathMapping[]>(() =>
+    preview.missingProjectRoots.map((path) => ({ from: path, to: "" })),
+  );
+  const visibleSessions = preview.sessions.slice(0, 8);
+  const extraSessions = Math.max(0, preview.sessions.length - visibleSessions.length);
+  const activeMappings = pathMappings.filter((mapping) => mapping.from.trim() && mapping.to.trim());
   return (
     <div className="modal-backdrop" role="dialog" aria-modal="true">
-      <div className="modal-card provider-import-modal">
+      <div className="modal-card session-import-modal">
         <div className="modal-head">
           <div>
-            <h2>{t("从 DreamSkin.cc 安装主题")}</h2>
-            <p>{t("检测到网页一键换肤请求。确认后会从固定社区 API 下载，并在本机重新校验大小、SHA-256、ZIP 清单与 Safe CSS。")}</p>
+            <h2>{t("导入会话迁移包")}</h2>
+            <p>{t("确认会话、冲突处理和项目路径后再写入本机 Codex 数据。导入前会自动创建安全备份。")}</p>
           </div>
-          <button className="toast-close" onClick={onDismiss} type="button">×</button>
+          <button className="toast-close" disabled={busy} onClick={onCancel} type="button">×</button>
         </div>
-        <div className="metric-list">
-          <Metric label={t("主题版本 ID")} value={versionId} />
-          <Metric label={t("来源")} value="api.dreamskin.cc" />
+        <div className="metric-list session-import-metrics">
+          <Metric label={t("会话数量")} value={tf("{0} 个", [preview.sessionCount])} />
+          <Metric label={t("附件文件")} value={tf("{0} 个", [preview.assetCount])} />
+          <Metric label={t("ID 冲突")} value={tf("{0} 个", [preview.conflictCount])} />
+          <Metric label={t("来源版本")} value={preview.sourceVersion || t("未知")} />
+          <Metric label={t("导出时间")} value={formatTime(Date.parse(preview.exportedAt))} />
         </div>
-        <div className="hint-line" role="note">
-          {t("链接不能携带任意下载地址、文件路径或命令；安装后主题会进入“我的主题”，不会自动重启 Codex。")}
+        <Field label={t("冲突处理")}>
+          <select
+            className="select-input"
+            disabled={busy || !preview.conflictCount}
+            value={conflictPolicy}
+            onChange={(event) => setConflictPolicy(event.currentTarget.value as "skip" | "overwrite")}
+          >
+            <option value="skip">{t("跳过已有会话（推荐）")}</option>
+            <option value="overwrite">{t("备份后覆盖已有会话")}</option>
+          </select>
+        </Field>
+        <div className="session-import-list">
+          {visibleSessions.map((session) => (
+            <div className="session-import-item" key={session.id}>
+              <div>
+                <strong>{session.title || session.id}</strong>
+                <small>{session.cwd || t("未记录项目路径")}</small>
+              </div>
+              <UiBadge variant={session.conflict ? "outline" : "secondary"}>
+                {session.conflict ? t("已存在") : session.hasRollout ? t("可导入") : t("无 rollout")}
+              </UiBadge>
+            </div>
+          ))}
+          {extraSessions ? <small className="session-import-extra">{tf("另外还有 {0} 个会话", [extraSessions])}</small> : null}
         </div>
-        <Toolbar>
-          <Button onClick={onConfirm}>
-            <Download className="h-4 w-4" />
-            {t("下载并安装")}
+        {pathMappings.length ? (
+          <div className="session-path-mappings">
+            <div className="session-path-mappings-head">
+              <strong>{t("缺失的项目路径")}</strong>
+              <small>{t("项目已移动时填写新目录；留空则保留原路径。")}</small>
+            </div>
+            {pathMappings.map((mapping, index) => (
+              <div className="session-path-mapping" key={mapping.from}>
+                <code title={mapping.from}>{mapping.from}</code>
+                <span>→</span>
+                <Input
+                  disabled={busy}
+                  placeholder={t("新的项目目录")}
+                  value={mapping.to}
+                  onChange={(event) => {
+                    const nextPath = event.currentTarget.value;
+                    setPathMappings((current) =>
+                      current.map((item, itemIndex) =>
+                        itemIndex === index ? { ...item, to: nextPath } : item,
+                      ),
+                    );
+                  }}
+                />
+              </div>
+            ))}
+          </div>
+        ) : null}
+        {preview.warnings.length ? (
+          <div className="session-import-warnings">
+            {preview.warnings.map((warning) => <small key={warning}>{warning}</small>)}
+          </div>
+        ) : null}
+        <div className="hint-line session-import-security">
+          <ShieldCheck className="h-4 w-4" />
+          <span>{t("迁移包不会写入账号或 API Key；导入失败时可使用自动创建的安全备份恢复。")}</span>
+        </div>
+        {errorMessage ? (
+          <div className="session-import-error" role="alert">
+            <strong>{t("会话导入")} · {t("失败")}</strong>
+            <small>{errorMessage}</small>
+          </div>
+        ) : null}
+        <div className="modal-actions">
+          <Button disabled={busy} onClick={() => onConfirm(conflictPolicy, activeMappings)}>
+            <Upload className="h-4 w-4" />
+            {busy ? t("正在导入…") : t("确认导入")}
           </Button>
-          <Button onClick={onDismiss} variant="secondary">{t("取消")}</Button>
-        </Toolbar>
+          <Button disabled={busy} onClick={onCancel} variant="secondary">{t("取消")}</Button>
+        </div>
       </div>
     </div>
   );
@@ -8015,11 +8399,12 @@ function routeSubtitle(route: Route) {
     relay: t("管理 API 供应商、协议、Key 与配置文件"),
     relayEnvironment: t("排查可能干扰中转站配置的本机环境"),
     sessions: t("查看、删除和修复 Codex 本地会话"),
-    context: t("独立管理 MCP、Skills、Plugins"),
+    context: t("管理 MCP、真实 Skills 和 Plugins"),
     enhance: t("会话删除、导出、项目移动和脚本能力"),
     dreamSkin: t("Codex-Dream-Skin 风格主题和换图"),
     zedRemote: t("管理 Codex SSH 项目并加入 Zed workspace"),
     userScripts: t("内置和用户自定义脚本清单"),
+    recommendations: t("普通推荐"),
     maintenance: t("入口安装、修复、Watcher 与手动启动"),
     about: t("版本信息、项目链接、GitHub Release 更新、日志与诊断"),
     settings: t("主题和启动参数"),
@@ -8719,8 +9104,10 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
             vlmModel: "",
             vlmBaseUrl: "",
             userAgent: "",
+            officialCodexFingerprint: false,
             sub2apiEnabled: false,
             sub2apiMultiplier: "",
+            modelRoutes: [],
           },
         ];
   const activeRelayId = profiles.some((profile) => profile.id === settings.activeRelayId)
@@ -8798,6 +9185,11 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
         autoCompactLimit: "",
         modelList: "",
         modelWindows: "",
+        modelVlm: "",
+        vlmApiKey: "",
+        vlmModel: "",
+        vlmBaseUrl: "",
+        officialCodexFingerprint: false,
         modelRoutes: [],
         sub2apiEnabled: false,
         sub2apiMultiplier: "",
@@ -8829,6 +9221,11 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
     autoCompactLimit: profile.autoCompactLimit || "",
     modelList: profile.modelList || "",
     modelWindows: profile.modelWindows || "",
+    modelVlm: profile.modelVlm || "",
+    vlmApiKey: profile.vlmApiKey || "",
+    vlmModel: profile.vlmModel || "",
+    vlmBaseUrl: profile.vlmBaseUrl || "",
+    officialCodexFingerprint: profile.officialCodexFingerprint === true,
     modelRoutes: relayMode === "official" && !officialMixApiKey ? [] : normalizeRelayModelRoutes(profile.modelRoutes),
     userAgent: profile.userAgent || "",
     sub2apiEnabled: profile.sub2apiEnabled === true,
@@ -8935,16 +9332,24 @@ function relayProfileConfigBrief(profile: RelayProfile): string {
   return profile.baseUrl || t("未填写 URL");
 }
 
-function relaySub2ApiMultiplierLabel(profile: RelayProfile): string {
-  const multiplier = profile.sub2apiMultiplier.trim();
-  return multiplier ? tf("Sub2API 倍率 {0}x", [multiplier]) : t("Sub2API 倍率未获取");
+function relayProfileLatencyTarget(profile: RelayProfile): string {
+  if (isAggregateRelayProfile(profile)) return "";
+  if (profile.relayMode === "official" && !profile.officialMixApiKey) return "";
+  if (profile.protocol === "chatCompletions") {
+    return (profile.upstreamBaseUrl || profile.baseUrl).trim();
+  }
+  return profile.baseUrl.trim();
 }
 
-function formatMultiplierValue(value: number): string {
-  if (!Number.isFinite(value) || value < 0) return "";
-  let text = value.toFixed(4);
-  while (text.includes(".") && text.endsWith("0")) text = text.slice(0, -1);
-  return text.endsWith(".") ? text.slice(0, -1) : text;
+function relayProfileApiKey(profile: RelayProfile): string {
+  if (profile.relayMode === "official") {
+    return codexExperimentalBearerTokenFromConfig(profile.configContents) || profile.apiKey.trim();
+  }
+  return (
+    codexApiKeyFromAuth(profile.authContents) ||
+    codexExperimentalBearerTokenFromConfig(profile.configContents) ||
+    profile.apiKey.trim()
+  );
 }
 
 function relayProfileModeHelp(profile: RelayProfile): string {
@@ -9147,6 +9552,7 @@ function applyRelayProfilePatchToFiles(
       next = withGeneratedRelayFiles(next);
     }
   }
+
   return deriveRelayProfileFromFiles(next);
 }
 
@@ -9567,6 +9973,7 @@ function createRelayProfile(settings: BackendSettings): RelayProfile {
     vlmModel: "",
     vlmBaseUrl: "",
     userAgent: "",
+    officialCodexFingerprint: false,
     sub2apiEnabled: false,
     sub2apiMultiplier: "",
     modelRoutes: [],
@@ -9605,6 +10012,7 @@ function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
       vlmModel: "",
       vlmBaseUrl: "",
       userAgent: "",
+      officialCodexFingerprint: false,
       sub2apiEnabled: false,
       sub2apiMultiplier: "",
       modelRoutes: [],
@@ -9732,8 +10140,6 @@ function normalizeAggregateRelayProfile(profile: RelayProfile, settings: Backend
     hideOfficialUsageAlert: false,
     configContents: "",
     authContents: "",
-    sub2apiEnabled: false,
-    sub2apiMultiplier: "",
     aggregate,
   };
 }
@@ -9849,8 +10255,7 @@ function loadInitialTheme(): Theme {
 
 function loadInitialRoute(): Route {
   if (typeof window === "undefined") return "overview";
-  const params = new URLSearchParams(window.location.search);
-  if (params.get("showUpdate") === "1" || window.location.hash === "#about") {
+  if (window.location.hash === "#about") {
     return "about";
   }
   return "overview";

@@ -328,9 +328,9 @@ fn administrator_runtime_is_staged_with_fixed_executable_roles() {
     assert!(installer.contains("Delete \"$INSTDIR\\codex-plus-admin-shim.exe\""));
     assert_eq!(
         installer
-            .matches("taskkill /IM codex-plus-admin-shim.exe /F")
+            .matches("taskkill.exe\" /IM codex-plus-admin-shim.exe /T /F")
             .count(),
-        2
+        4
     );
     let installer_executables = installer
         .lines()
@@ -340,9 +340,12 @@ fn administrator_runtime_is_staged_with_fixed_executable_roles() {
     assert_eq!(
         installer_executables,
         [
+            "File /oname=codex-plus-recovery.exe \"${ROOT}\\dist\\windows\\app\\codex-plus-plus.exe\"",
             "File \"${ROOT}\\dist\\windows\\app\\codex-plus-plus.exe\"",
             "File \"${ROOT}\\dist\\windows\\app\\codex-plus-plus-manager.exe\"",
             "File \"${ROOT}\\dist\\windows\\app\\codex-plus-admin-shim.exe\"",
+            "File /oname=pwsh.exe \"${ROOT}\\dist\\windows\\app\\admin-terminal\\pwsh.exe\"",
+            "File /oname=codex-plus-recovery.exe \"${ROOT}\\dist\\windows\\app\\codex-plus-plus.exe\"",
         ]
     );
     assert!(!installer.contains("auth.json"));
@@ -467,7 +470,7 @@ fn relay_context_management_is_global_not_supplier_scoped() {
     let styles = manifest_dir.parent().unwrap().join("src/styles.css");
     let styles = std::fs::read_to_string(&styles).expect("read manager styles.css");
 
-    assert!(app_tsx.contains("作为全局配置独立管理"));
+    assert!(app_tsx.contains("管理 MCP、真实 SKILL.md Skills 和 Plugins"));
     assert!(
         app_tsx.contains("label: t(\"工具与插件\")") || app_tsx.contains("label: \"工具与插件\"")
     );
@@ -489,9 +492,8 @@ fn relay_context_management_is_global_not_supplier_scoped() {
     assert!(app_tsx.contains("sync_live_context_entries"));
     assert!(app_tsx.contains("refreshLiveContextEntries"));
     assert!(app_tsx.contains("syncLiveContextEntries(next, true)"));
-    assert!(app_tsx.contains("const syncContextEntries = async (next: BackendSettings) =>"));
-    assert_eq!(app_tsx.matches("await syncContextEntries(next)").count(), 3);
-    assert!(app_tsx.contains("if (!(await syncContextEntries(next))) return;"));
+    assert!(app_tsx.contains("const syncLiveContextEntries = async (next: BackendSettings"));
+    assert!(app_tsx.contains("actions.syncLiveContextEntries(next, true)"));
     assert!(app_tsx.contains("function contextEntriesWithLiveEntries"));
     assert!(app_tsx.contains("liveByKind"));
     assert!(app_tsx.contains("mergeLiveContextEntries"));

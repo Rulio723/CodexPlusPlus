@@ -23,7 +23,7 @@ fn backend_settings_defaults_to_upstream_platform_theme_config() {
         assert_eq!(theme.name, "Dream Skin");
         assert_eq!(theme.tagline, "把喜欢的画面变成可交互的 Codex 工作台。");
         assert_eq!(theme.colors.as_ref().unwrap().accent, "#E25563");
-        assert_eq!(theme.extra_fields["promoSub"], "passion8.cc");
+        assert!(theme.extra_fields.get("promoSub").is_none());
     }
     assert!(!settings.codex_app_dream_skin_paused);
 }
@@ -49,25 +49,13 @@ fn target_theme_fields_survive_deserialize_and_serialize() {
             "taskMode": "ambient"
         },
         "palette": { "accent": "#123456", "custom": "keep" },
-        "promoTitle": "Sponsor",
-        "promoSub": "sponsor.example",
-        "promoUrl": "https://sponsor.example",
         "customTargetField": { "nested": true }
     });
 
     let theme: DreamSkinThemeConfig = serde_json::from_value(source.clone()).unwrap();
     let saved = serde_json::to_value(theme).unwrap();
 
-    for key in [
-        "image",
-        "appearance",
-        "art",
-        "palette",
-        "promoTitle",
-        "promoSub",
-        "promoUrl",
-        "customTargetField",
-    ] {
+    for key in ["image", "appearance", "art", "palette", "customTargetField"] {
         assert_eq!(saved[key], source[key], "target field changed: {key}");
     }
     assert!(saved.get("colors").is_none());

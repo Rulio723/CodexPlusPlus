@@ -36,9 +36,6 @@ export type DreamSkinThemeConfig = {
     accent?: string;
     [key: string]: unknown;
   };
-  promoTitle?: string;
-  promoSub?: string;
-  promoUrl?: string;
   image?: string;
   companion?: {
     dataUrl: string;
@@ -241,9 +238,6 @@ export function defaultDreamSkinTheme(): DreamSkinThemeConfig {
     quote: "Make something wonderful",
     colors: defaultDreamSkinColors(),
     image: "portal-hero.png",
-    promoTitle: "感谢 Passion8 赞助",
-    promoSub: "passion8.cc",
-    promoUrl: "https://passion8.cc/register?aff=TuPe",
   };
 }
 
@@ -303,6 +297,9 @@ export function normalizeDreamSkinTheme(
     statusText: textOr(value?.statusText, fallback.statusText),
     quote: textOr(value?.quote, fallback.quote),
   };
+  delete normalized.promoTitle;
+  delete normalized.promoSub;
+  delete normalized.promoUrl;
   if (typeof value?.stylePreset === "string" && value.stylePreset.trim()) {
     normalized.stylePreset = value.stylePreset.trim();
   } else {
