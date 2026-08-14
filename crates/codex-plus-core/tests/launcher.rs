@@ -14,9 +14,9 @@ use codex_plus_core::launcher::{
     build_codex_arguments, build_codex_arguments_for_settings,
     build_codex_arguments_with_native_menu_inspector, build_codex_command,
     build_codex_command_with_native_menu_inspector, build_macos_cleanup_command,
-    build_macos_open_command,
-    build_macos_open_command_with_native_menu_inspector, build_packaged_activation,
-    build_packaged_activation_with_native_menu_inspector, launch_and_inject_with_hooks,
+    build_macos_open_command, build_macos_open_command_with_native_menu_inspector,
+    build_packaged_activation, build_packaged_activation_with_native_menu_inspector,
+    launch_and_inject_with_hooks,
 };
 #[cfg(windows)]
 use codex_plus_core::launcher::{WindowsProcessControlStrategy, windows_process_control_strategy};

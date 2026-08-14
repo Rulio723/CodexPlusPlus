@@ -211,6 +211,7 @@ type BackendSettings = {
   relayProfilesEnabled: boolean;
   enhancementsEnabled: boolean;
   computerUseGuardEnabled: boolean;
+  administratorModeEnabled: boolean;
   codexAppPluginMarketplaceUnlock: boolean;
   codexAppModelWhitelistUnlock: boolean;
   codexAppSessionDelete: boolean;
@@ -823,6 +824,7 @@ const defaultSettings: BackendSettings = {
   relayProfilesEnabled: true,
   enhancementsEnabled: true,
   computerUseGuardEnabled: false,
+  administratorModeEnabled: false,
   codexAppPluginMarketplaceUnlock: true,
   codexAppModelWhitelistUnlock: true,
   codexAppSessionDelete: true,
@@ -8729,6 +8731,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
     ...settings,
     relayProfilesEnabled: settings.relayProfilesEnabled !== false,
     computerUseGuardEnabled: settings.computerUseGuardEnabled === true,
+    administratorModeEnabled: settings.administratorModeEnabled === true,
     codexAppImageOverlayOpacity: clampNumber(settings.codexAppImageOverlayOpacity || 35, 1, 100),
     codexAppImageOverlayFitMode: normalizeImageOverlayFitMode(settings.codexAppImageOverlayFitMode),
     codexAppDreamSkinPaused: settings.codexAppDreamSkinPaused === true,

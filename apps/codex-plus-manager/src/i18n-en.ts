@@ -447,7 +447,6 @@ export const EN_PLAIN: Record<string, string> = {
   "当前使用": "Current",
   "切换": "Switch",
   "输入新的账号名称": "Enter a new account name",
-  "重命名": "Rename",
   "删除保存副本": "Delete saved copy",
   "尚未保存官方账号。请先在 Codex 中登录，然后保存当前账号。":
     "No official accounts have been saved. Log in through Codex first, then save the current account.",
