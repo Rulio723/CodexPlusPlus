@@ -1,6 +1,7 @@
 pub mod backup;
 pub mod markdown;
 pub mod provider_sync;
+pub mod session_transfer;
 pub mod storage;
 
 pub use backup::BackupStore;
@@ -14,6 +15,11 @@ pub use provider_sync::{
     run_provider_sync_with_target,
     run_remote_control_session_catalog_recovery_for_thread_with_target,
     run_remote_control_session_finalization_for_thread_with_target,
+};
+pub use session_transfer::{
+    SessionArchiveExportResult, SessionArchiveImportOptions, SessionArchiveImportResult,
+    SessionArchivePreview, SessionPathMapping, export_session_archive, import_session_archive,
+    inspect_session_archive,
 };
 pub use storage::{
     LocalSession, SQLiteStorageAdapter, delete_local_from_paths,

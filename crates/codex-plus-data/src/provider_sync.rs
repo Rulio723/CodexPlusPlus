@@ -734,7 +734,7 @@ pub fn load_provider_sync_targets(codex_home: Option<&Path>) -> ProviderSyncTarg
     }
 }
 
-fn read_current_provider(path: &Path) -> String {
+pub(crate) fn read_current_provider(path: &Path) -> String {
     let Ok(text) = fs::read_to_string(path) else {
         return DEFAULT_PROVIDER.to_string();
     };

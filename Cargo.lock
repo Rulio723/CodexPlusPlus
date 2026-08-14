@@ -453,6 +453,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "codex-plus-core",
+ "fs2",
  "rusqlite",
  "serde",
  "serde_json",
@@ -460,6 +461,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "uuid",
+ "zip",
 ]
 
 [[package]]
