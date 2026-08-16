@@ -5,6 +5,65 @@
   if (!codexPlusIsNodeTestHarness && (window.top !== window || window.self !== window || !window.electronBridge || !/^app:\/\/\-\//i.test(window.location.href))) return;
   const codexPlusIsWindowsPlatform = /\bWindows\b/i.test(navigator.userAgent || "");
 
+  function installCodexPlusClassicProjectSidebar() {
+    const config = window.__CODEX_PLUS_CLASSIC_PROJECT_SIDEBAR__;
+    if (!config || config.enabled !== true) return;
+    if (window.__codexPlusClassicProjectSidebarInstalled === "1") return;
+    window.__codexPlusClassicProjectSidebarInstalled = "1";
+    const gateName = String(config.gateName || "12346831");
+
+    const refreshStatsigClient = (client) => {
+      try {
+        client.$emt?.({ name: "values_updated", status: "Ready", values: {} });
+      } catch {
+      }
+    };
+
+    const patchStatsigClient = (client) => {
+      if (!client || typeof client !== "object") return false;
+      if (client.__codexPlusClassicProjectSidebarPatched === true) return false;
+      const originalCheckGate = typeof client.checkGate === "function"
+        ? client.checkGate.bind(client)
+        : null;
+      const originalGetFeatureGate = typeof client.getFeatureGate === "function"
+        ? client.getFeatureGate.bind(client)
+        : null;
+      if (!originalCheckGate && !originalGetFeatureGate) return false;
+
+      if (originalCheckGate) {
+        client.checkGate = (name, ...args) => (
+          String(name || "") === gateName ? false : originalCheckGate(name, ...args)
+        );
+      }
+      if (originalGetFeatureGate) {
+        client.getFeatureGate = (name, ...args) => {
+          const result = originalGetFeatureGate(name, ...args);
+          if (String(name || "") !== gateName || !result || typeof result !== "object") return result;
+          return { ...result, value: false };
+        };
+      }
+      client.__codexPlusClassicProjectSidebarPatched = true;
+      refreshStatsigClient(client);
+      return true;
+    };
+
+    const statsigClients = () => {
+      const root = window.__STATSIG__ || globalThis.__STATSIG__;
+      if (!root || typeof root !== "object") return [];
+      const clients = [root.firstInstance, typeof root.instance === "function" ? root.instance() : null];
+      if (root.instances && typeof root.instances === "object") clients.push(...Object.values(root.instances));
+      return clients.filter((client, index, array) => client && typeof client === "object" && array.indexOf(client) === index);
+    };
+
+    const patchStatsigClients = () => statsigClients().forEach(patchStatsigClient);
+    patchStatsigClients();
+    const startedAt = Date.now();
+    const timer = window.setInterval(() => {
+      patchStatsigClients();
+      if (Date.now() - startedAt > 5000) window.clearInterval(timer);
+    }, 25);
+  }
+
   function installCodexPlusFastStartup() {
     const config = window.__CODEX_PLUS_FAST_STARTUP__;
     if (!config || config.enabled !== true) return;
@@ -372,6 +431,7 @@
     }, 50);
   }
 
+  installCodexPlusClassicProjectSidebar();
   installCodexPlusFastStartup();
   installCodexPlusForceChineseLocale();
 
@@ -406,8 +466,9 @@
   const projectMoveRefreshDelaysMs = [50, 250, 750, 1500];
   const chatsSortRefreshIntervalMs = 1500;
   const chatsSortDbRefreshIntervalMs = 5000;
+  const catalogOnlyGracePeriodMs = 60_000;
   const styleId = "codex-delete-style";
-  const codexDeleteStyleVersion = "14";
+  const codexDeleteStyleVersion = "16";
   const codexPlusMenuId = "codex-plus-menu";
   const codexPlusMenuFloatingClass = "codex-plus-menu-floating";
   const codexDeleteVersion = "7";
@@ -474,6 +535,9 @@
   const codexAppServerModelRequestPatchVersion = "5";
   const codexRemoteSessionRecoveryVersion = "4";
   const codexPluginMarketplaceUnlockVersion = "15";
+  const codexPluginAutoExpandVersion = "1";
+  const codexPluginAutoExpandMaxClicks = 32;
+  const codexPluginAutoExpandClickDelayMs = 120;
   const codexThreadScrollMaxEntries = 120;
   const codexThreadScrollSaveThrottleMs = 120;
   const codexThreadScrollRestoreWindowMs = 3200;
@@ -831,6 +895,8 @@
       .codex-project-move-empty { padding: 18px 12px; color: #6b7280; text-align: center; }
       .codex-project-move-hidden { display: none !important; }
       [data-codex-plus-usage-alert-hidden="true"] { display: none !important; }
+      [data-codex-internal-subagent-row="true"] { display: none !important; }
+      [data-codex-catalog-only-row="true"] { display: none !important; }
       [data-codex-project-move-injected-list="true"] { display: flex; flex-direction: column; }
       .codex-archive-delete-all {
         border: 1px solid #ef4444;
@@ -1279,11 +1345,12 @@
   }
 
   function defaultCodexPlusSettings() {
-    return { pluginMarketplaceUnlock: true, modelWhitelistUnlock: true, sessionDelete: true, markdownExport: true, pasteFix: false, projectMove: true, threadIdBadge: false, conversationView: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, zedRemoteOpen: true, upstreamWorktreeCreate: true, nativeMenuPlacement: true, serviceTierControls: false, petRealMouseLook: false, stepwise: false, dreamSkinEnabled: false, dreamSkinPaused: false, dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {}, dreamSkinImagePath: "" };
+    return { pluginMarketplaceUnlock: true, pluginAutoExpand: true, modelWhitelistUnlock: true, sessionDelete: true, markdownExport: true, pasteFix: false, projectMove: true, threadIdBadge: false, conversationView: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, zedRemoteOpen: true, upstreamWorktreeCreate: true, nativeMenuPlacement: true, serviceTierControls: false, petRealMouseLook: false, stepwise: false, dreamSkinEnabled: false, dreamSkinPaused: false, dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {}, dreamSkinImagePath: "" };
   }
 
   const codexPlusBackendSettingMap = {
     pluginMarketplaceUnlock: "codexAppPluginMarketplaceUnlock",
+    pluginAutoExpand: "codexAppPluginAutoExpand",
     modelWhitelistUnlock: "codexAppModelWhitelistUnlock",
     sessionDelete: "codexAppSessionDelete",
     markdownExport: "codexAppMarkdownExport",
@@ -1321,6 +1388,7 @@
     if (codexPlusBackendSettings.enhancementsEnabled === false) {
       return {
         pluginMarketplaceUnlock: false,
+        pluginAutoExpand: false,
         modelWhitelistUnlock: false,
         sessionDelete: false,
         markdownExport: false,
@@ -1346,12 +1414,14 @@
       const settings = { ...defaultCodexPlusSettings(), ...JSON.parse(localStorage.getItem(codexPlusSettingsKey) || "{}"), ...backendCodexPlusSettings() };
       if (relayPatchDisabled) {
         settings.pluginMarketplaceUnlock = false;
+        settings.pluginAutoExpand = false;
       }
       return settings;
     } catch {
       const settings = { ...defaultCodexPlusSettings(), ...backendCodexPlusSettings() };
       if (relayPatchDisabled) {
         settings.pluginMarketplaceUnlock = false;
+        settings.pluginAutoExpand = false;
       }
       return settings;
     }
@@ -4543,6 +4613,101 @@
     return pluginMarketplaceFallbackResult(false);
   }
 
+  function pluginAutoExpandVisibleElement(el) {
+    if (!(el instanceof HTMLElement) || !el.isConnected) return false;
+    const style = getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden" || style.pointerEvents === "none") return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  function pluginAutoExpandPageLooksRelevant() {
+    const text = String(document.body?.innerText || "");
+    return /插件|Plugins?|Marketplace|市场/i.test(text) && !!document.querySelector('button, [role="button"]');
+  }
+
+  function pluginAutoExpandButtonLooksScoped(button) {
+    let node = button;
+    for (let depth = 0; node instanceof HTMLElement && node !== document.body && depth < 8; depth += 1, node = node.parentElement) {
+      const text = String(node.innerText || "");
+      if (text.length > 16000) continue;
+      if (/插件|Plugins?|Marketplace|市场/i.test(text)) return true;
+    }
+    return false;
+  }
+
+  function pluginAutoExpandButtonText(button) {
+    return String(button?.textContent || button?.getAttribute?.("aria-label") || button?.getAttribute?.("title") || "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function pluginAutoExpandButtonLooksLikeMore(button) {
+    const text = pluginAutoExpandButtonText(button);
+    if (!text || text.length > 120) return false;
+    if (/^(更多|显示更多|查看更多|加载更多|Show more|Load more|More)$/i.test(text)) return true;
+    if (/^查看\s+.+以及另外\s*\d+\s*个$/i.test(text)) return true;
+    if (/^View\s+.+\s+and\s+\d+\s+more$/i.test(text)) return true;
+    if (/^Show\s+.+\s+and\s+\d+\s+more$/i.test(text)) return true;
+    return false;
+  }
+
+  function pluginAutoExpandButtonCandidates() {
+    if (!codexPlusSettings().pluginAutoExpand || !pluginAutoExpandPageLooksRelevant()) return [];
+    return Array.from(document.querySelectorAll('button, [role="button"]'))
+      .filter(pluginAutoExpandVisibleElement)
+      .filter((button) => !button.disabled && button.getAttribute("aria-disabled") !== "true")
+      .filter(pluginAutoExpandButtonLooksLikeMore)
+      .filter(pluginAutoExpandButtonLooksScoped)
+      .filter((button) => !button.closest?.(`.${moreMenuClass}, #${codexPlusMenuId}, .codex-plus-modal-overlay`));
+  }
+
+  function pluginAutoExpandSignature() {
+    return pluginAutoExpandButtonCandidates()
+      .map((button) => {
+        const rect = button.getBoundingClientRect();
+        return `${pluginAutoExpandButtonText(button)}:${Math.round(rect.top)}:${Math.round(rect.left)}`;
+      })
+      .join("|");
+  }
+
+  function schedulePluginAutoExpand(force = false) {
+    if (!codexPlusSettings().pluginAutoExpand) return;
+    if (window.__codexPluginAutoExpandRunning && !force) return;
+    clearTimeout(window.__codexPluginAutoExpandTimer);
+    window.__codexPluginAutoExpandTimer = setTimeout(() => runPluginAutoExpand(force), force ? 30 : 180);
+  }
+
+  function runPluginAutoExpand(force = false) {
+    if (!codexPlusSettings().pluginAutoExpand) return;
+    const currentSignature = pluginAutoExpandSignature();
+    if (!force && currentSignature && currentSignature === window.__codexPluginAutoExpandLastSignature) return;
+    window.__codexPluginAutoExpandLastSignature = currentSignature;
+    window.__codexPluginAutoExpandRunning = true;
+    window.__codexPluginAutoExpandClicks = 0;
+    const clickNext = () => {
+      if (!codexPlusSettings().pluginAutoExpand) {
+        window.__codexPluginAutoExpandRunning = false;
+        return;
+      }
+      const button = pluginAutoExpandButtonCandidates()[0];
+      if (!button || window.__codexPluginAutoExpandClicks >= codexPluginAutoExpandMaxClicks) {
+        window.__codexPluginAutoExpandRunning = false;
+        sendCodexPlusDiagnostic("plugin_auto_expand_finished", {
+          version: codexPluginAutoExpandVersion,
+          clicks: window.__codexPluginAutoExpandClicks || 0,
+          exhausted: !!button,
+        });
+        return;
+      }
+      window.__codexPluginAutoExpandClicks = (window.__codexPluginAutoExpandClicks || 0) + 1;
+      button.dataset.codexPluginAutoExpandClicked = String(Date.now());
+      button.click();
+      setTimeout(clickNext, codexPluginAutoExpandClickDelayMs);
+    };
+    clickNext();
+  }
+
   function patchPluginMarketplaceRequestClient(client) {
     if (!client || typeof client.sendRequest !== "function") return false;
     if (client.__codexPluginMarketplaceUnlockPatch === codexPluginMarketplaceUnlockVersion) return true;
@@ -4899,11 +5064,13 @@
   function sessionRows(forceRefresh = false) {
     const now = Date.now();
     if (!forceRefresh && now - cachedSessionRowsAt < 150) {
-      cachedSessionRows = cachedSessionRows.filter((row) => row.isConnected);
+      cachedSessionRows = cachedSessionRows.filter((row) => row.isConnected && !isCatalogOnlyRow(row));
       if (cachedSessionRows.length > 0) return cachedSessionRows;
     }
 
-    cachedSessionRows = Array.from(document.querySelectorAll(selectors.sidebarThread));
+    const rows = Array.from(document.querySelectorAll(selectors.sidebarThread));
+    rows.forEach(syncInternalSubagentRowVisibility);
+    cachedSessionRows = rows.filter((row) => !isInternalSubagentRow(row) && !isCatalogOnlyRow(row));
     cachedSessionRowsAt = now;
     return cachedSessionRows;
   }
@@ -4963,6 +5130,8 @@
       for (const props of [fiber.pendingProps, fiber.memoizedProps]) {
         const directId = normalizedCodexThreadUuid(props?.conversationId);
         if (directId) return directId;
+        const entryId = normalizedCodexThreadUuid(props && props.entry?.conversationId);
+        if (entryId) return entryId;
         const childId = normalizedCodexThreadUuid(
           props?.children?.props?.conversationId,
         );
@@ -4970,6 +5139,59 @@
       }
     }
     return "";
+  }
+
+  function reactThreadSourceFromRow(row) {
+    const fiberKey = Object.getOwnPropertyNames(row).find((key) => key.startsWith("__reactFiber$"));
+    let fiber = fiberKey ? row[fiberKey] : null;
+    for (let fiberDepth = 0; fiber && fiberDepth < 20; fiberDepth += 1, fiber = fiber.return) {
+      for (const props of [fiber.pendingProps, fiber.memoizedProps]) {
+        const source = props?.threadSource
+          || props?.threadSummary?.threadSource
+          || props?.summary?.threadSource
+          || props?.entry?.threadSource
+          || props?.entry?.summary?.threadSource;
+        if (typeof source === "string" && source.trim()) return source.trim().toLowerCase();
+      }
+    }
+    return "";
+  }
+
+  function isInternalSubagentRow(row) {
+    return reactThreadSourceFromRow(row) === "subagent";
+  }
+
+  function syncInternalSubagentRowVisibility(row) {
+    const item = row.closest?.('[role="listitem"]') || row;
+    if (isInternalSubagentRow(row)) {
+      item.dataset.codexInternalSubagentRow = "true";
+      row.dataset.codexInternalSubagentRow = "true";
+      return;
+    }
+    delete item.dataset.codexInternalSubagentRow;
+    delete row.dataset.codexInternalSubagentRow;
+  }
+
+  function isCatalogOnlyRow(row) {
+    const item = row.closest?.('[role="listitem"]') || row;
+    return row.dataset.codexCatalogOnlyRow === "true" || item.dataset.codexCatalogOnlyRow === "true";
+  }
+
+  function syncCatalogOnlyRowVisibility(row, missingFromStorage) {
+    const item = row.closest?.('[role="listitem"]') || row;
+    const ref = sessionRefFromRow(row);
+    const timestampMs = uuidV7TimestampMs(ref.session_id);
+    const isStaleCatalogOnly = missingFromStorage
+      && !!normalizedCodexThreadUuid(ref.session_id)
+      && timestampMs > 0
+      && Date.now() - timestampMs >= catalogOnlyGracePeriodMs;
+    if (isStaleCatalogOnly) {
+      item.dataset.codexCatalogOnlyRow = "true";
+      row.dataset.codexCatalogOnlyRow = "true";
+      return;
+    }
+    delete item.dataset.codexCatalogOnlyRow;
+    delete row.dataset.codexCatalogOnlyRow;
   }
 
   function sessionRefFromRow(row) {
@@ -4999,6 +5221,8 @@
   if (window.__CODEX_PLUS_TEST_SESSION_REF__) {
     window.__codexPlusSessionRefTest = {
       fromRow: sessionRefFromRow,
+      threadSourceFromRow: reactThreadSourceFromRow,
+      isInternalSubagentRow,
     };
   }
 
@@ -6678,7 +6902,7 @@
   }
 
   function chatsSection() {
-    return document.querySelector('[data-app-action-sidebar-section-heading="Chats"]');
+    return document.querySelector('[data-app-action-sidebar-section-heading="Chats"], [data-app-action-sidebar-section-heading="Recents"]');
   }
 
   function projectRowListItem(projectRow) {
@@ -6853,7 +7077,8 @@
   }
 
   function rowIsInChats(row) {
-    return !!row.closest?.('[data-app-action-sidebar-section-heading="Chats"]');
+    const section = chatsSection();
+    return !!section && section.contains(row);
   }
 
   function chatsThreadList() {
@@ -7301,7 +7526,7 @@
   async function applyChatsSortCorrection() {
     if (!codexPlusSettings().projectMove || chatsSortInFlight) return;
     const rows = visibleChatsRows();
-    if (rows.length < 2) return;
+    if (rows.length < 1) return;
     const refs = rows.map(sessionRefFromRow).filter((ref) => ref.session_id);
     const signature = refs.map((ref) => projectMoveSessionKey(ref.session_id)).join("|");
     const allRowsHaveSortMs = rows.every((row) => numericTimestamp(row.dataset.codexProjectMoveSortMs || rowListItem(row).dataset.codexProjectMoveSortMs));
@@ -7322,6 +7547,7 @@
         rows.forEach((row) => {
           const ref = sessionRefFromRow(row);
           const payload = byId.get(projectMoveSessionKey(ref.session_id));
+          syncCatalogOnlyRowVisibility(row, result?.status === "ok" && !payload);
           const trustedSortMs = timestampMsFromPayload(payload);
           const sortMs = trustedSortMs || sortMsForSession(ref.session_id, row.dataset.codexProjectMoveSortMs || rowListItem(row).dataset.codexProjectMoveSortMs);
           row.dataset.codexProjectMoveSortMs = String(sortMs || 0);
@@ -7418,7 +7644,7 @@
     return result;
   }
 
-  function showToast(message, undoToken) {
+  function showToast(message, undoToken, deletedRef = null) {
     document.querySelectorAll(".codex-delete-toast").forEach((node) => node.remove());
     const toast = document.createElement("div");
     toast.className = "codex-delete-toast";
@@ -7428,6 +7654,13 @@
       undo.textContent = "撤销";
       undo.addEventListener("click", async () => {
         const result = await postJson("/undo", { undo_token: undoToken });
+        if (result.status === "undone") {
+          const restoredRef = {
+            session_id: result.session_id || deletedRef?.session_id || "",
+            title: deletedRef?.title || "",
+          };
+          notifyCodexThreadState("thread/unarchived", restoredRef);
+        }
         toast.textContent = result.message || "撤销完成";
         if (result.status === "undone") {
           const refreshed = await refreshRecentConversationsForHost();
@@ -8397,6 +8630,29 @@
     }
   }
 
+  function notifyCodexThreadState(method, ref) {
+    const sessionId = String(ref?.session_id || "").trim();
+    const threadId = sessionId.startsWith("local:") ? sessionId.slice("local:".length) : sessionId;
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(threadId)) return false;
+    if (method !== "thread/deleted" && method !== "thread/unarchived") return false;
+    const notification = {
+      type: "mcp-notification",
+      hostId: "local",
+      method,
+      params: { threadId },
+    };
+    if (typeof MessageEvent === "function" && typeof window.dispatchEvent === "function") {
+      window.dispatchEvent(new MessageEvent("message", {
+        data: notification,
+        origin: window.location?.origin || "",
+        source: window,
+      }));
+    } else {
+      window.postMessage(notification, "*");
+    }
+    return true;
+  }
+
   function removeDeletedRow(row, button, ref) {
     releaseDeleteFocus(row, button);
     const shouldReload = isCurrentSessionRow(row, ref);
@@ -8429,8 +8685,9 @@
       releaseDeleteFocus(row, button);
       const result = await postJson("/delete", ref);
       if (result.status === "server_deleted" || result.status === "local_deleted") {
+        notifyCodexThreadState("thread/deleted", ref);
         removeDeletedRow(row, button, ref);
-        showToast(result.message || "删除成功", result.undo_token);
+        showToast(result.message || "删除成功", result.undo_token, ref);
       } else {
         showToast(result.message || "删除失败", null);
       }
@@ -10121,6 +10378,7 @@
       selectors.sidebarThread,
       'aside.app-shell-left-panel [role="status"][aria-live="polite"]',
       '[data-app-action-sidebar-section-heading="Chats"]',
+      '[data-app-action-sidebar-section-heading="Recents"]',
       '[data-app-action-sidebar-section-heading="Projects"]',
       '[data-codex-project-move-row="true"]',
       '[data-codex-archive-page-row="true"]',

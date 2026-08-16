@@ -49,6 +49,13 @@ const SKY_066_HELPER_SHA256: &[&str] =
     &["be488e66c38e12fa46850ee48c1f5e44ecdb0a3a64042e064e3a1a1da286ac42"];
 const SKY_066_HELPER_TRANSPORT_SHA256: &str =
     "7bc54c5bb7f49661fb1f501c6832f5490620501464d3f1593a361a85c7f66b39";
+const SKY_0611_HELPER_TRANSPORT_LAUNCH_TEMPLATE: &str = "const i=s(e(this,w,\"f\"),e(this,v,\"f\"),{env:null==e(this,y,\"f\")?void 0:Object.assign(Object.assign({},J().env),e(this,y,\"f\")),stdio:[\"pipe\",\"pipe\",\"pipe\"],windowsHide:!0});";
+const SKY_0611_HELPER_TRANSPORT_LAUNCH_SHA256: &str =
+    "4ce69185bcd92f0fc88ac4a98c55bcaeb2a5dc6631b0cfbd34ed0f82ac3585b7";
+const SKY_0611_HELPER_SHA256: &[&str] =
+    &["7a95d14ebf992955d8ab8e6c57a75545ed7d18e864b0f5c1b9fe7f47685bd897"];
+const SKY_0611_HELPER_TRANSPORT_SHA256: &str =
+    "56ac031983d85e4718f10c5a814923afe2cb4ead649466eef02b1b4d4cf63e40";
 
 #[cfg(test)]
 const HELPER_TRANSPORT_LAUNCH_TEMPLATE: &str = LEGACY_HELPER_TRANSPORT_LAUNCH_TEMPLATE;
@@ -97,6 +104,14 @@ const SUPPORTED_COMPUTER_USE_CONTRACTS: &[SupportedComputerUseContract] = &[
         launch_template: LEGACY_HELPER_TRANSPORT_LAUNCH_TEMPLATE,
         launch_template_sha256: LEGACY_HELPER_TRANSPORT_LAUNCH_SHA256,
         process_expression: "P()",
+    },
+    SupportedComputerUseContract {
+        sky_version: "0.6.11",
+        helper_sha256: SKY_0611_HELPER_SHA256,
+        transport_sha256: SKY_0611_HELPER_TRANSPORT_SHA256,
+        launch_template: SKY_0611_HELPER_TRANSPORT_LAUNCH_TEMPLATE,
+        launch_template_sha256: SKY_0611_HELPER_TRANSPORT_LAUNCH_SHA256,
+        process_expression: "J()",
     },
 ];
 const ADMIN_HELPER_TRANSPORT_BACKUP: &str = "helper_transport.js.bak-codex-plus-admin";
@@ -2521,6 +2536,14 @@ mod tests {
         assert_eq!(
             supported_transport_sha256("0.6.6"),
             Some("7bc54c5bb7f49661fb1f501c6832f5490620501464d3f1593a361a85c7f66b39")
+        );
+        assert_eq!(
+            supported_helper_sha256s("0.6.11").and_then(|hashes| hashes.first().copied()),
+            Some("7a95d14ebf992955d8ab8e6c57a75545ed7d18e864b0f5c1b9fe7f47685bd897")
+        );
+        assert_eq!(
+            supported_transport_sha256("0.6.11"),
+            Some("56ac031983d85e4718f10c5a814923afe2cb4ead649466eef02b1b4d4cf63e40")
         );
         assert_eq!(supported_helper_sha256s("0.5.3"), None);
         assert_eq!(supported_transport_sha256("0.5.3"), None);

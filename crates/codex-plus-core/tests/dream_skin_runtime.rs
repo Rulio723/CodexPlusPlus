@@ -120,6 +120,77 @@ fn verification_accepts_target_project_live_contract() {
 }
 
 #[test]
+fn verification_accepts_the_managed_snow_target_version() {
+    let result = parse_renderer_verification(serde_json::json!({
+        "installed": true,
+        "engine": "snow",
+        "version": "2.1.0-snow.1",
+        "stylePresent": true,
+        "chromePresent": true,
+        "chromePointerEvents": "none",
+        "homeRoute": false,
+        "homePresent": false,
+        "visibleCardCount": 0,
+        "composer": { "visible": true },
+        "sidebar": { "visible": true },
+        "documentOverflow": { "x": false, "y": false }
+    }))
+    .unwrap();
+
+    assert!(result.pass);
+}
+
+#[test]
+fn verifier_recognizes_current_main_surface_as_a_skinned_home() {
+    let source = codex_plus_core::dream_skin_runtime::renderer_verification_script();
+
+    assert!(source.contains("main.dream-home"));
+    assert!(source.contains("main.glass-vision-home"));
+}
+
+#[test]
+fn verifier_prefers_visible_home_content_over_the_hidden_home_icon() {
+    let source = codex_plus_core::dream_skin_runtime::renderer_verification_script();
+
+    let game_source = source
+        .find("document.querySelector('[data-feature=\"game-source\"]')")
+        .unwrap();
+    let home_icon = source
+        .find("document.querySelector('[data-testid=\"home-icon\"]')")
+        .unwrap();
+    assert!(game_source < home_icon);
+    assert!(source.contains(
+        "hero: box(home?.querySelector('[data-feature=\"game-source\"]') || suggestions)"
+    ));
+}
+
+#[test]
+fn snow_home_headline_uses_dark_text_on_the_pale_background() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("assets/inject/upstream/snow-skin/dream-skin.css");
+    let source = std::fs::read_to_string(path).unwrap();
+    let headline = source
+        .split(".dream-home [data-feature=\"game-source\"] {")
+        .nth(1)
+        .unwrap()
+        .split(".dream-home [data-feature=\"game-source\"]::after")
+        .next()
+        .unwrap();
+    let subtitle = source
+        .split(".dream-home [data-feature=\"game-source\"]::after {")
+        .nth(1)
+        .unwrap()
+        .split(".dream-home [data-feature=\"game-source\"] button")
+        .next()
+        .unwrap();
+
+    assert!(headline.contains("color: #123b63 !important;"));
+    assert!(!headline.contains("color: white !important;"));
+    assert!(subtitle.contains("color: rgba(18,59,99,.78);"));
+}
+
+#[test]
 fn bundled_skin_runtimes_gate_structural_home_layout_on_classic_chrome() {
     for relative_path in [
         "assets/inject/upstream/dream-skin/windows/renderer-inject.js",

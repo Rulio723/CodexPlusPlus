@@ -108,6 +108,7 @@ pub fn parse_renderer_verification(raw: Value) -> anyhow::Result<DreamSkinVerifi
         .get("version")
         .and_then(Value::as_str)
         .map(ToString::to_string);
+    let engine = raw.get("engine").and_then(Value::as_str);
     let style = bool_at(&raw, "/stylePresent");
     let chrome = bool_at(&raw, "/chromePresent")
         && raw.get("chromePointerEvents").and_then(Value::as_str) == Some("none");
@@ -125,7 +126,7 @@ pub fn parse_renderer_verification(raw: Value) -> anyhow::Result<DreamSkinVerifi
                 .is_some_and(|count| (1..=6).contains(&count)));
     let version_pass = version
         .as_deref()
-        .is_some_and(|value| value.starts_with("codex-plus:"));
+        .is_some_and(|value| managed_renderer_version(engine, value));
 
     let mut checks = vec![
         bool_check(
@@ -215,6 +216,16 @@ pub fn parse_renderer_verification(raw: Value) -> anyhow::Result<DreamSkinVerifi
         screenshot_path: None,
         raw,
     })
+}
+
+fn managed_renderer_version(engine: Option<&str>, version: &str) -> bool {
+    version.starts_with("codex-plus:")
+        || matches!(
+            (engine, version),
+            (Some("snow"), "2.1.0-snow.1")
+                | (Some("glass-vision"), "2.1.0")
+                | (Some("dream-skin" | "cidala-tiger"), "1.2.1-newchat-fix")
+        )
 }
 
 pub async fn dream_skin_status(debug_port: u16) -> DreamSkinRuntimeStatus {
@@ -406,13 +417,23 @@ pub fn renderer_verification_script() -> &'static str {
       visible: rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden",
     };
   };
-  const homeSignal = document.querySelector('[data-testid="home-icon"]') ||
-    document.querySelector('[data-feature="game-source"]') ||
-    document.querySelector('.group\\/home-suggestions');
-  const homeRoute = homeSignal?.closest('[role="main"]') || null;
-  const home = document.querySelector('[role="main"].dream-home, [role="main"].dream-skin-home, [role="main"].glass-vision-home');
-  const suggestions = home?.querySelector('.group\\/home-suggestions') || null;
-  const cards = suggestions ? [...suggestions.querySelectorAll('button')].map(box) : [];
+  const home = document.querySelector('main.dream-home, main.dream-skin-home, main.glass-vision-home, [role="main"].dream-home, [role="main"].dream-skin-home, [role="main"].glass-vision-home');
+  const suggestions = home?.querySelector('.group\\/home-suggestions, [class*="home-suggestions"]') || null;
+  const homeSignals = [
+    document.querySelector('[data-feature="game-source"]'),
+    document.querySelector('.group\\/home-suggestions'),
+    document.querySelector('[data-testid="home-icon"]'),
+  ];
+  const homeSignal = homeSignals.find((node) => box(node)?.visible) ||
+    homeSignals.find(Boolean) || null;
+  const homeRoute = home || homeSignal?.closest('main, [role="main"]') || null;
+  const cardNodes = suggestions
+    ? [...suggestions.querySelectorAll('button')]
+    : [...(home?.querySelectorAll('button') || [])].filter((node) => {
+        const rect = node.getBoundingClientRect();
+        return rect.width >= 150 && rect.height >= 60;
+      });
+  const cards = cardNodes.map(box);
   const chrome = document.getElementById('codex-dream-skin-chrome') ||
     document.getElementById('codex-glass-vision-skin-chrome');
   return JSON.stringify({
@@ -420,16 +441,18 @@ pub fn renderer_verification_script() -> &'static str {
       document.documentElement.classList.contains('codex-glass-vision-skin'),
     version: window.__CODEX_DREAM_SKIN_STATE__?.version ||
       window.__CODEX_GLASS_VISION_SKIN_STATE__?.version || null,
+    engine: window.__CODEX_PLUS_DREAM_SKIN_TARGET_ENGINE__ || null,
     stylePresent: Boolean(document.getElementById('codex-dream-skin-style') ||
       document.getElementById('codex-glass-vision-skin-style')),
     chromePresent: Boolean(chrome),
     chromePointerEvents: getComputedStyle(chrome || document.body).pointerEvents,
     homeRoute: Boolean(homeRoute),
     homePresent: Boolean(home),
-    hero: box(home?.firstElementChild?.firstElementChild?.firstElementChild),
+    hero: box(home?.querySelector('[data-feature="game-source"]') || suggestions),
     visibleCardCount: cards.filter((item) => item?.visible).length,
     projectButton: box(home?.querySelector('.group\\/project-selector > button')),
-    composer: box(document.querySelector('.composer-surface-chrome')),
+    composer: box(document.querySelector('.composer-surface-chrome') ||
+      document.querySelector('[role="textbox"][contenteditable="true"]')),
     sidebar: box(document.querySelector('aside.app-shell-left-panel')),
     documentOverflow: {
       x: document.documentElement.scrollWidth > document.documentElement.clientWidth,

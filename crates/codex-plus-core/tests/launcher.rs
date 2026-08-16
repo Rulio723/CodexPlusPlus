@@ -12,11 +12,12 @@ use codex_plus_core::launcher::{
     AdminModeLease, CodexLaunch, DefaultLaunchHooks, LaunchHooks, LaunchOptions,
     MacosCleanupPolicy, activate_existing_administrator_session_with, browser_identity_changed,
     build_codex_arguments, build_codex_arguments_for_settings,
-    build_codex_arguments_with_native_menu_inspector, build_codex_command,
-    build_codex_command_with_native_menu_inspector, build_macos_cleanup_command,
-    build_macos_open_command, build_macos_open_command_with_native_menu_inspector,
-    build_packaged_activation, build_packaged_activation_with_native_menu_inspector,
-    launch_and_inject_with_hooks,
+    build_codex_arguments_with_main_inspector, build_codex_arguments_with_native_menu_inspector,
+    build_codex_command, build_codex_command_with_native_menu_inspector,
+    build_macos_cleanup_command, build_macos_open_command,
+    build_macos_open_command_with_native_menu_inspector, build_packaged_activation,
+    build_packaged_activation_with_main_inspector,
+    build_packaged_activation_with_native_menu_inspector, launch_and_inject_with_hooks,
 };
 #[cfg(windows)]
 use codex_plus_core::launcher::{WindowsProcessControlStrategy, windows_process_control_strategy};
@@ -125,6 +126,27 @@ fn app_paths_find_latest_windows_package_checks_roots_before_fallback() {
 }
 
 #[test]
+fn app_paths_default_windows_discovery_checks_registered_package_before_stale_roots() {
+    let source =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/app_paths.rs")).unwrap();
+    let body = source
+        .split("pub fn find_latest_codex_app_dir_default")
+        .nth(1)
+        .unwrap()
+        .split("fn find_latest_codex_app_dir_from_appx_package")
+        .next()
+        .unwrap();
+
+    let registered = body
+        .find("find_latest_codex_app_dir_from_appx_package()")
+        .unwrap();
+    let roots = body
+        .find("find_latest_codex_app_dir_from_roots(&windows_app_package_roots())")
+        .unwrap();
+    assert!(registered < roots);
+}
+
+#[test]
 fn app_paths_find_latest_windows_package_ignores_chatgpt_across_roots() {
     let temp = tempfile::tempdir().unwrap();
     let root_a = temp.path().join("WindowsAppsA");
@@ -184,12 +206,29 @@ fn app_paths_resolves_portable_current_link_to_directory_version() {
     std::fs::create_dir_all(&target).unwrap();
     std::fs::write(target.join("Codex.exe"), "").unwrap();
     std::fs::write(target.join("version"), "42.1.0\n").unwrap();
-    std::os::windows::fs::symlink_dir(&target, &current).unwrap();
+    if let Err(error) = std::os::windows::fs::symlink_dir(&target, &current) {
+        if error.raw_os_error() == Some(1314) {
+            eprintln!("SKIP: creating a directory symlink requires Windows developer mode");
+            return;
+        }
+        panic!("failed to create portable current link: {error}");
+    }
 
     assert_eq!(
         codex_app_version(&current).as_deref(),
         Some("26.519.2736.0")
     );
+}
+
+#[test]
+fn app_paths_prefers_chatgpt_entrypoint_when_portable_bundle_contains_codex_shim() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = temp.path().join("current");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(app.join("Codex.exe"), "").unwrap();
+    std::fs::write(app.join("ChatGPT.exe"), "").unwrap();
+
+    assert_eq!(build_codex_executable(&app), app.join("ChatGPT.exe"));
 }
 
 #[test]
@@ -348,17 +387,6 @@ fn app_paths_normalizes_executable_and_package_paths() {
 }
 
 #[test]
-fn app_paths_prefers_chatgpt_entrypoint_when_portable_bundle_contains_codex_shim() {
-    let temp = tempfile::tempdir().unwrap();
-    let app = temp.path().join("current");
-    std::fs::create_dir_all(&app).unwrap();
-    std::fs::write(app.join("Codex.exe"), "").unwrap();
-    std::fs::write(app.join("ChatGPT.exe"), "").unwrap();
-
-    assert_eq!(build_codex_executable(&app), app.join("ChatGPT.exe"));
-}
-
-#[test]
 fn app_paths_normalizes_chatgpt_desktop_executable_and_builds_it() {
     let temp = tempfile::tempdir().unwrap();
     let app = temp
@@ -481,14 +509,6 @@ fn launcher_does_not_override_codex_app_environment() {
 }
 
 #[test]
-fn launcher_uses_all_com_server_contexts_for_packaged_app_activation() {
-    let source = include_str!("../src/launcher.rs");
-
-    assert!(source.contains("CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_ALL)?"));
-    assert!(!source.contains("CLSCTX_LOCAL_SERVER"));
-}
-
-#[test]
 fn launcher_does_not_prepare_projectless_main_window() {
     let source = include_str!("../src/launcher.rs");
 
@@ -595,6 +615,30 @@ fn launcher_native_menu_inspector_arguments_are_added_before_extra_args() {
     assert_eq!(command[2], "--remote-allow-origins=http://127.0.0.1:9229");
     assert_eq!(command[3], "--inspect=127.0.0.1:9329");
     assert_eq!(command[4], "--force_high_performance_gpu");
+}
+
+#[test]
+fn launcher_administrator_app_server_does_not_pause_electron_main_process() {
+    assert_eq!(
+        build_codex_arguments_with_main_inspector(9229, 9329, &[]),
+        vec![
+            "--remote-debugging-port=9229".to_string(),
+            "--remote-allow-origins=http://127.0.0.1:9229".to_string(),
+            "--inspect=127.0.0.1:9329".to_string(),
+        ]
+    );
+
+    let app_dir = PathBuf::from(
+        r"C:\Program Files\WindowsApps\OpenAI.Codex_26.506.2212.0_x64__2p2nqsd0c76g0\app",
+    );
+    let activation =
+        build_packaged_activation_with_main_inspector(&app_dir, 9229, 9329, &[]).unwrap();
+    let CodexLaunch::PackagedActivation { arguments, .. } = activation else {
+        panic!("expected packaged activation")
+    };
+    assert!(arguments.contains("--inspect=127.0.0.1:9329"));
+    assert!(!arguments.contains("--inspect-brk"));
+    assert!(!arguments.contains("CODEX_PLUS_ADMIN_APP_SERVER_PIPE"));
 }
 
 #[test]
@@ -1196,8 +1240,8 @@ async fn official_mix_responses_profile_starts_fixed_protocol_proxy_without_enha
     assert!(!events.contains(&"remote-control-session-recovery".to_string()));
     assert!(!events.contains(&"provider-sync".to_string()));
     assert!(events.contains(&"select-helper:58123".to_string()));
-    assert!(events.contains(&"start-helper:57321".to_string()));
-    assert!(events.contains(&"shutdown-helper:57321".to_string()));
+    assert!(events.contains(&"start-helper:58123".to_string()));
+    assert!(events.contains(&"shutdown-helper:58123".to_string()));
     assert!(!events.iter().any(|event| event.starts_with("inject:")));
 }
 
@@ -1268,8 +1312,8 @@ async fn official_mix_responses_profile_keeps_proxy_when_profile_switching_is_di
 
     let events = events.lock().unwrap().clone();
     assert!(events.contains(&"select-helper:58123".to_string()));
-    assert!(events.contains(&"start-helper:57321".to_string()));
-    assert!(events.contains(&"shutdown-helper:57321".to_string()));
+    assert!(events.contains(&"start-helper:58123".to_string()));
+    assert!(events.contains(&"shutdown-helper:58123".to_string()));
     assert!(!events.iter().any(|event| event.starts_with("inject:")));
 }
 
@@ -1526,14 +1570,63 @@ async fn launch_starts_helper_when_chat_protocol_proxy_is_enabled() {
 
     let before_stop = events.lock().unwrap().clone();
     assert!(before_stop.contains(&"select-helper:58000".to_string()));
-    assert!(before_stop.contains(&"start-helper:57321".to_string()));
+    assert!(before_stop.contains(&"start-helper:58000".to_string()));
     assert!(!before_stop.contains(&"inject:9229:57321".to_string()));
 
     handle.wait_for_codex_exit().await.unwrap();
 
     let after_stop = events.lock().unwrap().clone();
     assert!(after_stop.contains(&"wait-codex".to_string()));
-    assert!(after_stop.contains(&"shutdown-helper:57321".to_string()));
+    assert!(after_stop.contains(&"shutdown-helper:58000".to_string()));
+}
+
+#[tokio::test]
+async fn launch_starts_helper_on_selected_port_for_official_mix_api() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let settings = BackendSettings {
+        enhancements_enabled: false,
+        relay_profiles: vec![RelayProfile {
+            id: "relay-official-mix".to_string(),
+            name: "Official mix".to_string(),
+            protocol: RelayProtocol::Responses,
+            relay_mode: codex_plus_core::settings::RelayMode::Official,
+            official_mix_api_key: true,
+            config_contents: "openai_base_url = \"http://127.0.0.1:57321/v1\"\n".to_string(),
+            ..RelayProfile::default()
+        }],
+        active_relay_id: "relay-official-mix".to_string(),
+        ..BackendSettings::default()
+    };
+    let hooks = FakeHooks::new(events.clone()).with_settings(settings);
+
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 58001,
+            status_store,
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+
+    let events_before_stop = events.lock().unwrap().clone();
+    assert!(events_before_stop.contains(&"select-helper:58001".to_string()));
+    assert!(events_before_stop.contains(&"start-helper:58001".to_string()));
+    assert!(!events_before_stop.contains(&"start-helper:57321".to_string()));
+
+    handle.wait_for_codex_exit().await.unwrap();
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .contains(&"shutdown-helper:58001".to_string())
+    );
 }
 
 #[tokio::test]
@@ -1585,12 +1678,12 @@ async fn launch_starts_helper_when_model_routing_is_enabled() {
 
     let before_stop = events.lock().unwrap().clone();
     assert!(before_stop.contains(&"select-helper:58000".to_string()));
-    assert!(before_stop.contains(&"start-helper:57321".to_string()));
+    assert!(before_stop.contains(&"start-helper:58000".to_string()));
     assert!(!before_stop.contains(&"inject:9229:57321".to_string()));
 
     handle.wait_for_codex_exit().await.unwrap();
     let after_stop = events.lock().unwrap().clone();
-    assert!(after_stop.contains(&"shutdown-helper:57321".to_string()));
+    assert!(after_stop.contains(&"shutdown-helper:58000".to_string()));
 }
 
 #[tokio::test]
@@ -1740,6 +1833,235 @@ async fn administrator_mode_starts_before_codex_and_stops_after_wait() {
     assert!(!status.administrator_mode.exec_elevated);
     assert!(!status.administrator_mode.computer_use_elevated);
     assert_eq!(status.administrator_mode.error_component, None);
+}
+
+#[tokio::test]
+async fn administrator_computer_use_broker_failure_terminates_codex_and_revokes_active_status() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let status_dir = tempfile::tempdir().unwrap();
+    let status_store = StatusStore::new(status_dir.path().join("status.json"));
+    let mut settings = BackendSettings::default();
+    settings.administrator_mode_enabled = true;
+    settings.enhancements_enabled = false;
+    let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
+    let hooks = FakeHooks::new(events.clone())
+        .with_settings(settings)
+        .with_admin_lease(AdminModeLease::testing_with_health(fatal_rx));
+
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(PathBuf::from("/Applications/Codex.app")),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store: status_store.clone(),
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+    fatal_tx
+        .send(Some(
+            "administrator Computer Use broker stopped unexpectedly".to_owned(),
+        ))
+        .unwrap();
+    let error = handle.wait_for_codex_exit().await.unwrap_err();
+
+    assert!(error.to_string().contains("Computer Use broker"));
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .contains(&"terminate-codex".to_string())
+    );
+    let status = status_store.load_latest().unwrap().unwrap();
+    assert_eq!(status.status, "failed");
+    assert_eq!(status.administrator_mode.state, "failed");
+    assert_eq!(
+        status.administrator_mode.error_component.as_deref(),
+        Some("computer_use")
+    );
+    assert!(!status.administrator_mode.exec_elevated);
+    assert!(!status.administrator_mode.computer_use_elevated);
+}
+
+#[tokio::test]
+async fn administrator_exec_broker_failure_terminates_codex_and_revokes_exec_status() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let status_dir = tempfile::tempdir().unwrap();
+    let status_store = StatusStore::new(status_dir.path().join("status.json"));
+    let mut settings = BackendSettings::default();
+    settings.administrator_mode_enabled = true;
+    settings.enhancements_enabled = false;
+    let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
+    let hooks = FakeHooks::new(events.clone())
+        .with_settings(settings)
+        .with_admin_lease(AdminModeLease::testing_with_health(fatal_rx));
+
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(PathBuf::from("/Applications/Codex.app")),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store: status_store.clone(),
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+    fatal_tx
+        .send(Some(
+            "administrator exec broker stopped unexpectedly".to_owned(),
+        ))
+        .unwrap();
+    let error = handle.wait_for_codex_exit().await.unwrap_err();
+
+    assert!(error.to_string().contains("exec broker"));
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .contains(&"terminate-codex".to_string())
+    );
+    let status = status_store.load_latest().unwrap().unwrap();
+    assert_eq!(status.status, "failed");
+    assert_eq!(status.administrator_mode.state, "failed");
+    assert_eq!(
+        status.administrator_mode.error_component.as_deref(),
+        Some("exec")
+    );
+    assert!(!status.administrator_mode.exec_elevated);
+    assert!(!status.administrator_mode.computer_use_elevated);
+}
+
+#[tokio::test]
+async fn administrator_exec_failure_interrupts_pending_post_launch_work() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let status_dir = tempfile::tempdir().unwrap();
+    let status_store = StatusStore::new(status_dir.path().join("status.json"));
+    let mut settings = BackendSettings::default();
+    settings.administrator_mode_enabled = true;
+    settings.enhancements_enabled = true;
+    let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
+    let injection_started = Arc::new(Notify::new());
+    let injection_release = Arc::new(Notify::new());
+    let cleanup_started = Arc::new(Notify::new());
+    let cleanup_release = Arc::new(Notify::new());
+    let hooks = FakeHooks::new(events.clone())
+        .with_settings(settings)
+        .with_admin_lease(AdminModeLease::testing_with_health(fatal_rx))
+        .with_injection_gate(injection_started.clone(), injection_release)
+        .with_admin_stop_gate(cleanup_started.clone(), cleanup_release.clone());
+
+    let launch = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(PathBuf::from("/Applications/Codex.app")),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store: status_store.clone(),
+        },
+        &hooks,
+    );
+    tokio::pin!(launch);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            _ = injection_started.notified() => {}
+            result = &mut launch => panic!("launch completed before injection gate: {result:?}"),
+        }
+    })
+    .await
+    .expect("injection should start");
+    fatal_tx
+        .send(Some(
+            "administrator exec broker stopped unexpectedly".to_owned(),
+        ))
+        .expect("publish exec failure");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            _ = cleanup_started.notified() => {}
+            result = &mut launch => panic!("launch completed before cleanup gate: {result:?}"),
+        }
+    })
+    .await
+    .expect("administrator cleanup should start");
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .contains(&"terminate-codex".to_string()),
+        "Codex must terminate before administrator cleanup can block"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut launch)
+            .await
+            .is_err(),
+        "launch should remain pending while administrator cleanup is gated"
+    );
+    cleanup_release.notify_one();
+    let error = tokio::time::timeout(Duration::from_secs(1), &mut launch)
+        .await
+        .expect("broker failure must interrupt post-launch work")
+        .expect_err("launch must fail closed");
+
+    assert!(error.to_string().contains("exec broker"));
+    let events = events.lock().unwrap();
+    assert!(events.contains(&"terminate-codex".to_string()));
+    assert!(events.contains(&"stop-admin".to_string()));
+    assert!(events.contains(&"shutdown-helper:57321".to_string()));
+    drop(events);
+    let status = status_store.load_latest().unwrap().unwrap();
+    assert_eq!(status.status, "failed");
+    assert_eq!(status.administrator_mode.state, "failed");
+    assert_eq!(
+        status.administrator_mode.error_component.as_deref(),
+        Some("exec")
+    );
+    assert!(!status.administrator_mode.exec_elevated);
+    assert!(!status.administrator_mode.computer_use_elevated);
+}
+
+#[tokio::test]
+async fn administrator_exec_failure_remains_primary_when_cleanup_also_fails() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let status_dir = tempfile::tempdir().unwrap();
+    let status_store = StatusStore::new(status_dir.path().join("status.json"));
+    let mut settings = BackendSettings::default();
+    settings.administrator_mode_enabled = true;
+    settings.enhancements_enabled = false;
+    let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
+    let hooks = FakeHooks::new(events.clone())
+        .with_settings(settings)
+        .with_admin_lease(AdminModeLease::testing_with_health(fatal_rx))
+        .with_admin_stop_error("secret-cleanup-error");
+
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(PathBuf::from("/Applications/Codex.app")),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store: status_store.clone(),
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+    fatal_tx
+        .send(Some(
+            "administrator exec broker stopped unexpectedly".to_owned(),
+        ))
+        .unwrap();
+    let error = handle.wait_for_codex_exit().await.unwrap_err();
+
+    assert!(error.to_string().contains("exec broker"));
+    assert!(error.to_string().contains("secret-cleanup-error"));
+    assert!(events.lock().unwrap().contains(&"stop-admin".to_owned()));
+    let status = status_store.load_latest().unwrap().unwrap();
+    assert_eq!(
+        status.administrator_mode.error_component.as_deref(),
+        Some("exec")
+    );
+    assert!(!status.administrator_mode.exec_elevated);
+    assert!(!status.administrator_mode.computer_use_elevated);
+    assert!(!status.message.contains("secret-cleanup"));
 }
 
 #[tokio::test]
@@ -2317,14 +2639,16 @@ struct FakeHooks {
     inject_error: Option<String>,
     provider_sync_unsupported: bool,
     plugin_marketplace_error: Option<String>,
-    has_pending_remote_control_session_recoveries: bool,
     admin_start_error: Option<String>,
     admin_stop_error: Option<String>,
     admin_stop_abort: bool,
     admin_lease: Arc<Mutex<Option<AdminModeLease>>>,
     admin_stop_started: Option<Arc<Notify>>,
     admin_stop_release: Option<Arc<Notify>>,
+    injection_started: Option<Arc<Notify>>,
+    injection_release: Option<Arc<Notify>>,
     wait_error: Option<String>,
+    has_pending_remote_control_session_recoveries: bool,
 }
 
 impl FakeHooks {
@@ -2341,14 +2665,16 @@ impl FakeHooks {
             inject_error: None,
             provider_sync_unsupported: false,
             plugin_marketplace_error: None,
-            has_pending_remote_control_session_recoveries: false,
             admin_start_error: None,
             admin_stop_error: None,
             admin_stop_abort: false,
             admin_lease: Arc::new(Mutex::new(None)),
             admin_stop_started: None,
             admin_stop_release: None,
+            injection_started: None,
+            injection_release: None,
             wait_error: None,
+            has_pending_remote_control_session_recoveries: false,
         }
     }
 
@@ -2382,11 +2708,6 @@ impl FakeHooks {
         self
     }
 
-    fn with_pending_remote_control_session_recoveries(mut self) -> Self {
-        self.has_pending_remote_control_session_recoveries = true;
-        self
-    }
-
     fn with_admin_start_error(mut self, message: &str) -> Self {
         self.admin_start_error = Some(message.to_string());
         self
@@ -2415,6 +2736,17 @@ impl FakeHooks {
     fn with_admin_stop_gate(mut self, started: Arc<Notify>, release: Arc<Notify>) -> Self {
         self.admin_stop_started = Some(started);
         self.admin_stop_release = Some(release);
+        self
+    }
+
+    fn with_injection_gate(mut self, started: Arc<Notify>, release: Arc<Notify>) -> Self {
+        self.injection_started = Some(started);
+        self.injection_release = Some(release);
+        self
+    }
+
+    fn with_pending_remote_control_session_recoveries(mut self) -> Self {
+        self.has_pending_remote_control_session_recoveries = true;
         self
     }
 
@@ -2580,6 +2912,12 @@ impl LaunchHooks for FakeHooks {
 
     async fn ensure_injection(&self, debug_port: u16, helper_port: u16, _app_dir: &Path) -> bool {
         self.event(format!("inject:{debug_port}:{helper_port}"));
+        if let Some(started) = &self.injection_started {
+            started.notify_one();
+        }
+        if let Some(release) = &self.injection_release {
+            release.notified().await;
+        }
         self.inject_error.is_none()
     }
 

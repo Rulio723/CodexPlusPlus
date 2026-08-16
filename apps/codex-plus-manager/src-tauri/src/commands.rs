@@ -440,6 +440,25 @@ pub struct ContextDeleteRequest {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SkillImportRequest {
+    pub source_path: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillEnabledRequest {
+    pub skill_id: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillIdRequest {
+    pub skill_id: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ExtractRelayCommonConfigRequest {
     pub config_contents: String,
 }
@@ -3631,6 +3650,90 @@ pub fn read_live_context_entries() -> CommandResult<LiveContextEntriesPayload> {
             LiveContextEntriesPayload {
                 entries: empty_context_entries(),
             },
+        ),
+    }
+}
+
+#[tauri::command]
+pub fn list_skills() -> CommandResult<codex_plus_core::skill_manager::SkillInventory> {
+    let home = codex_plus_core::codex_home::default_codex_home_dir();
+    match codex_plus_core::skill_manager::list_skills(&home) {
+        Ok(inventory) => ok(
+            &format!("已读取 {} 个可用 Skill。", inventory.skills.len()),
+            inventory,
+        ),
+        Err(error) => failed(
+            &format!("读取 Skill 失败：{error}"),
+            codex_plus_core::skill_manager::SkillInventory::empty(&home),
+        ),
+    }
+}
+
+#[tauri::command]
+pub fn import_skill(
+    request: SkillImportRequest,
+) -> CommandResult<codex_plus_core::skill_manager::SkillInventory> {
+    let home = codex_plus_core::codex_home::default_codex_home_dir();
+    let source_path = PathBuf::from(request.source_path);
+    match codex_plus_core::skill_manager::import_skill(&home, &source_path) {
+        Ok(inventory) => ok(
+            "Skill 已安装到 Codex 用户目录；新会话可直接调用，未刷新时请重启 Codex。",
+            inventory,
+        ),
+        Err(error) => failed(
+            &format!("安装 Skill 失败：{error}"),
+            codex_plus_core::skill_manager::list_skills(&home)
+                .unwrap_or_else(|_| codex_plus_core::skill_manager::SkillInventory::empty(&home)),
+        ),
+    }
+}
+
+#[tauri::command]
+pub fn set_skill_enabled(
+    request: SkillEnabledRequest,
+) -> CommandResult<codex_plus_core::skill_manager::SkillInventory> {
+    let home = codex_plus_core::codex_home::default_codex_home_dir();
+    match codex_plus_core::skill_manager::set_skill_enabled(
+        &home,
+        &request.skill_id,
+        request.enabled,
+    ) {
+        Ok(inventory) => ok(
+            if request.enabled {
+                "Skill 已启用；新会话可直接调用。"
+            } else {
+                "Skill 已禁用并移出 Codex 自动发现目录。"
+            },
+            inventory,
+        ),
+        Err(error) => failed(
+            &format!(
+                "{} Skill 失败：{error}",
+                if request.enabled { "启用" } else { "禁用" }
+            ),
+            codex_plus_core::skill_manager::list_skills(&home)
+                .unwrap_or_else(|_| codex_plus_core::skill_manager::SkillInventory::empty(&home)),
+        ),
+    }
+}
+
+#[tauri::command]
+pub fn uninstall_skill(
+    request: SkillIdRequest,
+) -> CommandResult<codex_plus_core::skill_manager::SkillInventory> {
+    let home = codex_plus_core::codex_home::default_codex_home_dir();
+    match codex_plus_core::skill_manager::uninstall_skill(&home, &request.skill_id) {
+        Ok((inventory, backup_path)) => ok(
+            &format!(
+                "Skill 已卸载，并安全备份到 {}。",
+                backup_path.to_string_lossy()
+            ),
+            inventory,
+        ),
+        Err(error) => failed(
+            &format!("卸载 Skill 失败：{error}"),
+            codex_plus_core::skill_manager::list_skills(&home)
+                .unwrap_or_else(|_| codex_plus_core::skill_manager::SkillInventory::empty(&home)),
         ),
     }
 }

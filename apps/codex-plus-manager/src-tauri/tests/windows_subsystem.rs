@@ -600,3 +600,37 @@ fn manager_update_install_keeps_visible_progress_bar() {
     assert!(app_tsx.contains("current.percent + 0.2"));
     assert!(app_tsx.contains("下载或启动耗时较长"));
 }
+
+#[test]
+fn windows_installer_uses_guarded_retry_before_admin_recovery() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest_dir
+        .parent()
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::parent)
+        .expect("manager crate should live under apps/codex-plus-manager/src-tauri");
+    let source = std::fs::read_to_string(root.join("scripts/installer/windows/CodexPlusPlus.nsi"))
+        .expect("read Windows installer script");
+
+    for section_name in ["Section \"Install\"", "Section \"Uninstall\""] {
+        let start = source.find(section_name).expect("installer section");
+        let section = &source[start..];
+        let attempt = section
+            .find("Call TryRecoverAdminMode")
+            .or_else(|| section.find("Call un.TryRecoverAdminMode"))
+            .expect("guarded administrator recovery attempt");
+        let stop = section
+            .find("Call StopRunningCodexPlus")
+            .or_else(|| section.find("Call un.StopRunningCodexPlus"))
+            .expect("stop running Codex call");
+        let recover = section
+            .find("Call RecoverAdminMode")
+            .or_else(|| section.find("Call un.RecoverAdminMode"))
+            .expect("administrator recovery call");
+        assert!(attempt < stop && stop < recover);
+    }
+
+    assert!(source.contains(
+        "nsExec::ExecToLog /TIMEOUT=30000 '\"$AdminRecoveryFile\" --recover-admin-mode'"
+    ));
+}

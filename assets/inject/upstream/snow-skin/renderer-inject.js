@@ -2,6 +2,7 @@
   const STATE_KEY = "__CODEX_DREAM_SKIN_STATE__";
   const STYLE_ID = "codex-dream-skin-style";
   const CHROME_ID = "codex-dream-skin-chrome";
+  const HOME_UTILITY_CLASS = "dream-home-utility";
   window.__CODEX_DREAM_SKIN_DISABLED__ = false;
 
   const previous = window[STATE_KEY];
@@ -41,7 +42,10 @@
     }
 
     const shellMain = document.querySelector("main.main-surface") || document.querySelector("main");
-    const homeCandidate = document.querySelector('[role="main"]:has([data-testid="home-icon"])');
+    const mainCandidates = [...document.querySelectorAll("main, [role=\"main\"]")]
+      .filter((candidate) => candidate.matches("main.main-surface, [role=\"main\"]"));
+    const homeCandidate = mainCandidates.find((candidate) =>
+      candidate.querySelector('[data-testid="home-icon"]')) || null;
     const homeHasClassicChrome = !!(
       homeCandidate
       && homeCandidate.querySelector('[data-feature="game-source"]')
@@ -52,7 +56,7 @@
       )
     );
     const home = homeHasClassicChrome ? homeCandidate : null;
-    for (const candidate of document.querySelectorAll('[role="main"]')) {
+    for (const candidate of mainCandidates) {
       const isStructuredHome = candidate === home;
       const isSoftHome = candidate === homeCandidate && !home;
       candidate.classList.toggle("dream-home", isStructuredHome || isSoftHome);

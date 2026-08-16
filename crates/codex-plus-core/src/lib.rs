@@ -42,6 +42,7 @@ pub mod remote_control_recovery;
 pub mod routes;
 pub mod script_market;
 pub mod settings;
+pub mod skill_manager;
 pub mod status;
 pub mod stepwise;
 pub mod sub2api;

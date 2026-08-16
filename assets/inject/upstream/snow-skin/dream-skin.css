@@ -256,12 +256,12 @@ html.codex-dream-skin .dream-home {
   align-items: flex-start !important;
   justify-content: flex-start !important;
   max-width: 100% !important;
-  color: white !important;
+  color: #123b63 !important;
   font-size: clamp(20px, 2vw, 30px) !important;
   line-height: 1.28 !important;
   font-weight: 760 !important;
   text-align: left !important;
-  text-shadow: 0 2px 12px rgba(3,25,52,.50), 0 1px 0 rgba(255,255,255,.22);
+  text-shadow: 0 1px 0 rgba(255,255,255,.96), 0 3px 14px rgba(57,125,179,.20);
   opacity: 1 !important;
   pointer-events: auto !important;
 }
@@ -270,23 +270,24 @@ html.codex-dream-skin .dream-home {
   content: "Snow track focus mode. Fast, clean, and sharp.";
   display: block;
   margin-top: 13px;
-  color: rgba(235,248,255,.96);
+  color: rgba(18,59,99,.78);
   font-size: 15px;
   line-height: 1.5;
   font-weight: 500;
   letter-spacing: 0;
+  text-shadow: 0 1px 0 rgba(255,255,255,.92);
 }
 
 .dream-home [data-feature="game-source"] button {
   margin: 0 5px;
   padding: 2px 9px 3px;
-  border: 1px solid rgba(225,245,255,.72);
+  border: 1px solid rgba(64,145,205,.38);
   border-radius: 999px;
-  background: rgba(219,242,255,.20);
-  color: #dff4ff !important;
-  text-decoration-color: rgba(223,244,255,.72) !important;
+  background: rgba(245,251,255,.68);
+  color: #176eae !important;
+  text-decoration-color: rgba(23,110,174,.52) !important;
   text-underline-offset: 5px;
-  box-shadow: inset 0 0 12px rgba(255,255,255,.10);
+  box-shadow: inset 0 0 12px rgba(255,255,255,.52);
 }
 
 .dream-home [data-feature="game-source"] button::before {

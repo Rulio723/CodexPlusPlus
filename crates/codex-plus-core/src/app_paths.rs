@@ -83,8 +83,8 @@ pub fn find_latest_codex_app_dir_from_roots(roots: &[PathBuf]) -> Option<PathBuf
 pub fn find_latest_codex_app_dir_default() -> Option<PathBuf> {
     #[cfg(windows)]
     {
-        find_latest_codex_app_dir_from_roots(&windows_app_package_roots())
-            .or_else(find_latest_codex_app_dir_from_appx_package)
+        find_latest_codex_app_dir_from_appx_package()
+            .or_else(|| find_latest_codex_app_dir_from_roots(&windows_app_package_roots()))
     }
 
     #[cfg(not(windows))]
@@ -105,26 +105,59 @@ fn find_latest_codex_app_dir_from_appx_package() -> Option<PathBuf> {
 
 #[cfg(windows)]
 pub(crate) fn registered_windows_packages() -> anyhow::Result<Vec<RegisteredWindowsPackage>> {
-    use std::sync::OnceLock;
-
-    static PACKAGES: OnceLock<Result<Vec<RegisteredWindowsPackage>, String>> = OnceLock::new();
-    PACKAGES
-        .get_or_init(|| query_registered_windows_packages().map_err(|error| error.to_string()))
-        .clone()
-        .map_err(anyhow::Error::msg)
+    query_registered_windows_packages()
 }
 
 #[cfg(windows)]
 fn query_registered_windows_packages() -> anyhow::Result<Vec<RegisteredWindowsPackage>> {
+    collect_registered_windows_packages(
+        OPENAI_PACKAGE_FAMILY_NAMES,
+        package_full_names_for_family,
+        package_path_by_full_name,
+    )
+}
+
+#[cfg(windows)]
+fn collect_registered_windows_packages<List, Resolve>(
+    family_names: &[&str],
+    mut list_full_names: List,
+    mut resolve_path: Resolve,
+) -> anyhow::Result<Vec<RegisteredWindowsPackage>>
+where
+    List: FnMut(&str) -> anyhow::Result<Vec<String>>,
+    Resolve: FnMut(&str) -> anyhow::Result<PathBuf>,
+{
     let mut packages = Vec::new();
-    for family_name in OPENAI_PACKAGE_FAMILY_NAMES {
-        for full_name in package_full_names_for_family(family_name)? {
-            let install_location = package_path_by_full_name(&full_name)
-                .with_context(|| format!("failed to resolve registered package {full_name}"))?;
-            packages.push(RegisteredWindowsPackage {
-                full_name,
-                install_location,
-            });
+    let mut first_error = None;
+    for family_name in family_names {
+        let full_names = match list_full_names(family_name) {
+            Ok(full_names) => full_names,
+            Err(error) => {
+                first_error.get_or_insert_with(|| {
+                    error.context(format!(
+                        "failed to query registered package family {family_name}"
+                    ))
+                });
+                continue;
+            }
+        };
+        for full_name in full_names {
+            match resolve_path(&full_name) {
+                Ok(install_location) => packages.push(RegisteredWindowsPackage {
+                    full_name,
+                    install_location,
+                }),
+                Err(error) => {
+                    first_error.get_or_insert_with(|| {
+                        error.context(format!("failed to resolve registered package {full_name}"))
+                    });
+                }
+            }
+        }
+    }
+    if packages.is_empty() {
+        if let Some(error) = first_error {
+            return Err(error);
         }
     }
     Ok(packages)
@@ -221,6 +254,49 @@ fn package_path_by_full_name(full_name: &str) -> anyhow::Result<PathBuf> {
         .position(|value| *value == 0)
         .unwrap_or(path.len());
     Ok(PathBuf::from(OsString::from_wide(&path[..end])))
+}
+
+#[cfg(all(test, windows))]
+mod registered_package_tests {
+    use super::*;
+
+    #[test]
+    fn stale_registered_package_does_not_hide_a_valid_package() {
+        let packages = collect_registered_windows_packages(
+            &["OpenAI.Codex_family"],
+            |_| Ok(vec!["stale".to_string(), "current".to_string()]),
+            |full_name| match full_name {
+                "stale" => anyhow::bail!("package is no longer registered"),
+                "current" => Ok(PathBuf::from(r"C:\Program Files\WindowsApps\current")),
+                _ => unreachable!(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            packages,
+            vec![RegisteredWindowsPackage {
+                full_name: "current".to_string(),
+                install_location: PathBuf::from(r"C:\Program Files\WindowsApps\current"),
+            }]
+        );
+    }
+
+    #[test]
+    fn package_query_reports_an_error_when_every_candidate_is_stale() {
+        let error = collect_registered_windows_packages(
+            &["OpenAI.Codex_family"],
+            |_| Ok(vec!["stale".to_string()]),
+            |_| anyhow::bail!("package is no longer registered"),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to resolve registered package stale")
+        );
+    }
 }
 
 #[cfg(windows)]

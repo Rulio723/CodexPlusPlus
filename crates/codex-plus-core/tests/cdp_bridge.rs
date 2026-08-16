@@ -852,12 +852,12 @@ fn injection_script_skips_plugin_patch_work_in_relay_mode() {
 }
 
 #[test]
-fn injection_script_omits_plugin_auto_expand() {
+fn injection_script_disables_plugin_auto_expand_in_relay_mode() {
     let script = assets::injection_script(57321);
 
-    assert!(!script.contains("pluginAutoExpand"));
-    assert!(!script.contains("codexPluginAutoExpand"));
-    assert!(!script.contains("plugin_auto_expand"));
+    assert!(script.contains("settings.pluginAutoExpand = false"));
+    assert!(script.contains("if (pluginPatchDisabledInRelayMode()) return"));
+    assert!(script.contains("if (!codexPlusSettings().pluginAutoExpand) return"));
 }
 
 #[test]
@@ -1326,7 +1326,7 @@ fn injection_script_refreshes_sidebar_after_session_undo() {
         .expect("refresh helper should end before project move refresh")
         .0;
     let toast = script
-        .split_once("function showToast(message, undoToken)")
+        .split_once("function showToast(message, undoToken, deletedRef = null)")
         .expect("undo toast should exist")
         .1
         .split_once("function upstreamWorktreeField")
@@ -1372,6 +1372,10 @@ fn injection_script_guards_temporary_new_thread_ids_before_delete() {
     );
     assert_eq!(cases["unrelatedIds"], "");
     assert_eq!(cases["temporaryHref"], "");
+    assert_eq!(cases["userThreadSource"], "user");
+    assert_eq!(cases["subagentThreadSource"], "subagent");
+    assert_eq!(cases["userRowHidden"], false);
+    assert_eq!(cases["subagentRowHidden"], true);
 }
 
 fn run_session_ref_contract_harness() -> serde_json::Value {
@@ -1432,6 +1436,7 @@ const row = (attributes, props = null) => {{
   return value;
 }};
 const sessionId = (value) => api.fromRow(value).session_id;
+const fiberRow = (props) => row({{}}, props);
 const cases = {{
   canonicalAttribute: sessionId(row({{ "data-app-action-sidebar-thread-id": "11111111-1111-4111-8111-111111111111" }})),
   canonicalHref: sessionId(row({{
@@ -1450,6 +1455,10 @@ const cases = {{
     {{ "data-app-action-sidebar-thread-id": placeholder, href: "/thread/client-new-thread:fixture" }},
     {{ conversationId: "66666666-6666-4666-8666-666666666666" }},
   )),
+  userThreadSource: api.threadSourceFromRow(fiberRow({{ threadSummary: {{ threadSource: "user" }} }})),
+  subagentThreadSource: api.threadSourceFromRow(fiberRow({{ entry: {{ summary: {{ threadSource: "subagent" }} }} }})),
+  userRowHidden: api.isInternalSubagentRow(fiberRow({{ threadSummary: {{ threadSource: "user" }} }})),
+  subagentRowHidden: api.isInternalSubagentRow(fiberRow({{ threadSummary: {{ threadSource: "subagent" }} }})),
 }};
 process.stdout.write(JSON.stringify(cases));
 process.exit(0);
@@ -2487,15 +2496,16 @@ fn manager_ui_exposes_pure_api_relay_mode_button() {
 }
 
 #[test]
-fn manager_ui_omits_plugin_auto_expand() {
+fn manager_ui_disables_plugin_auto_expand_in_compatible_mode() {
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
         .expect("core crate should live under crates/codex-plus-core");
     let source = std::fs::read_to_string(repo.join("apps/codex-plus-manager/src/App.tsx")).unwrap();
 
-    assert!(!source.contains("codexAppPluginAutoExpand"));
-    assert!(!source.contains("插件列表全量展示"));
+    assert!(source.contains(
+        "checked={form.codexAppPluginAutoExpand} disabled={!masterEnabled || !patchMode}"
+    ));
 }
 
 #[test]

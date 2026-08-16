@@ -347,7 +347,10 @@
       style.dataset.dreamVersion = "3";
     }
 
-    const homeCandidate = document.querySelector('[role="main"]:has([data-testid="home-icon"])');
+    const mainCandidates = [...document.querySelectorAll("main, [role=\"main\"]")]
+      .filter((candidate) => candidate.matches("main.main-surface, [role=\"main\"]"));
+    const homeCandidate = mainCandidates.find((candidate) =>
+      candidate.querySelector('[data-testid="home-icon"]')) || null;
     const homeHasClassicChrome = !!(
       homeCandidate
       && homeCandidate.querySelector('[data-feature="game-source"]')
@@ -358,7 +361,7 @@
       )
     );
     const home = homeHasClassicChrome ? homeCandidate : null;
-    for (const candidate of document.querySelectorAll('[role="main"]')) {
+    for (const candidate of mainCandidates) {
       const isStructuredHome = candidate === home;
       const isSoftHome = candidate === homeCandidate && !home;
       candidate.classList.toggle("dream-home", isStructuredHome || isSoftHome);

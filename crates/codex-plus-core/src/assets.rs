@@ -47,7 +47,7 @@ const DREAM_SKIN_DEFAULT_IMAGE: &[u8] =
 const PET_REAL_MOUSE_SCRIPT: &str = include_str!("../../../assets/inject/pet-real-mouse-inject.js");
 const STEPWISE_SCRIPT: &str = include_str!("../../../assets/inject/stepwise-inject.js");
 pub const DIAGNOSTIC_BUILD_ID: &str = "diag-20260518-1";
-const DREAM_SKIN_RENDERER_REVISION: &str = "19-newchat-fix";
+const DREAM_SKIN_RENDERER_REVISION: &str = "22-home-contrast-diagnostics";
 
 pub fn renderer_script() -> &'static str {
     RENDERER_SCRIPT
@@ -118,6 +118,12 @@ fn dream_skin_target_runtime_script(settings: &BackendSettings, include_art: boo
     let style_revision = dream_skin_content_signature(css.as_bytes());
     let payload_revision =
         dream_skin_target_payload_signature(settings, engine, &style_revision, &theme);
+    let managed_version = format!(
+        "codex-plus:{}:{}:r{}",
+        dream_skin_platform(),
+        engine,
+        DREAM_SKIN_RENDERER_REVISION
+    );
     let mut payload = renderer
         .replace("__DREAM_CSS_JSON__", &serde_json::to_string(&css).unwrap())
         .replace("__DREAM_ART_JSON__", "window.__CODEX_PLUS_DREAM_SKIN_ART__")
@@ -127,7 +133,7 @@ fn dream_skin_target_runtime_script(settings: &BackendSettings, include_art: boo
         )
         .replace(
             "__DREAM_VERSION_JSON__",
-            &serde_json::to_string("2.1.0-snow.1").unwrap(),
+            &serde_json::to_string(&managed_version).unwrap(),
         )
         .replace(
             "__GLASS_VISION_CSS_JSON__",
@@ -403,9 +409,10 @@ pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettin
     let paste_fix = paste_fix_enabled_config(settings);
     let force_chinese_locale = force_chinese_locale_config(settings);
     let fast_startup = fast_startup_config(settings);
+    let classic_project_sidebar = classic_project_sidebar_config(settings);
     let hide_official_usage_alert = hide_official_usage_alert_config(settings);
     format!(
-        "window.__CODEX_SESSION_DELETE_HELPER__ = {};\nwindow.__CODEX_PLUS_VERSION__ = {};\nwindow.__CODEX_PLUS_BUILD__ = {};\nwindow.__CODEX_PLUS_IMAGE_OVERLAY__ = {};\nwindow.__CODEX_PLUS_PLUGIN_MARKETPLACES__ = {};\nwindow.__CODEX_PLUS_EXTERNAL_DREAM_SKIN_RUNTIME__ = true;\nwindow.__CODEX_PLUS_DREAM_SKIN_PLATFORM__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_REVISION__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_ART__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_ART_SIGNATURE__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_THEME__ = {};\nwindow.__CODEX_PLUS_PASTE_FIX__ = {};\nwindow.__CODEX_PLUS_FORCE_CHINESE_LOCALE__ = {};\nwindow.__CODEX_PLUS_FAST_STARTUP__ = {};\nwindow.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = {};\n{}\n{}\n{}",
+        "window.__CODEX_SESSION_DELETE_HELPER__ = {};\nwindow.__CODEX_PLUS_VERSION__ = {};\nwindow.__CODEX_PLUS_BUILD__ = {};\nwindow.__CODEX_PLUS_IMAGE_OVERLAY__ = {};\nwindow.__CODEX_PLUS_PLUGIN_MARKETPLACES__ = {};\nwindow.__CODEX_PLUS_EXTERNAL_DREAM_SKIN_RUNTIME__ = true;\nwindow.__CODEX_PLUS_DREAM_SKIN_PLATFORM__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_REVISION__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_ART__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_ART_SIGNATURE__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_THEME__ = {};\nwindow.__CODEX_PLUS_PASTE_FIX__ = {};\nwindow.__CODEX_PLUS_FORCE_CHINESE_LOCALE__ = {};\nwindow.__CODEX_PLUS_FAST_STARTUP__ = {};\nwindow.__CODEX_PLUS_CLASSIC_PROJECT_SIDEBAR__ = {};\nwindow.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = {};\n{}\n{}\n{}",
         serde_json::to_string(&helper_url).expect("helper URL should serialize"),
         serde_json::to_string(crate::version::VERSION).expect("version should serialize"),
         serde_json::to_string(DIAGNOSTIC_BUILD_ID).expect("build id should serialize"),
@@ -422,6 +429,8 @@ pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettin
         serde_json::to_string(&force_chinese_locale)
             .expect("force Chinese locale config should serialize"),
         serde_json::to_string(&fast_startup).expect("fast startup config should serialize"),
+        serde_json::to_string(&classic_project_sidebar)
+            .expect("classic project sidebar config should serialize"),
         serde_json::to_string(&hide_official_usage_alert)
             .expect("usage alert config should serialize"),
         renderer_script(),
@@ -684,6 +693,13 @@ pub fn force_chinese_locale_config(settings: &BackendSettings) -> Value {
 
 pub fn fast_startup_config(settings: &BackendSettings) -> Value {
     json!({ "enabled": settings.codex_app_fast_startup, "statsigTimeoutMs": 800 })
+}
+
+pub fn classic_project_sidebar_config(settings: &BackendSettings) -> Value {
+    json!({
+        "enabled": settings.codex_app_classic_project_sidebar,
+        "gateName": "12346831",
+    })
 }
 
 fn image_data_uri(mime_type: &str, bytes: &[u8]) -> String {

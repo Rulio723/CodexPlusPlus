@@ -133,4 +133,24 @@ describe("renderer injection header compatibility", () => {
     assert.match(renderer, /\[data-codex-plus-usage-alert-hidden="true"\] \{ display: none !important; \}/);
     assert.doesNotMatch(renderer, /container\.style\.(?:setProperty|removeProperty)\("display"/);
   });
+
+  it("filters internal subagent rows and recognizes the current Recents sidebar section", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+
+    assert.match(renderer, /reactThreadSourceFromRow/);
+    assert.match(renderer, /reactThreadSourceFromRow\(row\)\s*===\s*"subagent"/);
+    assert.match(renderer, /data-codex-internal-subagent-row="true"/);
+    assert.match(renderer, /sidebar-section-heading="Recents"/);
+  });
+
+  it("hides stale catalog-only rows without racing newly-created threads", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+
+    assert.match(renderer, /catalogOnlyGracePeriodMs\s*=\s*60_000/);
+    assert.match(renderer, /data-codex-catalog-only-row="true"/);
+    assert.match(renderer, /uuidV7TimestampMs\(ref\.session_id\)/);
+    assert.match(renderer, /delete item\.dataset\.codexCatalogOnlyRow/);
+    assert.match(renderer, /!isCatalogOnlyRow\(row\)/);
+    assert.match(renderer, /if \(rows\.length < 1\) return/);
+  });
 });

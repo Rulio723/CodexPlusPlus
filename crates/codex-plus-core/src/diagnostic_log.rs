@@ -57,6 +57,62 @@ pub fn append_diagnostic_log(event: &str, detail: impl Serialize) -> std::io::Re
     Ok(())
 }
 
+pub fn sanitized_error_chain(error: &anyhow::Error) -> String {
+    const MAX_DETAIL_CHARS: usize = 2_048;
+    let mut detail = error
+        .chain()
+        .map(ToString::to_string)
+        .map(|message| sanitize_error_message(&message))
+        .collect::<Vec<_>>()
+        .join(": ");
+    if detail.chars().count() > MAX_DETAIL_CHARS {
+        detail = detail.chars().take(MAX_DETAIL_CHARS).collect();
+        detail.push_str("...");
+    }
+    detail
+}
+
+fn sanitize_error_message(message: &str) -> String {
+    let mut sanitized = Vec::new();
+    let mut redact_next = false;
+    for token in message.split_whitespace() {
+        let lower = token.to_ascii_lowercase();
+        if redact_next || lower.contains(r"\\.\pipe\") {
+            sanitized.push("<REDACTED>".to_string());
+            redact_next = false;
+            continue;
+        }
+        let label = lower
+            .trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '_');
+        if matches!(
+            label,
+            "proof" | "session" | "session_id" | "token" | "pipe" | "pipe_name"
+        ) {
+            sanitized.push(token.to_string());
+            redact_next = true;
+            continue;
+        }
+        if [
+            "proof=",
+            "session=",
+            "session_id=",
+            "token=",
+            "pipe=",
+            "pipe_name=",
+        ]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+        {
+            let separator = if token.contains('=') { "=" } else { ":" };
+            let label = token.split(['=', ':']).next().unwrap_or("sensitive");
+            sanitized.push(format!("{label}{separator}<REDACTED>"));
+            continue;
+        }
+        sanitized.push(token.to_string());
+    }
+    sanitized.join(" ")
+}
+
 pub fn clear_diagnostic_log() -> std::io::Result<()> {
     let path = diagnostic_log_path();
     clear_diagnostic_log_path(&path)
@@ -153,5 +209,31 @@ mod tests {
         let path = temp.path().join("missing.log");
 
         clear_diagnostic_log_path(&path).unwrap();
+    }
+
+    #[test]
+    fn sanitized_error_chain_keeps_stage_but_redacts_admin_secrets() {
+        let error = anyhow::anyhow!(
+            r"administrator_mode:exec: admin_exec_readiness failed for pipe \\.\pipe\codex-plus-secret with proof secret-proof session 1234 token=abcd"
+        );
+
+        let detail = sanitized_error_chain(&error);
+
+        assert!(detail.contains("administrator_mode:exec"));
+        assert!(detail.contains("admin_exec_readiness"));
+        assert!(!detail.contains("codex-plus-secret"));
+        assert!(!detail.contains("secret-proof"));
+        assert!(!detail.contains("1234"));
+        assert!(!detail.contains("abcd"));
+    }
+
+    #[test]
+    fn sanitized_error_chain_is_bounded() {
+        let error = anyhow::anyhow!("{}", "x".repeat(4_096));
+
+        let detail = sanitized_error_chain(&error);
+
+        assert!(detail.len() <= 2_051);
+        assert!(detail.ends_with("..."));
     }
 }

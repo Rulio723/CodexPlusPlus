@@ -627,7 +627,6 @@ fn managed_openai_base_url() -> String {
 }
 
 fn update_remote_control_openai_base_url(doc: &mut DocumentMut, enabled: bool) {
-    let managed = managed_openai_base_url();
     let current = doc
         .get(OPENAI_BASE_URL_KEY)
         .and_then(Item::as_str)
@@ -635,10 +634,14 @@ fn update_remote_control_openai_base_url(doc: &mut DocumentMut, enabled: bool) {
         .map(ToString::to_string);
 
     if enabled {
+        let managed = managed_openai_base_url();
         if current.as_deref().is_none_or(|value| value == managed) {
             doc[OPENAI_BASE_URL_KEY] = toml_edit::value(managed);
         }
-    } else if current.as_deref() == Some(managed.as_str()) {
+    } else if current
+        .as_deref()
+        .is_some_and(|value| local_responses_proxy_port(value).is_some())
+    {
         doc.as_table_mut().remove(OPENAI_BASE_URL_KEY);
     }
 }
@@ -647,6 +650,73 @@ fn remove_managed_remote_control_openai_base_url(contents: &str) -> anyhow::Resu
     let mut doc = parse_toml_document(contents)?;
     update_remote_control_openai_base_url(&mut doc, false);
     Ok(normalize_optional_toml(doc))
+}
+
+fn local_responses_proxy_port(value: &str) -> Option<u16> {
+    value
+        .trim()
+        .strip_prefix("http://127.0.0.1:")?
+        .strip_suffix("/v1")?
+        .parse()
+        .ok()
+}
+
+fn rewrite_local_proxy_item(item: &mut Item, replacement: &str) -> bool {
+    let Some(value) = item.as_str() else {
+        return false;
+    };
+    if local_responses_proxy_port(value).is_none() {
+        return false;
+    }
+    if value.trim() == replacement {
+        return false;
+    }
+    *item = toml_edit::value(replacement);
+    true
+}
+
+pub fn rewrite_managed_local_proxy_urls_to_port(
+    home: &Path,
+    proxy_port: u16,
+    preserve_computer_use_guard: bool,
+) -> anyhow::Result<bool> {
+    if proxy_port == 0 {
+        return Ok(false);
+    }
+    let config_path = home.join("config.toml");
+    let contents = read_optional_text(&config_path)?;
+    if contents.trim().is_empty() {
+        return Ok(false);
+    }
+    let mut doc = parse_toml_document(&contents)?;
+    let replacement = crate::protocol_proxy::local_responses_proxy_base_url(proxy_port);
+    let mut changed = false;
+
+    for key in [OPENAI_BASE_URL_KEY, "base_url"] {
+        if let Some(item) = doc.get_mut(key) {
+            changed |= rewrite_local_proxy_item(item, &replacement);
+        }
+    }
+    if let Some(providers) = doc
+        .get_mut("model_providers")
+        .and_then(Item::as_table_like_mut)
+    {
+        for (_, provider) in providers.iter_mut() {
+            if let Some(item) = provider
+                .as_table_like_mut()
+                .and_then(|table| table.get_mut("base_url"))
+            {
+                changed |= rewrite_local_proxy_item(item, &replacement);
+            }
+        }
+    }
+
+    if !changed {
+        return Ok(false);
+    }
+    let updated = normalize_optional_toml(doc);
+    write_codex_live_atomic(home, Some(&updated), None, preserve_computer_use_guard)?;
+    Ok(true)
 }
 
 pub fn clear_relay_config_to_home(home: &Path) -> anyhow::Result<RelayApplyResult> {

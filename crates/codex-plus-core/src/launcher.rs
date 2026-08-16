@@ -4,8 +4,8 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -108,6 +108,7 @@ pub struct LaunchHandle {
     pub status_store: StatusStore,
     helper_started: bool,
     administrator_mode: Arc<Mutex<Option<AdminModeLease>>>,
+    administrator_health: Option<tokio::sync::watch::Receiver<Option<String>>>,
     hooks: Arc<dyn LaunchHooks>,
 }
 
@@ -126,10 +127,22 @@ impl std::fmt::Debug for LaunchHandle {
 
 impl LaunchHandle {
     pub async fn wait_for_codex_exit(&self) -> anyhow::Result<()> {
-        let wait_result = self
-            .hooks
-            .wait_for_codex_exit(&self.launch, self.debug_port)
-            .await;
+        let mut broker_failure_component = None;
+        let wait_result = if let Some(mut health) = self.administrator_health.clone() {
+            tokio::select! {
+                biased;
+                failure = wait_for_administrator_failure(&mut health) => {
+                    broker_failure_component = Some(administrator_failure_component(&failure));
+                    self.hooks.terminate_codex(&self.launch).await;
+                    Err(anyhow::anyhow!(failure))
+                }
+                result = self.hooks.wait_for_codex_exit(&self.launch, self.debug_port) => result,
+            }
+        } else {
+            self.hooks
+                .wait_for_codex_exit(&self.launch, self.debug_port)
+                .await
+        };
         let cleanup_task = self
             .administrator_mode
             .lock()
@@ -149,33 +162,48 @@ impl LaunchHandle {
             self.hooks.shutdown_helper(self.helper_port).await;
         }
         if owns_cleanup {
-            let (status, message, state, error_component) =
-                match (wait_result.is_err(), cleanup_result.is_err()) {
-                    (false, false) => (
-                        "stopped",
-                        "Codex exited; Administrator Mode stopped",
-                        "stopped",
-                        None,
-                    ),
-                    (true, false) => (
-                        "failed",
-                        "Codex wait failed; Administrator Mode stopped",
-                        "failed",
-                        Some("codex_wait".to_string()),
-                    ),
-                    (false, true) => (
-                        "failed",
-                        "Administrator Mode cleanup failed",
-                        "failed",
-                        Some("cleanup".to_string()),
-                    ),
-                    (true, true) => (
-                        "failed",
-                        "Codex wait and Administrator Mode cleanup failed",
-                        "failed",
-                        Some("cleanup".to_string()),
-                    ),
-                };
+            let (status, message, state, error_component) = match (
+                broker_failure_component,
+                wait_result.is_err(),
+                cleanup_result.is_err(),
+            ) {
+                (Some(component), _, false) => (
+                    "failed",
+                    "Administrator broker failed; Codex was terminated",
+                    "failed",
+                    Some(component.to_string()),
+                ),
+                (Some(component), _, true) => (
+                    "failed",
+                    "Administrator broker and cleanup failed",
+                    "failed",
+                    Some(component.to_string()),
+                ),
+                (None, false, false) => (
+                    "stopped",
+                    "Codex exited; Administrator Mode stopped",
+                    "stopped",
+                    None,
+                ),
+                (None, true, false) => (
+                    "failed",
+                    "Codex wait failed; Administrator Mode stopped",
+                    "failed",
+                    Some("codex_wait".to_string()),
+                ),
+                (None, false, true) => (
+                    "failed",
+                    "Administrator Mode cleanup failed",
+                    "failed",
+                    Some("cleanup".to_string()),
+                ),
+                (None, true, true) => (
+                    "failed",
+                    "Codex wait and Administrator Mode cleanup failed",
+                    "failed",
+                    Some("cleanup".to_string()),
+                ),
+            };
             let final_status = launch_status_with_administrator_mode(
                 status,
                 message,
@@ -200,6 +228,27 @@ impl LaunchHandle {
             (Err(wait), Err(cleanup)) => Err(anyhow::anyhow!(
                 "Codex wait failed: {wait:#}; Administrator Mode cleanup failed: {cleanup:#}"
             )),
+        }
+    }
+}
+
+fn administrator_failure_component(failure: &str) -> &'static str {
+    if failure.to_ascii_lowercase().contains("exec") {
+        "exec"
+    } else {
+        "computer_use"
+    }
+}
+
+async fn wait_for_administrator_failure(
+    health: &mut tokio::sync::watch::Receiver<Option<String>>,
+) -> String {
+    loop {
+        if let Some(failure) = health.borrow().clone() {
+            return failure;
+        }
+        if health.changed().await.is_err() {
+            return "administrator Computer Use broker health channel closed".to_owned();
         }
     }
 }
@@ -345,6 +394,7 @@ pub struct DefaultLaunchHooks {
     bridge_reinjector: Mutex<Option<BridgeReinjector>>,
     computer_use_guard_watchdog: Mutex<Option<ComputerUseGuardWatchdogRuntime>>,
     computer_use_guard_artifacts: Mutex<Option<crate::computer_use_guard::GuardArtifacts>>,
+    administrator_app_server: StdMutex<Option<crate::admin_mode::AdminAppServerBootstrap>>,
 }
 
 struct HelperRuntime {
@@ -402,7 +452,7 @@ where
 {
     let hooks = hooks.into_launch_hooks();
     let debug_port = hooks.select_debug_port(options.debug_port);
-    let mut helper_port = hooks.select_helper_port(options.helper_port);
+    let helper_port = hooks.select_helper_port(options.helper_port);
     let settings = hooks.load_settings().await?;
     let app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings)?;
     let status_store = options.status_store.clone();
@@ -410,6 +460,7 @@ where
     let mut launched = None;
     let mut keep_launched_on_error = false;
     let mut administrator_lease = None;
+    let mut administrator_health = None;
     let mut administrator_status = AdministratorModeStatus {
         requested: settings.administrator_mode_enabled,
         ..AdministratorModeStatus::default()
@@ -418,6 +469,10 @@ where
 
     let result: anyhow::Result<LaunchHandle> = async {
         let home = crate::relay_config::default_codex_home_dir();
+        crate::codex_app_state::ensure_bottom_panel_launcher_visible_nonfatal(
+            &home,
+            "launcher.before",
+        );
         if settings.provider_sync_enabled {
             crate::codex_app_state::capture_app_state_snapshot_nonfatal(&home, "launcher.before");
             hooks.run_provider_sync().await?;
@@ -476,7 +531,11 @@ where
         let protocol_proxy_enabled = relay_protocol_proxy_enabled(&settings)
             || remote_control_provider_proxy_enabled(&settings);
         if protocol_proxy_enabled {
-            helper_port = crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT;
+            crate::relay_config::rewrite_managed_local_proxy_urls_to_port(
+                &home,
+                helper_port,
+                settings.computer_use_guard_enabled,
+            )?;
         }
         if settings.enhancements_enabled || protocol_proxy_enabled {
             hooks.start_helper(helper_port).await?;
@@ -498,6 +557,9 @@ where
             match hooks.start_administrator_mode(&settings, &app_dir).await {
                 Ok(Some(lease)) => {
                     administrator_lease = Some(lease);
+                    administrator_health = administrator_lease
+                        .as_ref()
+                        .and_then(AdminModeLease::health_receiver);
                     administrator_status.state = "active".to_string();
                     administrator_status.exec_elevated = true;
                     administrator_status.computer_use_elevated = true;
@@ -532,6 +594,7 @@ where
             .await?;
         launched = Some(launch.clone());
         keep_launched_on_error = true;
+        let post_launch = async {
         if settings.computer_use_guard_enabled {
             hooks.start_computer_use_guard_watchdog(&settings).await?;
         }
@@ -577,6 +640,26 @@ where
             options.status_store.save_latest(&status)?;
             hooks.write_status("running").await;
         }
+        Ok::<(), anyhow::Error>(())
+        };
+        if let Some(mut health) = administrator_health.clone() {
+            tokio::select! {
+                biased;
+                failure = wait_for_administrator_failure(&mut health) => {
+                    administrator_status.state = "failed".to_string();
+                    administrator_status.exec_elevated = false;
+                    administrator_status.computer_use_elevated = false;
+                    administrator_status.error_component = Some(
+                        administrator_failure_component(&failure).to_string()
+                    );
+                    keep_launched_on_error = false;
+                    return Err(anyhow::anyhow!(failure));
+                }
+                result = post_launch => result?,
+            }
+        } else {
+            post_launch.await?;
+        }
 
         Ok(LaunchHandle {
             debug_port,
@@ -586,6 +669,7 @@ where
             status_store: status_store.clone(),
             helper_started,
             administrator_mode: Arc::new(Mutex::new(administrator_lease.take())),
+            administrator_health: administrator_health.clone(),
             hooks: Arc::clone(&hooks),
         })
     }
@@ -593,23 +677,47 @@ where
 
     match result {
         Ok(handle) => Ok(handle),
-        Err(error) => {
+        Err(mut error) => {
+            if let Some(health) = administrator_health.as_ref()
+                && let Some(failure) = health.borrow().clone()
+            {
+                administrator_status.state = "failed".to_string();
+                administrator_status.exec_elevated = false;
+                administrator_status.computer_use_elevated = false;
+                administrator_status.error_component =
+                    Some(administrator_failure_component(&failure).to_string());
+                keep_launched_on_error = false;
+                error = anyhow::anyhow!(failure);
+            }
+            let administrator_broker_failed = matches!(
+                administrator_status.error_component.as_deref(),
+                Some("exec" | "computer_use")
+            );
+            if let Some(launch) = &launched
+                && !keep_launched_on_error
+                && administrator_broker_failed
+            {
+                hooks.terminate_codex(launch).await;
+            }
             if let Some(lease) = administrator_lease.take() {
                 let _ = hooks.stop_administrator_mode(lease).await;
                 if !administrator_start_failed {
-                    administrator_status.state = "failed".to_string();
-                    administrator_status.exec_elevated = false;
-                    administrator_status.computer_use_elevated = false;
-                    administrator_status.error_component = Some("activation".to_string());
+                    if administrator_status.error_component.is_none() {
+                        administrator_status.state = "failed".to_string();
+                        administrator_status.exec_elevated = false;
+                        administrator_status.computer_use_elevated = false;
+                        administrator_status.error_component = Some("activation".to_string());
+                    }
                 }
             }
             if helper_started {
                 hooks.shutdown_helper(helper_port).await;
             }
-            if let Some(launch) = &launched {
-                if !keep_launched_on_error {
-                    hooks.terminate_codex(launch).await;
-                }
+            if let Some(launch) = &launched
+                && !keep_launched_on_error
+                && !administrator_broker_failed
+            {
+                hooks.terminate_codex(launch).await;
             }
             let message = if administrator_start_failed {
                 "Administrator Mode failed to start".to_string()
@@ -917,6 +1025,55 @@ impl LaunchHooks for DefaultLaunchHooks {
         Ok(())
     }
 
+    async fn start_administrator_mode(
+        &self,
+        settings: &BackendSettings,
+        app_dir: &Path,
+    ) -> anyhow::Result<Option<AdminModeLease>> {
+        if !settings.administrator_mode_enabled {
+            *self
+                .administrator_app_server
+                .lock()
+                .expect("administrator app-server state lock poisoned") = None;
+            return Ok(None);
+        }
+        let current_exe = std::env::current_exe().context("administrator_mode:shim")?;
+        let install_dir = current_exe
+            .parent()
+            .context("administrator_mode:shim: launcher has no parent directory")?;
+        let shim_path = install_dir.join("codex-plus-admin-shim.exe");
+        let terminal_shim_path = install_dir.join("admin-terminal").join("pwsh.exe");
+        let runtime =
+            crate::admin_mode::AdminModeRuntime::start(crate::admin_mode::AdminModeConfig {
+                codex_home: &crate::codex_home::default_codex_home_dir(),
+                state_dir: &crate::paths::default_app_state_dir(),
+                app_dir,
+                shim_path: &shim_path,
+                terminal_shim_path: &terminal_shim_path,
+            })
+            .await?;
+        let lease = AdminModeLease::new(runtime);
+        let bootstrap = lease
+            .app_server_bootstrap()
+            .context("administrator_mode:app_server: bootstrap is unavailable")?;
+        *self
+            .administrator_app_server
+            .lock()
+            .expect("administrator app-server state lock poisoned") = Some(bootstrap);
+        Ok(Some(lease))
+    }
+
+    fn stop_administrator_mode(
+        &self,
+        lease: AdminModeLease,
+    ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        *self
+            .administrator_app_server
+            .lock()
+            .expect("administrator app-server state lock poisoned") = None;
+        tokio::spawn(async move { lease.shutdown().await.map(|_| ()) })
+    }
+
     async fn launch_codex(
         &self,
         app_dir: &Path,
@@ -925,12 +1082,24 @@ impl LaunchHooks for DefaultLaunchHooks {
         extra_args: &[String],
     ) -> anyhow::Result<CodexLaunch> {
         let native_menu_localization_enabled = settings.codex_app_native_menu_localization;
-        let native_menu_inspector_port =
-            native_menu_localization_enabled.then(|| select_native_menu_inspector_port(debug_port));
+        let administrator_app_server = self
+            .administrator_app_server
+            .lock()
+            .expect("administrator app-server state lock poisoned")
+            .clone();
+        let force_windows_computer_use =
+            should_force_windows_computer_use_runtime(settings, cfg!(windows));
+        if settings.administrator_mode_enabled && administrator_app_server.is_none() {
+            anyhow::bail!("administrator_mode:app_server: bootstrap was not prepared");
+        }
+        let main_inspector_port = (native_menu_localization_enabled
+            || administrator_app_server.is_some()
+            || force_windows_computer_use)
+            .then(|| select_native_menu_inspector_port(debug_port));
         let launch_extra_args = codex_extra_args_for_launch(settings, extra_args);
         if cfg!(windows) {
-            let activation = if let Some(inspector_port) = native_menu_inspector_port {
-                build_packaged_activation_with_native_menu_inspector(
+            let activation = if let Some(inspector_port) = main_inspector_port {
+                build_packaged_activation_with_main_inspector(
                     app_dir,
                     debug_port,
                     inspector_port,
@@ -949,8 +1118,30 @@ impl LaunchHooks for DefaultLaunchHooks {
                     unreachable!();
                 };
                 let process_id = activate_packaged_app(app_user_model_id, arguments).await?;
+                if let (Some(inspector_port), Some(bootstrap)) =
+                    (main_inspector_port, administrator_app_server.as_ref())
+                {
+                    if let Err(error) =
+                        crate::admin_app_server::install_and_resume(inspector_port, bootstrap).await
+                    {
+                        terminate_failed_packaged_activation(process_id).await;
+                        return Err(error.context("administrator_mode:app_server"));
+                    }
+                } else if force_windows_computer_use
+                    && let Some(inspector_port) = main_inspector_port
+                    && let Err(error) =
+                        crate::admin_app_server::install_windows_computer_use_and_resume(
+                            inspector_port,
+                        )
+                        .await
+                {
+                    terminate_failed_packaged_activation(process_id).await;
+                    return Err(error.context("windows_computer_use:runtime_bootstrap"));
+                }
                 apply_codexplusplus_window_icon_after_launch(process_id);
-                if let Some(inspector_port) = native_menu_inspector_port {
+                if native_menu_localization_enabled
+                    && let Some(inspector_port) = main_inspector_port
+                {
                     start_native_menu_localizer(inspector_port);
                 }
                 return Ok(match activation {
@@ -974,7 +1165,7 @@ impl LaunchHooks for DefaultLaunchHooks {
             } else {
                 MacosCleanupPolicy::QuitIfNotPreviouslyRunning
             };
-            let command = if let Some(inspector_port) = native_menu_inspector_port {
+            let command = if let Some(inspector_port) = main_inspector_port {
                 build_macos_open_command_with_native_menu_inspector(
                     app_dir,
                     debug_port,
@@ -994,7 +1185,7 @@ impl LaunchHooks for DefaultLaunchHooks {
                 .spawn()
                 .context("failed to launch macOS Codex app")?;
             *self.child.lock().await = Some(child);
-            if let Some(inspector_port) = native_menu_inspector_port {
+            if native_menu_localization_enabled && let Some(inspector_port) = main_inspector_port {
                 start_native_menu_localizer(inspector_port);
             }
             return Ok(CodexLaunch::Process {
@@ -1004,7 +1195,7 @@ impl LaunchHooks for DefaultLaunchHooks {
             });
         }
 
-        let command = if let Some(inspector_port) = native_menu_inspector_port {
+        let command = if let Some(inspector_port) = main_inspector_port {
             build_codex_command_with_native_menu_inspector(
                 app_dir,
                 debug_port,
@@ -1028,7 +1219,7 @@ impl LaunchHooks for DefaultLaunchHooks {
             .spawn()
             .with_context(|| format!("failed to launch Codex executable {executable}"))?;
         *self.child.lock().await = Some(child);
-        if let Some(inspector_port) = native_menu_inspector_port {
+        if native_menu_localization_enabled && let Some(inspector_port) = main_inspector_port {
             start_native_menu_localizer(inspector_port);
         }
         Ok(CodexLaunch::Process {
@@ -1311,12 +1502,13 @@ async fn handle_helper_connection(
             &body,
         )
         .await?;
-        log_helper_response(
+        let _ = crate::diagnostic_log::append_diagnostic_log(
             "helper.responses_websocket_upgrade_required",
-            method,
-            path,
-            "426 Upgrade Required",
-            remote_addr_text,
+            serde_json::json!({
+                "method": method,
+                "path": path,
+                "remote_addr": remote_addr_text
+            }),
         );
         stream.shutdown().await?;
         return Ok(());
@@ -1339,12 +1531,14 @@ async fn handle_helper_connection(
                     &body,
                 )
                 .await?;
-                log_helper_response(
+                let _ = crate::diagnostic_log::append_diagnostic_log(
                     "helper.protocol_proxy_decode_failed",
-                    method,
-                    path,
-                    "400 Bad Request",
-                    remote_addr_text,
+                    serde_json::json!({
+                        "method": method,
+                        "path": path,
+                        "remote_addr": remote_addr_text,
+                        "message": error.to_string()
+                    }),
                 );
                 stream.shutdown().await?;
                 return Ok(());
@@ -1436,17 +1630,6 @@ async fn handle_helper_connection(
             )
         } else {
             overlay_image_response()
-        }
-    } else if path == "/dream-skin/image" && matches!(method, "GET" | "OPTIONS") {
-        if method == "OPTIONS" {
-            (
-                "200 OK".to_string(),
-                Vec::new(),
-                "application/octet-stream".to_string(),
-                "helper.dream_skin_image_options",
-            )
-        } else {
-            dream_skin_image_response()
         }
     } else {
         (
@@ -1540,47 +1723,6 @@ fn overlay_image_response() -> (String, Vec<u8>, String, &'static str) {
             bytes,
             content_type.to_string(),
             "helper.overlay_image_ok",
-        ),
-        Err(_) => not_found(),
-    }
-}
-
-fn dream_skin_image_response() -> (String, Vec<u8>, String, &'static str) {
-    let not_found = || {
-        (
-            "404 Not Found".to_string(),
-            serde_json::to_vec(&serde_json::json!({
-                "status": "failed",
-                "message": "皮肤图片未启用或图片不可用"
-            }))
-            .unwrap_or_default(),
-            "application/json; charset=utf-8".to_string(),
-            "helper.dream_skin_image_not_found",
-        )
-    };
-    let settings = SettingsStore::default().load().unwrap_or_default();
-    if !settings.codex_app_dream_skin_enabled {
-        return not_found();
-    }
-    let image_path = PathBuf::from(settings.codex_app_dream_skin_image_path.trim());
-    if image_path.as_os_str().is_empty() || !image_path.is_file() {
-        let (content_type, image) = crate::assets::dream_skin_default_image();
-        return (
-            "200 OK".to_string(),
-            image.to_vec(),
-            content_type.to_string(),
-            "helper.dream_skin_default_image_ok",
-        );
-    }
-    let Some(content_type) = overlay_image_content_type(&image_path) else {
-        return not_found();
-    };
-    match std::fs::read(&image_path) {
-        Ok(bytes) => (
-            "200 OK".to_string(),
-            bytes,
-            content_type.to_string(),
-            "helper.dream_skin_image_ok",
         ),
         Err(_) => not_found(),
     }
@@ -2474,11 +2616,25 @@ pub fn build_codex_arguments_for_settings(
 
 fn codex_extra_args_for_launch(settings: &BackendSettings, extra_args: &[String]) -> Vec<String> {
     let mut args = Vec::new();
+    if settings.codex_app_force_chinese_locale && !has_language_switch(extra_args) {
+        args.push("--lang=zh-CN".to_string());
+    }
     if settings.codex_app_fast_startup && !has_host_resolver_rules(extra_args) {
         args.push(statsig_fast_fail_host_resolver_rule());
     }
     args.extend(normalize_codex_extra_args(extra_args));
     args
+}
+
+fn should_force_windows_computer_use_runtime(settings: &BackendSettings, is_windows: bool) -> bool {
+    is_windows && settings.active_relay_profile().relay_mode == crate::settings::RelayMode::PureApi
+}
+
+fn has_language_switch(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        let arg = arg.trim();
+        arg == "--lang" || arg.starts_with("--lang=")
+    })
 }
 
 fn has_host_resolver_rules(args: &[String]) -> bool {
@@ -2503,8 +2659,21 @@ pub fn build_codex_arguments_with_native_menu_inspector(
     inspector_port: u16,
     extra_args: &[String],
 ) -> Vec<String> {
+    build_codex_arguments_with_main_inspector(debug_port, inspector_port, extra_args)
+}
+
+pub fn build_codex_arguments_with_main_inspector(
+    debug_port: u16,
+    inspector_port: u16,
+    extra_args: &[String],
+) -> Vec<String> {
     let mut args = build_codex_arguments(debug_port, &[]);
     if inspector_port != 0 {
+        // Electron 150 can remain in a latent inspector-break state after
+        // Runtime.runIfWaitingForDebugger. Opening the bottom panel then blocks
+        // the browser process and Windows reports an application hang. Attach
+        // without pausing and install the bootstrap during the normal startup
+        // window instead.
         args.push(format!("--inspect=127.0.0.1:{inspector_port}"));
     }
     args.extend(normalize_codex_extra_args(extra_args));
@@ -2558,9 +2727,18 @@ pub fn build_packaged_activation_with_native_menu_inspector(
     inspector_port: u16,
     extra_args: &[String],
 ) -> Option<CodexLaunch> {
+    build_packaged_activation_with_main_inspector(app_dir, debug_port, inspector_port, extra_args)
+}
+
+pub fn build_packaged_activation_with_main_inspector(
+    app_dir: &Path,
+    debug_port: u16,
+    inspector_port: u16,
+    extra_args: &[String],
+) -> Option<CodexLaunch> {
     Some(CodexLaunch::PackagedActivation {
         app_user_model_id: crate::app_paths::packaged_app_user_model_id(app_dir)?,
-        arguments: command_line_arguments(&build_codex_arguments_with_native_menu_inspector(
+        arguments: command_line_arguments(&build_codex_arguments_with_main_inspector(
             debug_port,
             inspector_port,
             extra_args,
@@ -3163,6 +3341,10 @@ async fn terminate_windows_process_id(process_id: u32) -> anyhow::Result<()> {
         .context("Windows process termination task failed")?
 }
 
+async fn terminate_failed_packaged_activation(pid: u32) {
+    let _ = terminate_windows_process_id(pid).await;
+}
+
 #[cfg(windows)]
 fn wait_for_windows_process_id_blocking(process_id: u32) -> anyhow::Result<()> {
     use windows::Win32::Foundation::{CloseHandle, WAIT_FAILED};
@@ -3330,7 +3512,8 @@ pub async fn activate_packaged_app(
 #[cfg(windows)]
 fn activate_packaged_app_blocking(app_user_model_id: &str, arguments: &str) -> anyhow::Result<u32> {
     use windows::Win32::System::Com::{
-        CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+        CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+        CoUninitialize,
     };
     use windows::Win32::UI::Shell::{ApplicationActivationManager, IApplicationActivationManager};
     use windows::core::HSTRING;
@@ -3349,7 +3532,7 @@ fn activate_packaged_app_blocking(app_user_model_id: &str, arguments: &str) -> a
 
         let result: windows::core::Result<u32> = (|| {
             let manager: IApplicationActivationManager =
-                CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_ALL)?;
+                CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER)?;
             let process_id = manager.ActivateApplication(
                 &HSTRING::from(app_user_model_id),
                 &HSTRING::from(arguments),
@@ -3378,18 +3561,6 @@ mod tests {
                 Ok(())
             })
         })
-    }
-
-    #[test]
-    fn launcher_stays_alive_while_injected_cdp_endpoint_is_available() {
-        assert!(launcher_target_alive(false, true));
-    }
-
-    #[test]
-    fn launcher_only_probes_cdp_for_unrecognized_windows_processes() {
-        assert!(should_probe_launcher_cdp(true, false));
-        assert!(!should_probe_launcher_cdp(true, true));
-        assert!(!should_probe_launcher_cdp(false, false));
     }
 
     #[tokio::test]
@@ -3530,124 +3701,6 @@ mod tests {
         assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 400 Bad Request"));
     }
 
-    #[tokio::test]
-    async fn helper_returns_426_for_responses_websocket_upgrade() {
-        let response = send_raw_helper_request(
-            b"GET /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
-        )
-        .await;
-
-        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 426 Upgrade Required"));
-    }
-
-    #[test]
-    fn protocol_proxy_request_body_decodes_zstd() {
-        let body = br#"{"model":"gpt-5.6-sol","input":"probe","stream":false}"#;
-        let compressed = zstd::stream::encode_all(std::io::Cursor::new(body), 3).unwrap();
-
-        let decoded = decode_protocol_proxy_request_body(&compressed, Some("zstd")).unwrap();
-
-        assert_eq!(decoded.as_bytes(), body);
-        assert!(decode_protocol_proxy_request_body(body, Some("gzip")).is_err());
-    }
-
-    #[tokio::test]
-    async fn helper_replaces_chatgpt_auth_when_proxying_zstd_responses_request() {
-        let _settings_guard = crate::paths::settings_path_test_guard();
-        let temp = tempfile::tempdir().unwrap();
-        let settings_path = temp.path().join("settings.json");
-        let previous_settings_path =
-            crate::paths::set_settings_path_for_tests(Some(settings_path.clone()));
-        let upstream_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
-        let upstream_addr = upstream_listener.local_addr().unwrap();
-        let settings = serde_json::json!({
-            "relayProfilesEnabled": true,
-            "relayProfiles": [{
-                "id": "remote-control",
-                "name": "Remote Control Relay",
-                "baseUrl": format!("http://{upstream_addr}/v1"),
-                "upstreamBaseUrl": format!("http://{upstream_addr}/v1"),
-                "apiKey": "sk-upstream",
-                "protocol": "responses",
-                "relayMode": "official",
-                "officialMixApiKey": true
-            }],
-            "activeRelayId": "remote-control"
-        });
-        std::fs::write(settings_path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
-
-        let upstream = tokio::spawn(async move {
-            let (mut stream, _) = upstream_listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 4096];
-            let mut expected_len = None;
-            loop {
-                let read = stream.read(&mut buffer).await.unwrap();
-                assert!(read > 0, "upstream request ended before body completed");
-                request.extend_from_slice(&buffer[..read]);
-                if expected_len.is_none() {
-                    if let Some(header_end) = find_header_end(&request) {
-                        let headers = String::from_utf8_lossy(&request[..header_end]);
-                        let content_length = header_value_from_headers(&headers, "content-length")
-                            .unwrap()
-                            .parse::<usize>()
-                            .unwrap();
-                        expected_len = Some(header_end + 4 + content_length);
-                    }
-                }
-                if expected_len.is_some_and(|length| request.len() >= length) {
-                    break;
-                }
-            }
-            let response_body = br#"{"id":"resp_remote","object":"response"}"#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                response_body.len()
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-            stream.write_all(response_body).await.unwrap();
-            request
-        });
-
-        let body = br#"{"model":"gpt-5.6-sol","input":"probe","stream":false}"#;
-        let compressed = zstd::stream::encode_all(std::io::Cursor::new(body), 3).unwrap();
-        let helper_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
-        let helper_addr = helper_listener.local_addr().unwrap();
-        let helper = tokio::spawn(async move {
-            let (stream, remote_addr) = helper_listener.accept().await.unwrap();
-            handle_helper_connection(stream, Some(remote_addr))
-                .await
-                .unwrap();
-        });
-        let mut client = tokio::net::TcpStream::connect(helper_addr).await.unwrap();
-        let headers = format!(
-            "POST /v1/responses HTTP/1.1\r\nHost: {helper_addr}\r\nAuthorization: Bearer chatgpt-secret\r\nContent-Type: application/json\r\nContent-Encoding: zstd\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            compressed.len()
-        );
-        client.write_all(headers.as_bytes()).await.unwrap();
-        client.write_all(&compressed).await.unwrap();
-        let mut response = Vec::new();
-        client.read_to_end(&mut response).await.unwrap();
-        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
-
-        helper.await.unwrap();
-        let upstream_request = upstream.await.unwrap();
-        let header_end = find_header_end(&upstream_request).unwrap();
-        let upstream_headers =
-            String::from_utf8_lossy(&upstream_request[..header_end]).to_ascii_lowercase();
-        assert!(upstream_headers.starts_with("post /v1/responses http/1.1"));
-        assert!(upstream_headers.contains("authorization: bearer sk-upstream"));
-        assert!(!upstream_headers.contains("chatgpt-secret"));
-        let upstream_body: serde_json::Value =
-            serde_json::from_slice(&upstream_request[header_end + 4..]).unwrap();
-        assert_eq!(upstream_body["model"], "gpt-5.6-sol");
-        crate::paths::set_settings_path_for_tests(previous_settings_path);
-    }
-
     async fn send_raw_helper_request(request: &[u8]) -> Vec<u8> {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -3779,6 +3832,38 @@ mod tests {
 
         assert!(!should_stop_post_launch_computer_use_guard(2, &artifacts));
         assert!(should_stop_post_launch_computer_use_guard(3, &artifacts));
+    }
+
+    #[test]
+    fn pure_api_forces_windows_computer_use_runtime_without_guard() {
+        let settings = BackendSettings {
+            computer_use_guard_enabled: false,
+            relay_profiles: vec![crate::settings::RelayProfile {
+                id: "pure".to_string(),
+                relay_mode: crate::settings::RelayMode::PureApi,
+                ..crate::settings::RelayProfile::default()
+            }],
+            active_relay_id: "pure".to_string(),
+            ..BackendSettings::default()
+        };
+
+        assert!(should_force_windows_computer_use_runtime(&settings, true));
+        assert!(!should_force_windows_computer_use_runtime(&settings, false));
+    }
+
+    #[test]
+    fn mixed_api_keeps_official_computer_use_feature_selection() {
+        let settings = BackendSettings {
+            relay_profiles: vec![crate::settings::RelayProfile {
+                id: "mixed".to_string(),
+                relay_mode: crate::settings::RelayMode::MixedApi,
+                ..crate::settings::RelayProfile::default()
+            }],
+            active_relay_id: "mixed".to_string(),
+            ..BackendSettings::default()
+        };
+
+        assert!(!should_force_windows_computer_use_runtime(&settings, true));
     }
 
     #[test]

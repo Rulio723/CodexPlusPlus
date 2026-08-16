@@ -853,7 +853,7 @@ body {
 
 .relay-profile-card {
   display: grid;
-  grid-template-columns: 32px 32px minmax(0, 1fr) auto;
+  grid-template-columns: 32px 32px minmax(0, 1fr) 84px auto;
   gap: 10px;
   align-items: center;
   width: 100%;
@@ -983,6 +983,42 @@ body {
   color: hsl(var(--foreground));
   font-size: 12px;
   padding: 2px 7px;
+}
+
+.relay-latency {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  width: 84px;
+  height: 32px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 6px;
+  background: hsl(var(--background) / 0.65);
+  color: hsl(var(--muted-foreground));
+  font: inherit;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.relay-latency.ok {
+  border-color: hsl(var(--status-success) / 0.38);
+  color: hsl(var(--status-success));
+}
+
+.relay-latency.failed {
+  border-color: hsl(var(--status-error) / 0.4);
+  color: hsl(var(--status-error));
+}
+
+.relay-latency:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.relay-latency.loading svg {
+  animation: spin 1s linear infinite;
 }
 
 .relay-card-actions {

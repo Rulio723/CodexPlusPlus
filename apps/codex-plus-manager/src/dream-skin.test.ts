@@ -139,7 +139,7 @@ describe("dream skin theme helpers", () => {
     assert.match(compatibility, /shellMain\.classList\.add\("main-surface"\)/);
     assert.match(compatibility, /data-codex-plus-dream-skin-main-surface/);
     assert.match(compatibility, /clearDreamSkinMainSurfaceCompatibility\(\)/);
-    assert.match(assets, /DREAM_SKIN_RENDERER_REVISION: &str = "19-newchat-fix"/);
+    assert.match(assets, /DREAM_SKIN_RENDERER_REVISION: &str = "22-home-contrast-diagnostics"/);
   });
 
   it("extends the Windows wallpaper treatment to right and bottom dock panels", async () => {
@@ -179,6 +179,28 @@ describe("dream skin theme helpers", () => {
     assert.match(css, /data-dream-home-layout.*structured/);
     assert.match(css, /overflow-y: auto !important/);
     assert.match(css, /\.composer-surface-chrome/);
+  });
+
+  it("supports the current Codex main surface without a role=main attribute", async () => {
+    const rendererPaths = [
+      "../../../assets/inject/upstream/dream-skin/windows/renderer-inject.js",
+      "../../../assets/inject/upstream/snow-skin/renderer-inject.js",
+      "../../../assets/inject/upstream/cidala-tiger/windows/renderer-inject.js",
+      "../../../assets/inject/upstream/glass-vision/renderer-inject.js",
+    ];
+    const css = await readFile(
+      new URL("../../../assets/inject/upstream/dream-skin/windows/dream-skin.css", import.meta.url),
+      "utf8",
+    );
+
+    for (const path of rendererPaths) {
+      const renderer = await readFile(new URL(path, import.meta.url), "utf8");
+      assert.match(renderer, /main\.main-surface/);
+      assert.match(renderer, /querySelectorAll\("main, \[role=\\"main\\"\]"\)/);
+    }
+    const snowRenderer = await readFile(new URL(rendererPaths[1], import.meta.url), "utf8");
+    assert.match(snowRenderer, /const HOME_UTILITY_CLASS = "dream-home-utility"/);
+    assert.match(css, /main\.main-surface[^\n]*\.dream-(?:home|task)/);
   });
 
   it("exposes companion image controls in the theme editor", async () => {

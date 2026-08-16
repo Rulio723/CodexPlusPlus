@@ -9,9 +9,10 @@ use codex_plus_core::relay_config::{
     clear_relay_config_to_home_with_auth, delete_context_entry_from_common_config,
     extract_common_config_from_config, filter_common_config_for_selection,
     list_context_entries_from_common_config, normalize_relay_profile_for_storage,
-    relay_config_status_from_home, relay_profile_api_key, sanitize_common_config_contents,
-    set_codex_goals_feature_in_home, strip_common_config_from_config,
-    sync_live_config_context_entries, upsert_context_entry_in_common_config,
+    relay_config_status_from_home, relay_profile_api_key, rewrite_managed_local_proxy_urls_to_port,
+    sanitize_common_config_contents, set_codex_goals_feature_in_home,
+    strip_common_config_from_config, sync_live_config_context_entries,
+    upsert_context_entry_in_common_config,
 };
 use codex_plus_core::settings::{
     RelayContextSelection, RelayMode, RelayModelRoute, RelayProfile, RelayProtocol,
@@ -41,6 +42,32 @@ fn write_remote_plugin_marketplace_snapshot(home: &std::path::Path) {
         r#"{"name":"product-design"}"#,
     )
     .unwrap();
+}
+
+#[test]
+fn rewrite_managed_local_proxy_urls_updates_only_local_proxy_urls() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        r#"openai_base_url = "http://127.0.0.1:57321/v1"
+base_url = "https://user-openai.example/v1"
+
+[model_providers.custom]
+base_url = "http://127.0.0.1:57321/v1"
+
+[model_providers.other]
+base_url = "https://other.example/v1"
+"#,
+    )
+    .unwrap();
+
+    assert!(rewrite_managed_local_proxy_urls_to_port(temp.path(), 58401, false).unwrap());
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(config.contains(r#"openai_base_url = "http://127.0.0.1:58401/v1""#));
+    assert!(config.contains(r#"base_url = "https://user-openai.example/v1""#));
+    assert!(config.contains(r#"base_url = "http://127.0.0.1:58401/v1""#));
+    assert!(config.contains(r#"base_url = "https://other.example/v1""#));
+    assert!(!rewrite_managed_local_proxy_urls_to_port(temp.path(), 58401, false).unwrap());
 }
 
 #[test]

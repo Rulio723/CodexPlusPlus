@@ -45,20 +45,22 @@ impl LauncherHooks {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    if let Err(error) = launcher_main().await {
+async fn main() {
+    if let Err(error) = run_launcher().await {
         let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-            "launcher.failed",
-            json!({
-                "message": error.to_string()
+            "launcher.run_failed",
+            serde_json::json!({
+                "message": "startup failed",
+                "component": launcher_failure_component(&error),
+                "error_chain": codex_plus_core::diagnostic_log::sanitized_error_chain(&error)
             }),
         );
-        return Err(error);
+        eprintln!("Codex++ launcher startup failed: {error:#}");
+        std::process::exit(1);
     }
-    Ok(())
 }
 
-async fn launcher_main() -> Result<()> {
+async fn run_launcher() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let helper_only = args.iter().any(|arg| arg == "--helper-only");
     let recover_only = args.iter().any(|arg| arg == "--recover-admin-mode");
@@ -112,7 +114,7 @@ async fn prepare_administrator_mode_startup(_options: &LaunchOptions) -> anyhow:
         }
         let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
             "launcher.stale_admin_recovery_failed_nonfatal",
-            json!({
+            serde_json::json!({
                 "message": "stale administrator state could not be fully recovered",
                 "component": "administrator_mode"
             }),
@@ -122,15 +124,19 @@ async fn prepare_administrator_mode_startup(_options: &LaunchOptions) -> anyhow:
         return Ok(());
     }
     let current_exe = std::env::current_exe().context("administrator_mode:shim")?;
-    let install_dir = current_exe
+    let shim_path = current_exe
         .parent()
-        .context("administrator_mode:shim: launcher has no parent directory")?;
-    let shim_path = install_dir.join("codex-plus-admin-shim.exe");
+        .context("administrator_mode:shim: launcher has no parent directory")?
+        .join("codex-plus-admin-shim.exe");
     anyhow::ensure!(
         shim_path.is_file(),
         "administrator_mode:shim: administrator shim is missing"
     );
-    let terminal_shim_path = install_dir.join("admin-terminal").join("pwsh.exe");
+    let terminal_shim_path = current_exe
+        .parent()
+        .context("administrator_mode:terminal: launcher has no parent directory")?
+        .join("admin-terminal")
+        .join("pwsh.exe");
     anyhow::ensure!(
         terminal_shim_path.is_file(),
         "administrator_mode:terminal: PowerShell compatibility shim is missing"
@@ -290,13 +296,6 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
     launch_result.map(|_| ())
 }
 
-fn should_finalize_pending_remote_control_recovery(
-    has_pending_recovery: bool,
-    blocking_process_ids: &[u32],
-) -> bool {
-    has_pending_recovery && blocking_process_ids.is_empty()
-}
-
 async fn activate_existing_administrator_session(
     options: &LaunchOptions,
     app_dir: &Path,
@@ -331,6 +330,13 @@ async fn activate_existing_administrator_session(
     Ok(())
 }
 
+fn should_finalize_pending_remote_control_recovery(
+    has_pending_recovery: bool,
+    blocking_process_ids: &[u32],
+) -> bool {
+    has_pending_recovery && blocking_process_ids.is_empty()
+}
+
 fn log_launcher_already_running(debug_port: u16) {
     let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
         "launcher.already_running",
@@ -358,6 +364,46 @@ fn open_manager_with_update_prompt() -> anyhow::Result<()> {
     )
     .map(|_| ())
     .map_err(|error| anyhow::anyhow!("启动管理工具失败：{error}"))
+}
+
+fn launcher_failure_component(error: &anyhow::Error) -> &'static str {
+    const ADMIN_COMPONENTS: &[&str] = &[
+        "recovery",
+        "identity",
+        "shim",
+        "terminal",
+        "job",
+        "exec",
+        "computer_use_config",
+        "computer_use",
+        "app_server",
+        "environment",
+        "runtime",
+        "activation",
+    ];
+    for message in error.chain().map(ToString::to_string) {
+        if let Some(component) = ADMIN_COMPONENTS
+            .iter()
+            .find(|component| message.contains(&format!("administrator_mode:{component}")))
+        {
+            return match *component {
+                "recovery" => "administrator_mode:recovery",
+                "identity" => "administrator_mode:identity",
+                "shim" => "administrator_mode:shim",
+                "terminal" => "administrator_mode:terminal",
+                "job" => "administrator_mode:job",
+                "exec" => "administrator_mode:exec",
+                "computer_use_config" => "administrator_mode:computer_use_config",
+                "computer_use" => "administrator_mode:computer_use",
+                "app_server" => "administrator_mode:app_server",
+                "environment" => "administrator_mode:environment",
+                "runtime" => "administrator_mode:runtime",
+                "activation" => "administrator_mode:activation",
+                _ => unreachable!(),
+            };
+        }
+    }
+    "launcher"
 }
 
 fn parse_launch_options<I, S>(args: I) -> LaunchOptions

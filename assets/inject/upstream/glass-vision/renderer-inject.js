@@ -52,8 +52,11 @@
     if (style.dataset.glassVisionVersion !== VERSION || style.textContent !== cssText) writeStyle(style);
 
     const shellMain = document.querySelector("main.main-surface") || document.querySelector("main");
-    const home = document.querySelector('[role="main"]:has([data-testid="home-icon"])');
-    for (const candidate of document.querySelectorAll('[role="main"].glass-vision-home')) {
+    const mainCandidates = [...document.querySelectorAll("main, [role=\"main\"]")]
+      .filter((candidate) => candidate.matches("main.main-surface, [role=\"main\"]"));
+    const home = mainCandidates.find((candidate) =>
+      candidate.querySelector('[data-testid="home-icon"]')) || null;
+    for (const candidate of mainCandidates.filter((node) => node.classList.contains("glass-vision-home"))) {
       if (candidate !== home) candidate.classList.remove("glass-vision-home");
     }
     home?.classList.add("glass-vision-home");

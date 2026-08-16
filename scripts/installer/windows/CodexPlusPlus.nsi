@@ -469,16 +469,10 @@ install_powershell7_done:
   File "${ROOT}\dist\windows\app\codex-plus-admin-shim.exe"
   SetOutPath "$INSTDIR\admin-terminal"
   File /oname=pwsh.exe "${ROOT}\dist\windows\app\admin-terminal\pwsh.exe"
-  StrCmp $PowerShell7Installed 1 install_runtime_skip install_runtime_required
-
-install_runtime_required:
-  DetailPrint "正在安装内置 PowerShell 7 runtime。"
+  DetailPrint "正在安装内置 PowerShell 7 runtime，管理员模式始终使用随包版本。"
   SetOutPath "$INSTDIR\runtime\powershell7"
   File /r "${ROOT}\dist\windows\app\runtime\powershell7\*"
   Goto install_runtime_done
-
-install_runtime_skip:
-  DetailPrint "已跳过内置 PowerShell 7 runtime。"
 
 install_runtime_done:
   SetOutPath "$INSTDIR"

@@ -11,6 +11,7 @@ const GLOBAL_STATE_BACKUP_FILE: &str = ".codex-global-state.json.bak";
 const BACKUP_ROOT: &str = "backups_state/app-state-sync";
 const SNAPSHOT_FILE: &str = "latest-safe-state.json";
 const SNAPSHOT_VERSION: u64 = 1;
+const BOTTOM_PANEL_LAUNCHER_VISIBLE_KEY: &str = "app-shell-bottom-panel-launcher-visible";
 
 const WORKSPACE_PATH_ARRAY_KEYS: &[&str] = &["electron-saved-workspace-roots", "project-order"];
 
@@ -35,6 +36,7 @@ const SAFE_TOP_LEVEL_KEYS: &[&str] = &[
 const SAFE_ATOM_KEYS: &[&str] = &[
     "default-service-tier",
     "avatar-overlay-mascot-width-px",
+    BOTTOM_PANEL_LAUNCHER_VISIBLE_KEY,
     "composer-auto-context-enabled",
     "diff-filter",
     "enter-behavior",
@@ -157,6 +159,61 @@ pub fn sync_app_state_after_provider_switch_nonfatal(home: &Path, source: &str) 
         Err(error) => {
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "codex_app_state.sync_failed",
+                json!({
+                    "source": source,
+                    "error": error.to_string(),
+                }),
+            );
+        }
+    }
+}
+
+pub fn ensure_bottom_panel_launcher_visible(home: &Path) -> anyhow::Result<bool> {
+    let state_path = state_path(home);
+    let existed = state_path.exists();
+    let mut state = load_global_state(home)?.unwrap_or_default();
+    let original = Value::Object(state.clone());
+    let atom = state
+        .entry("electron-persisted-atom-state".to_string())
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("electron-persisted-atom-state must be a JSON object"))?;
+
+    if atom.get(BOTTOM_PANEL_LAUNCHER_VISIBLE_KEY) == Some(&Value::Bool(true)) {
+        return Ok(false);
+    }
+    atom.insert(
+        BOTTOM_PANEL_LAUNCHER_VISIBLE_KEY.to_string(),
+        Value::Bool(true),
+    );
+
+    if let Some(parent) = state_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if existed {
+        create_backup(home, &original)?;
+    }
+    let text = serde_json::to_string_pretty(&Value::Object(state))?;
+    crate::settings::atomic_write(&state_path, text.as_bytes())?;
+    if let Some(parent) = state_path.parent() {
+        let _ =
+            crate::settings::atomic_write(&parent.join(GLOBAL_STATE_BACKUP_FILE), text.as_bytes());
+    }
+    Ok(true)
+}
+
+pub fn ensure_bottom_panel_launcher_visible_nonfatal(home: &Path, source: &str) {
+    match ensure_bottom_panel_launcher_visible(home) {
+        Ok(true) => {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "codex_app_state.bottom_panel_launcher_enabled",
+                json!({ "source": source }),
+            );
+        }
+        Ok(false) => {}
+        Err(error) => {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "codex_app_state.bottom_panel_launcher_enable_failed",
                 json!({
                     "source": source,
                     "error": error.to_string(),
