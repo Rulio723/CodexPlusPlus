@@ -123,8 +123,7 @@ pub fn parse_renderer_verification(raw: Value) -> anyhow::Result<DreamSkinVerifi
         .unwrap_or(0);
     let legacy_suggestions = bool_at(&raw, "/legacySuggestionsPresent") || visible_card_count > 0;
     let legacy_home_pass = legacy_suggestions && (1..=6).contains(&visible_card_count);
-    let modern_home_pass =
-        !legacy_suggestions && bool_at(&raw, "/projectButton/visible") && composer;
+    let modern_home_pass = !legacy_suggestions && composer;
     let home_pass = !home_route
         || (bool_at(&raw, "/homePresent")
             && bool_at(&raw, "/hero/visible")
@@ -180,8 +179,8 @@ pub fn parse_renderer_verification(raw: Value) -> anyhow::Result<DreamSkinVerifi
             "home",
             "首页内容",
             home_pass,
-            "首页横幅和项目入口正常。",
-            "首页横幅、建议卡或项目入口不符合目标项目要求。",
+            "首页横幅和输入框正常。",
+            "首页横幅、建议卡或输入框不符合目标项目要求。",
         ),
         bool_check(
             "overflow",

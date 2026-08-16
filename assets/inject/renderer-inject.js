@@ -4681,7 +4681,7 @@
   function runPluginAutoExpand(force = false) {
     if (!codexPlusSettings().pluginAutoExpand) return;
     const currentSignature = pluginAutoExpandSignature();
-    if (!force && currentSignature && currentSignature === window.__codexPluginAutoExpandLastSignature) return;
+    if (!force && currentSignature === window.__codexPluginAutoExpandLastSignature) return;
     window.__codexPluginAutoExpandLastSignature = currentSignature;
     window.__codexPluginAutoExpandRunning = true;
     window.__codexPluginAutoExpandClicks = 0;

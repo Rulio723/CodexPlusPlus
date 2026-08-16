@@ -288,7 +288,7 @@ fn verification_accepts_modern_official_mixed_home_without_legacy_cards() {
         "hero": { "visible": true, "width": 760, "height": 92 },
         "legacySuggestionsPresent": false,
         "visibleCardCount": 0,
-        "projectButton": { "visible": true },
+        "projectButton": null,
         "composer": { "visible": true },
         "sidebar": { "visible": true },
         "documentOverflow": { "x": false, "y": false }

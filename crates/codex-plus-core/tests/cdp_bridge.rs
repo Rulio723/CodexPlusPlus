@@ -861,6 +861,18 @@ fn injection_script_disables_plugin_auto_expand_in_relay_mode() {
 }
 
 #[test]
+fn injection_script_deduplicates_empty_plugin_auto_expand_scans() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains(
+        "if (!force && currentSignature === window.__codexPluginAutoExpandLastSignature) return;"
+    ));
+    assert!(!script.contains(
+        "if (!force && currentSignature && currentSignature === window.__codexPluginAutoExpandLastSignature) return;"
+    ));
+}
+
+#[test]
 fn injection_script_defines_version_gated_plugin_unlock_strategy() {
     let script = assets::injection_script(57321);
 
