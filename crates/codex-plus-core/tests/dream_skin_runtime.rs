@@ -258,6 +258,49 @@ fn windows_identity_requires_a_path_inside_the_registered_package_root() {
 
 #[tokio::test]
 #[ignore = "requires a running Codex Desktop CDP renderer"]
+async fn live_official_mixed_home_passes_skin_verification() {
+    let debug_port = std::env::var("CODEX_PLUS_TEST_DEBUG_PORT")
+        .expect("CODEX_PLUS_TEST_DEBUG_PORT is required")
+        .parse()
+        .expect("CODEX_PLUS_TEST_DEBUG_PORT must be a port");
+
+    let result = codex_plus_core::dream_skin_runtime::verify_dream_skin(debug_port, None)
+        .await
+        .expect("live verification should succeed");
+    assert!(
+        result.pass,
+        "official mixed home should pass: checks={:?}, raw={}",
+        result.checks, result.raw
+    );
+}
+
+#[test]
+fn verification_accepts_modern_official_mixed_home_without_legacy_cards() {
+    let result = parse_renderer_verification(serde_json::json!({
+        "installed": true,
+        "engine": "snow",
+        "version": "2.1.0-snow.1",
+        "stylePresent": true,
+        "chromePresent": true,
+        "chromePointerEvents": "none",
+        "homeRoute": true,
+        "homePresent": true,
+        "hero": { "visible": true, "width": 760, "height": 92 },
+        "legacySuggestionsPresent": false,
+        "visibleCardCount": 0,
+        "projectButton": { "visible": true },
+        "composer": { "visible": true },
+        "sidebar": { "visible": true },
+        "documentOverflow": { "x": false, "y": false }
+    }))
+    .unwrap();
+
+    assert_eq!(result.state, DreamSkinState::Pass);
+    assert!(result.pass);
+}
+
+#[tokio::test]
+#[ignore = "requires a running Codex Desktop CDP renderer"]
 async fn live_apply_keeps_the_running_renderer_available() {
     let debug_port = std::env::var("CODEX_PLUS_TEST_DEBUG_PORT")
         .expect("CODEX_PLUS_TEST_DEBUG_PORT is required")

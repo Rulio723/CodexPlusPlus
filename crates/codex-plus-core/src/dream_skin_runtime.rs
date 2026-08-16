@@ -117,13 +117,18 @@ pub fn parse_renderer_verification(raw: Value) -> anyhow::Result<DreamSkinVerifi
     let no_horizontal_overflow = !bool_at(&raw, "/documentOverflow/x");
     let no_vertical_overflow = !bool_at(&raw, "/documentOverflow/y");
     let home_route = bool_at(&raw, "/homeRoute");
+    let visible_card_count = raw
+        .get("visibleCardCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let legacy_suggestions = bool_at(&raw, "/legacySuggestionsPresent") || visible_card_count > 0;
+    let legacy_home_pass = legacy_suggestions && (1..=6).contains(&visible_card_count);
+    let modern_home_pass =
+        !legacy_suggestions && bool_at(&raw, "/projectButton/visible") && composer;
     let home_pass = !home_route
         || (bool_at(&raw, "/homePresent")
             && bool_at(&raw, "/hero/visible")
-            && raw
-                .get("visibleCardCount")
-                .and_then(Value::as_u64)
-                .is_some_and(|count| (1..=6).contains(&count)));
+            && (legacy_home_pass || modern_home_pass));
     let version_pass = version
         .as_deref()
         .is_some_and(|value| managed_renderer_version(engine, value));
@@ -175,8 +180,8 @@ pub fn parse_renderer_verification(raw: Value) -> anyhow::Result<DreamSkinVerifi
             "home",
             "首页内容",
             home_pass,
-            "首页横幅和建议卡正常。",
-            "首页横幅或建议卡不符合目标项目要求。",
+            "首页横幅和项目入口正常。",
+            "首页横幅、建议卡或项目入口不符合目标项目要求。",
         ),
         bool_check(
             "overflow",
@@ -449,6 +454,7 @@ pub fn renderer_verification_script() -> &'static str {
     homeRoute: Boolean(homeRoute),
     homePresent: Boolean(home),
     hero: box(home?.querySelector('[data-feature="game-source"]') || suggestions),
+    legacySuggestionsPresent: Boolean(suggestions),
     visibleCardCount: cards.filter((item) => item?.visible).length,
     projectButton: box(home?.querySelector('.group\\/project-selector > button')),
     composer: box(document.querySelector('.composer-surface-chrome') ||

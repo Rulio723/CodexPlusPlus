@@ -139,7 +139,7 @@ describe("dream skin theme helpers", () => {
     assert.match(compatibility, /shellMain\.classList\.add\("main-surface"\)/);
     assert.match(compatibility, /data-codex-plus-dream-skin-main-surface/);
     assert.match(compatibility, /clearDreamSkinMainSurfaceCompatibility\(\)/);
-    assert.match(assets, /DREAM_SKIN_RENDERER_REVISION: &str = "22-home-contrast-diagnostics"/);
+    assert.match(assets, /DREAM_SKIN_RENDERER_REVISION: &str = "23-modern-official-mixed-home"/);
   });
 
   it("extends the Windows wallpaper treatment to right and bottom dock panels", async () => {
