@@ -970,7 +970,7 @@
         background: #dc2626;
         color: #ffffff;
       }
-      /* Dark theme overrides for delete-confirm and project-move dialogs.
+      /* Dark theme overrides for delete-confirm dialogs.
          Triggered either by Codex applying a "dark" class / data-theme="dark"
          on its document root, or by the OS-level prefers-color-scheme hint.
          Palette matches the existing Codex++ dark modal (.codex-plus-modal-content). */
@@ -1006,45 +1006,6 @@
         background: #dc2626;
         color: #ffffff;
       }
-      html.dark .${projectMoveOverlayClass},
-      html[data-theme="dark"] .${projectMoveOverlayClass},
-      :root[data-theme="dark"] .${projectMoveOverlayClass} {
-        background: rgba(0,0,0,.55);
-      }
-      html.dark .codex-project-move-panel,
-      html[data-theme="dark"] .codex-project-move-panel,
-      :root[data-theme="dark"] .codex-project-move-panel {
-        border-color: rgba(255,255,255,.12);
-        background: #2b2b2b;
-        color: #f3f4f6;
-        box-shadow: 0 18px 60px rgba(0,0,0,.55);
-      }
-      html.dark .codex-project-move-header,
-      html[data-theme="dark"] .codex-project-move-header,
-      :root[data-theme="dark"] .codex-project-move-header {
-        border-bottom-color: rgba(255,255,255,.1);
-      }
-      html.dark .codex-project-move-item,
-      html[data-theme="dark"] .codex-project-move-item,
-      :root[data-theme="dark"] .codex-project-move-item {
-        color: #f3f4f6;
-      }
-      html.dark .codex-project-move-item:hover,
-      html.dark .codex-project-move-item:focus-visible,
-      html[data-theme="dark"] .codex-project-move-item:hover,
-      html[data-theme="dark"] .codex-project-move-item:focus-visible,
-      :root[data-theme="dark"] .codex-project-move-item:hover,
-      :root[data-theme="dark"] .codex-project-move-item:focus-visible {
-        background: rgba(255,255,255,.08);
-      }
-      html.dark .codex-project-move-item-path,
-      html[data-theme="dark"] .codex-project-move-item-path,
-      :root[data-theme="dark"] .codex-project-move-item-path,
-      html.dark .codex-project-move-empty,
-      html[data-theme="dark"] .codex-project-move-empty,
-      :root[data-theme="dark"] .codex-project-move-empty {
-        color: #9ca3af;
-      }
       @media (prefers-color-scheme: dark) {
         html:not(.light):not([data-theme="light"]) .codex-delete-confirm-overlay {
           background: rgba(0,0,0,.55);
@@ -1067,29 +1028,6 @@
           border-color: #ef4444;
           background: #dc2626;
           color: #ffffff;
-        }
-        html:not(.light):not([data-theme="light"]) .${projectMoveOverlayClass} {
-          background: rgba(0,0,0,.55);
-        }
-        html:not(.light):not([data-theme="light"]) .codex-project-move-panel {
-          border-color: rgba(255,255,255,.12);
-          background: #2b2b2b;
-          color: #f3f4f6;
-          box-shadow: 0 18px 60px rgba(0,0,0,.55);
-        }
-        html:not(.light):not([data-theme="light"]) .codex-project-move-header {
-          border-bottom-color: rgba(255,255,255,.1);
-        }
-        html:not(.light):not([data-theme="light"]) .codex-project-move-item {
-          color: #f3f4f6;
-        }
-        html:not(.light):not([data-theme="light"]) .codex-project-move-item:hover,
-        html:not(.light):not([data-theme="light"]) .codex-project-move-item:focus-visible {
-          background: rgba(255,255,255,.08);
-        }
-        html:not(.light):not([data-theme="light"]) .codex-project-move-item-path,
-        html:not(.light):not([data-theme="light"]) .codex-project-move-empty {
-          color: #9ca3af;
         }
       }
       #${codexPlusMenuId}.${codexPlusMenuFloatingClass} {
@@ -3791,7 +3729,7 @@
               </div>
             </div>
             <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">Codex增强</div><div class="codex-plus-row-description">关闭后停用删除、导出、移动、插件相关和菜单位置增强。</div></div>
+              <div><div class="codex-plus-row-title">Codex增强</div><div class="codex-plus-row-description">关闭后停用删除、导出、插件相关和菜单位置增强。</div></div>
               <button type="button" class="codex-plus-toggle" data-codex-backend-setting="enhancementsEnabled"><span></span></button>
             </div>
             <div class="codex-plus-row">
@@ -3845,10 +3783,6 @@
               <button type="button" class="codex-plus-toggle" data-codex-plus-setting="pasteFix"><span></span></button>
             </div>
             <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">会话项目移动</div><div class="codex-plus-row-description">在会话列表悬停显示移动按钮，可移动到普通对话或其他本地项目。</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="projectMove"><span></span></button>
-            </div>
-            <div class="codex-plus-row">
               <div><div class="codex-plus-row-title">会话 ID 标识</div><div class="codex-plus-row-description">在侧边栏会话标题前显示短 ID 和 UUIDv7 创建时间，方便定位历史会话。</div></div>
               <button type="button" class="codex-plus-toggle" data-codex-plus-setting="threadIdBadge"><span></span></button>
             </div>
@@ -3879,7 +3813,7 @@
               <button type="button" class="codex-plus-toggle" data-codex-backend-setting="providerSyncEnabled"><span></span></button>
             </div>
             <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">页面增强模式</div><div class="codex-plus-row-description">${codexPlusBackendSettings.launchMode === "relay" ? "兼容增强：保留会话删除、导出、项目移动和用户脚本，仅关闭插件市场相关增强。" : "完整增强：加载插件市场、项目路径移动等全部页面能力。"}</div></div>
+              <div><div class="codex-plus-row-title">页面增强模式</div><div class="codex-plus-row-description">${codexPlusBackendSettings.launchMode === "relay" ? "兼容增强：保留会话删除、导出和用户脚本，仅关闭插件市场相关增强。" : "完整增强：加载插件市场、会话管理等全部页面能力。"}</div></div>
               <button type="button" class="codex-plus-action-button" data-codex-open-manager="true">打开管理工具</button>
             </div>
             <div class="codex-plus-row">
@@ -5248,7 +5182,7 @@
   }
 
   function threadIdBadgeMeta(sessionId) {
-    const id = projectMoveSessionKey(sessionId);
+    const id = sessionKey(sessionId);
     const compact = id.replaceAll("-", "");
     const shortId = compact.slice(0, 8);
     const createdAt = threadIdBadgeCreatedAt(sessionId);
@@ -5394,7 +5328,7 @@
   }
 
   function validThreadScrollSessionKey(sessionId) {
-    const key = projectMoveSessionKey(sessionId);
+    const key = sessionKey(sessionId);
     if (!key || key === "__proto__" || key === "prototype" || key === "constructor") return "";
     return /^[A-Za-z0-9_.-]{8,128}$/.test(key) ? key : "";
   }
@@ -6827,54 +6761,17 @@
     return uniqueValues([id, bareId, `local:${bareId}`]);
   }
 
-  function projectMoveSessionKey(sessionId) {
+  function sessionKey(sessionId) {
     const variants = threadIdVariants(sessionId);
     const bareId = variants.find((id) => !id.startsWith("local:"));
     return bareId || variants[0] || "";
   }
 
   function uuidV7TimestampMs(sessionId) {
-    const id = projectMoveSessionKey(sessionId).replaceAll("-", "");
+    const id = sessionKey(sessionId).replaceAll("-", "");
     if (!/^[0-9a-fA-F]{12}/.test(id)) return 0;
     const timestamp = Number.parseInt(id.slice(0, 12), 16);
     return Number.isFinite(timestamp) ? timestamp : 0;
-  }
-
-  function numericTimestamp(value) {
-    const timestamp = Number(value);
-    return Number.isFinite(timestamp) && timestamp > 0 ? timestamp : 0;
-  }
-
-  function timestampValueToMs(value) {
-    const timestamp = numericTimestamp(value);
-    if (!timestamp) return 0;
-    return timestamp < 1000000000000 ? timestamp * 1000 : timestamp;
-  }
-
-  function sortMsForSession(sessionId, preferredValue) {
-    return numericTimestamp(preferredValue) || uuidV7TimestampMs(sessionId);
-  }
-
-  function timestampMsFromPayload(payload) {
-    return numericTimestamp(payload?.updated_at_ms) || timestampValueToMs(payload?.updated_at) || numericTimestamp(payload?.created_at_ms);
-  }
-
-  function relativeTimeLabel(timestampMs, nowMs = Date.now()) {
-    const timestamp = numericTimestamp(timestampMs);
-    if (!timestamp) return "";
-    const elapsedSeconds = Math.max(0, Math.floor((nowMs - timestamp) / 1000));
-    if (elapsedSeconds < 60) return "刚刚";
-    const elapsedMinutes = Math.floor(elapsedSeconds / 60);
-    if (elapsedMinutes < 60) return `${elapsedMinutes} 分`;
-    const elapsedHours = Math.floor(elapsedMinutes / 60);
-    if (elapsedHours < 24) return `${elapsedHours} 小时`;
-    const elapsedDays = Math.floor(elapsedHours / 24);
-    if (elapsedDays < 7) return `${elapsedDays} 天`;
-    const elapsedWeeks = Math.floor(elapsedDays / 7);
-    if (elapsedWeeks < 5) return `${elapsedWeeks} 周`;
-    const elapsedMonths = Math.floor(elapsedDays / 30);
-    if (elapsedMonths < 12) return `${Math.max(1, elapsedMonths)} 月`;
-    return `${Math.floor(elapsedDays / 365)} 年`;
   }
 
   function normalizeWorkspacePath(path) {
@@ -7457,8 +7354,8 @@
       await sendRequest("refresh-recent-conversations-for-host", { hostId: "local", sortKey: "updated_at" });
       return true;
     } catch (error) {
-      window.__codexProjectMoveRefreshFailures = window.__codexProjectMoveRefreshFailures || [];
-      window.__codexProjectMoveRefreshFailures.push(String(error?.stack || error));
+      window.__codexRecentConversationRefreshFailures = window.__codexRecentConversationRefreshFailures || [];
+      window.__codexRecentConversationRefreshFailures.push(String(error?.stack || error));
       return false;
     }
   }
@@ -10450,10 +10347,6 @@
   installUpstreamBranchDropdownAdapter();
   installUpstreamWorktreeNativeAdapter();
   scan();
-  window.__codexProjectMoveApplyProjection = applyProjectMoveProjection;
-  window.__codexProjectMoveReadProjection = readProjectMoveProjection;
-  window.__codexProjectMoveTargets = projectMoveTargets;
-  window.__codexProjectMoveSortChats = applyChatsSortCorrection;
   window.removeEventListener("resize", window.__codexPlusResizeHandler);
   let codexPlusResizeRafId = 0;
   window.__codexPlusResizeHandler = () => {

@@ -6,6 +6,7 @@ use codex_plus_core::launcher::{
 };
 use codex_plus_core::models::{DeleteResult, ExportResult, SessionRef};
 use codex_plus_core::routes::{BridgeContext, BridgeDataService, BridgeRuntimeService};
+use codex_plus_core::status::{AdministratorModeStatus, LaunchStatus};
 use codex_plus_core::user_scripts::UserScriptManager;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -45,8 +46,12 @@ impl LauncherHooks {
 }
 
 #[tokio::main]
-async fn main() {
-    if let Err(error) = run_launcher().await {
+async fn main() -> Result<()> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let helper_only = args.iter().any(|arg| arg == "--helper-only");
+    let recover_only = args.iter().any(|arg| arg == "--recover-admin-mode");
+    let options = parse_launch_options(args.iter());
+    if let Err(error) = launcher_main(args, helper_only, recover_only, options.clone()).await {
         let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
             "launcher.run_failed",
             serde_json::json!({
@@ -56,15 +61,33 @@ async fn main() {
             }),
         );
         eprintln!("Codex++ launcher startup failed: {error:#}");
-        std::process::exit(1);
+        if !helper_only {
+            let _ = options.status_store.save_latest(&LaunchStatus {
+                status: "failed".to_string(),
+                message: error.to_string(),
+                started_at_ms: current_timestamp_ms(),
+                debug_port: Some(options.debug_port),
+                helper_port: Some(options.helper_port),
+                codex_app: options
+                    .app_dir
+                    .map(|path| path.to_string_lossy().to_string()),
+                administrator_mode: administrator_mode_status_for_failure(
+                    &options.status_store,
+                    &error,
+                ),
+            });
+        }
+        return Err(error);
     }
+    Ok(())
 }
 
-async fn run_launcher() -> Result<()> {
-    let args = std::env::args().skip(1).collect::<Vec<_>>();
-    let helper_only = args.iter().any(|arg| arg == "--helper-only");
-    let recover_only = args.iter().any(|arg| arg == "--recover-admin-mode");
-    let options = parse_launch_options(args.iter());
+async fn launcher_main(
+    _args: Vec<String>,
+    helper_only: bool,
+    recover_only: bool,
+    options: LaunchOptions,
+) -> Result<()> {
     if recover_only {
         codex_plus_core::admin_mode::recover_stale_admin_mode_for_shutdown(
             &codex_plus_core::codex_home::default_codex_home_dir(),
@@ -82,6 +105,19 @@ async fn run_launcher() -> Result<()> {
     prepare_administrator_mode_startup(&options).await?;
     let Some(_guard) = acquire_single_instance_guard(options.debug_port)? else {
         activate_existing_codex_app(&options).await?;
+        options.status_store.save_latest(&LaunchStatus {
+            status: "running".to_string(),
+            message: "Existing Codex instance activated".to_string(),
+            started_at_ms: current_timestamp_ms(),
+            debug_port: Some(options.debug_port),
+            helper_port: Some(options.helper_port),
+            codex_app: options
+                .app_dir
+                .map(|path| path.to_string_lossy().to_string()),
+            administrator_mode: administrator_mode_status_for_existing_session(
+                &options.status_store,
+            ),
+        })?;
         return Ok(());
     };
     tokio::spawn(async {
@@ -142,6 +178,64 @@ async fn prepare_administrator_mode_startup(_options: &LaunchOptions) -> anyhow:
         "administrator_mode:terminal: PowerShell compatibility shim is missing"
     );
     Ok(())
+}
+
+fn current_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn administrator_mode_requested(status_store: &codex_plus_core::status::StatusStore) -> bool {
+    codex_plus_core::settings::SettingsStore::default()
+        .load()
+        .map(|settings| settings.administrator_mode_enabled)
+        .or_else(|_| {
+            status_store.load_latest().map(|status| {
+                status
+                    .map(|status| status.administrator_mode.requested)
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn administrator_mode_status_for_failure(
+    status_store: &codex_plus_core::status::StatusStore,
+    error: &anyhow::Error,
+) -> AdministratorModeStatus {
+    if !administrator_mode_requested(status_store) {
+        return AdministratorModeStatus::default();
+    }
+
+    let error_component = launcher_failure_component(error)
+        .strip_prefix("administrator_mode:")
+        .map(str::to_owned)
+        .or_else(|| Some("runtime".to_string()));
+    AdministratorModeStatus {
+        requested: true,
+        state: "failed".to_string(),
+        exec_elevated: false,
+        computer_use_elevated: false,
+        error_component,
+    }
+}
+
+fn administrator_mode_status_for_existing_session(
+    status_store: &codex_plus_core::status::StatusStore,
+) -> AdministratorModeStatus {
+    if !administrator_mode_requested(status_store) {
+        return AdministratorModeStatus::default();
+    }
+
+    AdministratorModeStatus {
+        requested: true,
+        state: "active".to_string(),
+        exec_elevated: true,
+        computer_use_elevated: true,
+        error_component: None,
+    }
 }
 
 fn acquire_single_instance_guard(
@@ -1200,6 +1294,8 @@ mod tests {
         assert!(source.contains("acquire_single_instance_guard(options.debug_port)?"));
         assert!(source.contains("launcher_guard_port"));
         assert!(source.contains("launcher.already_running"));
+        assert!(source.contains("Existing Codex instance activated"));
+        assert!(source.contains("status: \"failed\".to_string()"));
     }
 
     #[test]

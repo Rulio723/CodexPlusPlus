@@ -1254,7 +1254,7 @@ fn injection_script_loads_backend_settings_before_initial_scan() {
         .find("scan();")
         .expect("script should perform an initial scan");
     let footer_marker = footer
-        .find("window.__codexProjectMoveApplyProjection")
+        .find("window.removeEventListener(\"resize\"")
         .expect("script should continue bootstrapping after the initial scan");
 
     assert!(initial_scan < footer_marker);
@@ -1334,8 +1334,8 @@ fn injection_script_refreshes_sidebar_after_session_undo() {
         .split_once("async function refreshRecentConversationsForHost()")
         .expect("recent conversation refresh helper should exist")
         .1
-        .split_once("function refreshAfterProjectMove")
-        .expect("refresh helper should end before project move refresh")
+        .split_once("function showToast")
+        .expect("refresh helper should end before toast helper")
         .0;
     let toast = script
         .split_once("function showToast(message, undoToken, deletedRef = null)")
@@ -1501,6 +1501,9 @@ fn injection_script_moves_export_and_project_move_into_more_menu() {
     assert!(script.contains("configureActionButton(moreButton, \"更多操作\", \"…\")"));
     assert!(script.contains("createSessionMoreMenuItem(\"导出\""));
     assert!(script.contains("createSessionMoreMenuItem(\"移动\""));
+    assert!(script.contains("postJson(\"/move-thread-workspace\""));
+    assert!(script.contains("postJson(\"/thread-sort-key\""));
+    assert!(script.contains("postJson(\"/thread-sort-keys\""));
     assert!(script.contains("group.appendChild(moreButton)"));
     assert!(script.contains("installMoreButtonEvents(row, moreButton, openMoreMenu)"));
     assert!(script.contains("installSessionMoreMenuAutoClose(row, moreMenu)"));
@@ -1712,21 +1715,6 @@ fn injection_script_refreshes_sidebar_after_undo_without_stale_asset_exports() {
     assert!(script.contains("if (!refreshed) window.location.reload()"));
     assert!(!script.contains("app-server-manager-signals-C1h8B-R-.js"));
     assert!(!script.contains("typeof signals.rn"));
-}
-
-#[test]
-fn injection_script_clears_project_state_when_moving_to_projectless() {
-    let script = assets::injection_script(57321);
-
-    assert!(script.contains("async function clearThreadWorkspaceHints"));
-    assert!(script.contains("async function clearThreadWritableRoots"));
-    assert!(script.contains("async function clearThreadProjectlessOutputDirectories"));
-    assert!(script.contains("thread-workspace-root-hints"));
-    assert!(script.contains("thread-writable-roots"));
-    assert!(script.contains("thread-projectless-output-directories"));
-    assert!(script.contains("await clearThreadWorkspaceHints(ref)"));
-    assert!(script.contains("await clearThreadWritableRoots(ref)"));
-    assert!(script.contains("await clearThreadProjectlessOutputDirectories(ref)"));
 }
 
 #[test]
