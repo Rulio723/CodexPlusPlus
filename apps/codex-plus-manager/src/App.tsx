@@ -95,7 +95,7 @@ import {
   type ImageHandling,
   type ModelWindowRow,
 } from "./model-windows";
-import { relayAuthForLiveDraft } from "./relay-live-files";
+import { relayAuthForLiveDraft, shouldBackfillRelayProfileBeforeSwitch } from "./relay-live-files";
 import { resolveProviderSyncCompletion } from "./provider-sync-flow";
 import { resolveLaunchStatus } from "./launch-status";
 import {
@@ -609,6 +609,7 @@ type RemoveEnvConflictsResult = CommandResult<{
 
 type ProviderSyncPayload = {
   syncStatus?: string;
+  syncMessage?: string;
   targetProvider?: string;
   changedSessionFiles?: number;
   skippedLockedRolloutFiles?: string[];
@@ -617,9 +618,11 @@ type ProviderSyncPayload = {
   sqliteUserEventRowsUpdated?: number;
   sqliteCwdRowsUpdated?: number;
   sqliteCatalogRowsInserted?: number;
+  sqliteCatalogRowsRemoved?: number;
   updatedWorkspaceRoots?: number;
   prunedSessionIndexEntries?: number;
   encryptedContentWarning?: string | null;
+  backupDir?: string | null;
 };
 
 type SessionIndexCleanupCandidate = {
@@ -747,17 +750,22 @@ function providerSyncProgressMessage(result: CommandResult<ProviderSyncPayload>)
   const changed = result.changedSessionFiles ?? 0;
   const rows = result.sqliteRowsUpdated ?? 0;
   const insertedCatalogRows = result.sqliteCatalogRowsInserted ?? 0;
+  const removedCatalogRows = result.sqliteCatalogRowsRemoved ?? 0;
   const pruned = result.prunedSessionIndexEntries ?? 0;
   const target = result.targetProvider || t("当前 provider");
   const skipped = result.skippedLockedRolloutFiles?.length ?? 0;
   const prunedText = pruned ? tf("，清理 {0} 条失效任务索引", [pruned]) : "";
   const skippedText = skipped ? tf("，跳过 {0} 个占用文件", [skipped]) : "";
   const catalogText = insertedCatalogRows ? tf("，补齐 {0} 条侧边栏索引", [insertedCatalogRows]) : "";
-  return tf("已同步到 {0}：修复 {1} 个会话文件，更新 {2} 行数据库索引{3}{4}{5}。", [
+  const catalogCleanupText = removedCatalogRows
+    ? tf("，清理 {0} 条误列的子任务侧边栏索引", [removedCatalogRows])
+    : "";
+  return tf("已同步到 {0}：修复 {1} 个会话文件，更新 {2} 行数据库索引{3}{4}{5}{6}。", [
     target,
     changed,
     rows,
     catalogText,
+    catalogCleanupText,
     prunedText,
     skippedText,
   ]);
@@ -1113,6 +1121,15 @@ export function App() {
     }
   };
 
+  const refreshUserScriptInventory = async () => {
+    const result = await run(() => call<SettingsResult>("refresh_user_script_inventory"));
+    if (result) {
+      setSettings(result);
+      setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
+    }
+    return result;
+  };
+
   const installMarketScript = async (id: string) => {
     const result = await run(() => call<ScriptMarketResult>("install_market_script", { id }));
     if (result) {
@@ -1128,6 +1145,7 @@ export function App() {
       setSettings(result);
       setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
       showResultNotice(t("本地脚本"), result);
+      await refreshUserScriptInventory();
     }
   };
 
@@ -1140,6 +1158,7 @@ export function App() {
       setSettings(result);
       setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
       showResultNotice(t("本地脚本"), result);
+      await refreshUserScriptInventory();
     }
   };
 
@@ -1835,6 +1854,7 @@ export function App() {
     if (next === "userScripts") {
       await refreshSettings(true);
       await refreshScriptMarket(true);
+      await refreshUserScriptInventory();
     }
     if (next === "recommendations") await refreshAds(true);
     if (next === "about") {
@@ -2270,9 +2290,17 @@ export function App() {
         call<CommandResult<ProviderSyncPayload>>("sync_providers_now", { targetProvider }),
       );
       if (result) {
-        let finalResult = result;
+        const syncSucceeded = isSuccessStatus(result.status) && result.syncStatus === "synced";
+        let finalResult =
+          isSuccessStatus(result.status) && !syncSucceeded
+            ? {
+                ...result,
+                status: "failed",
+                message: result.syncMessage || t("历史会话修复失败，请查看错误提示后重试。"),
+              }
+            : result;
         let cleanupFailure: { status: Status; message: string } | null = null;
-        if (isSuccessStatus(result.status)) {
+        if (syncSucceeded) {
           const preview = await run(() =>
             call<CommandResult<SessionIndexCleanupPreviewPayload>>("preview_session_index_cleanup"),
           );
@@ -2317,7 +2345,7 @@ export function App() {
               : completion.result.message),
           result: completion.result,
         });
-        if (targetProvider) {
+        if (targetProvider && syncSucceeded) {
           const next = {
             ...settingsForm,
             providerSyncLastSelectedProvider: targetProvider,
@@ -2602,8 +2630,8 @@ export function App() {
     next: BackendSettings,
     previousActiveRelayId: string,
   ): Promise<BackendSettings> => {
+    if (!shouldBackfillRelayProfileBeforeSwitch(previousActiveRelayId, next.activeRelayId)) return next;
     const profileId = previousActiveRelayId.trim();
-    if (!profileId) return next;
     const result = await run(() =>
       call<SettingsBackfillResult>("backfill_relay_profile_from_live", {
         request: { settings: next, profileId },
@@ -2963,6 +2991,7 @@ export function App() {
       syncLiveContextEntries,
       refreshAds,
       refreshScriptMarket,
+      refreshUserScriptInventory,
       installMarketScript,
       setUserScriptEnabled,
       deleteUserScript,
@@ -3351,6 +3380,7 @@ type Actions = {
   syncLiveContextEntries: (settings: BackendSettings, silent?: boolean) => Promise<LiveContextEntriesResult | null>;
   refreshAds: () => Promise<void>;
   refreshScriptMarket: () => Promise<void>;
+  refreshUserScriptInventory: () => Promise<SettingsResult | null>;
   installMarketScript: (id: string) => Promise<void>;
   setUserScriptEnabled: (key: string, enabled: boolean) => Promise<void>;
   deleteUserScript: (key: string) => Promise<void>;
@@ -4335,7 +4365,7 @@ function EnhanceScreen({
               <FeatureToggle title={t("切换对话保留位置")} detail={t("切换 thread 时恢复上一次浏览位置。")} checked={form.codexAppThreadScrollRestore} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppThreadScrollRestore", value)} />
             </FeatureGroup>
             <FeatureGroup title="Stepwise" detail={t("基于当前对话生成下一步建议，使用独立 API 配置。")}>
-              <FeatureToggle title="Stepwise" detail={t("在 Codex 页面显示可拖动的后续建议浮层；建议由单独配置的 Stepwise API 生成。")} checked={form.codexAppStepwiseEnabled} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppStepwiseEnabled", value)} />
+              <FeatureToggle title="Stepwise" detail={t("在 Codex 页面显示可拖动的后续建议浮层；建议由单独配置的 Stepwise API 生成。启停后需重启 Codex++ 生效。")} checked={form.codexAppStepwiseEnabled} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppStepwiseEnabled", value)} />
               <FeatureToggle title={t("Stepwise 直接发送")} detail={t("点击建议后自动发送；关闭时只填入输入框。")} checked={form.codexAppStepwiseDirectSend} disabled={!masterEnabled || !form.codexAppStepwiseEnabled} onChange={(value) => setEnhanceFlag("codexAppStepwiseDirectSend", value)} />
             </FeatureGroup>
             <FeatureGroup title={t("界面与启动")} detail={t("控制语言、启动速度和 Codex 原生界面调整。")}>
@@ -6682,12 +6712,7 @@ function RelayProfileDetail({
     const savedProfile = savedSettings.relayProfiles.find((candidate) => candidate.id === normalizedDraft.id)
       ?? normalizedDraft;
     if (isActive && savedSettings.relayProfilesEnabled && relayProfileUsesLiveFiles(savedProfile)) {
-      await actions.saveRelayFile(
-        "config",
-        effectiveRelayConfigPreview(savedProfile, savedSettings, savedProfile),
-        true,
-      );
-      await actions.saveRelayFile("auth", savedProfile.authContents, true);
+      await actions.switchRelayProfile(savedSettings, savedSettings.activeRelayId);
     }
     onSaved?.();
   };
@@ -6837,8 +6862,8 @@ function RelayProfileEditor({
   setModelWindowRows: (value: ModelWindowRow[]) => void;
 }) {
   const [showAdvanced, setShowAdvanced] = useState(false);
-  // 纯 Responses 模式（非聚合）下 VLM/Strip 不生效，禁用下拉
-  const vlmUnsupportedProtocol = profile.protocol === "responses" && !isAggregateRelayProfile(profile);
+  // VLM/Strip 对 Chat Completions 与 Responses 协议均可用(注入块类型已按协议适配)。
+  const vlmUnsupportedProtocol = false;
   if (isAggregateRelayProfile(profile)) {
     return (
       <AggregateRelayProfileEditor
@@ -7123,6 +7148,17 @@ function RelayProfileEditor({
                   <Download className="h-4 w-4" />
                   {t("从上游获取")}
                 </Button>
+                <Button
+                  disabled={!modelWindowRows.some((row) => row.model.trim())}
+                  onClick={() => setModelWindowRows([{ model: "", window: "", imageHandling: "send-as-is" }])}
+                  size="sm"
+                  title={t("清空模型")}
+                  type="button"
+                  variant="outline"
+                >
+                  <Trash2 className="h-4 w-4" />
+                  {t("清空模型")}
+                </Button>
               </div>
             </div>
             <div className="relay-model-row-editor">
@@ -7150,9 +7186,9 @@ function RelayProfileEditor({
                     onChange={(value) => updateModelWindowRow(index, { imageHandling: value })}
                     options={[
                       { value: "", label: t("纯文本模型请配置此项"), disabled: true },
-                      { value: "send-as-is", label: "send-as-is", title: t("原样发送图片") },
-                      { value: "strip", label: "strip images", title: t("为纯文本模型移除消息中的图片") },
-                      { value: "vlm", label: "VLM analysis", title: t("为纯文本模型配置图片分析路由") },
+                      { value: "send-as-is", label: t("原样发送图片"), title: t("多模态模型直接接收图片,不经过任何处理") },
+                      { value: "strip", label: t("移除图片"), title: t("删掉图片只发文字,避免纯文本模型报错(模型看不到图)") },
+                      { value: "vlm", label: t("视觉辅助分析"), title: t("图片先由视觉辅助模型(Qwen)转成文字描述,纯文本模型也能\"看图\"") },
                     ]}
                     title={vlmUnsupportedProtocol ? t("VLM 仅支持 Chat Completions 协议和聚合模式") : t("多模态模型（支持图片输入的模型）请保持 send-as-is。")}
                   />
