@@ -1113,6 +1113,35 @@ pub fn weixin_connect_stop() -> CommandResult<codex_plus_core::connect::WeixinCo
     )
 }
 
+#[tauri::command]
+pub fn find_desktop_codex_cli() -> CommandResult<Value> {
+    let settings = match SettingsStore::default().load() {
+        Ok(settings) => settings,
+        Err(error) => {
+            return failed(
+                &format!("读取 Codex 应用设置失败：{error}"),
+                json!({ "path": null }),
+            );
+        }
+    };
+    let Some(app_dir) = codex_plus_core::app_paths::resolve_codex_app_dir_with_saved(
+        None,
+        Some(settings.codex_app_path.as_str()),
+    ) else {
+        return failed("未找到 Codex Desktop 应用。", json!({ "path": null }));
+    };
+    let Some(path) = codex_plus_core::app_paths::find_bundled_codex_cli(&app_dir) else {
+        return failed(
+            "已找到 Codex Desktop，但包内没有可用的 Codex CLI。",
+            json!({ "path": null }),
+        );
+    };
+    ok(
+        "已填入桌面版内置 Codex CLI。",
+        json!({ "path": path.to_string_lossy() }),
+    )
+}
+
 fn spawn_weixin_connect(
     settings: BackendSettings,
 ) -> anyhow::Result<codex_plus_core::connect::WeixinConnectStatus> {
@@ -2334,6 +2363,7 @@ pub fn delete_local_session(request: DeleteLocalSessionRequest) -> CommandResult
         session_id: session_id.to_string(),
         title: request.title,
     };
+    let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
     let mut candidate_paths = Vec::new();
     if let Some(path) = request.db_path.as_deref() {
         let path = PathBuf::from(path);
@@ -2341,9 +2371,7 @@ pub fn delete_local_session(request: DeleteLocalSessionRequest) -> CommandResult
             candidate_paths.push(path);
         }
     }
-    for path in codex_plus_core::codex_sqlite::codex_session_db_paths_from_home(
-        &codex_plus_core::codex_sqlite::default_codex_home_dir(),
-    ) {
+    for path in codex_plus_core::codex_sqlite::codex_session_db_paths_from_home(&home) {
         if !candidate_paths.iter().any(|candidate| candidate == &path) {
             candidate_paths.push(path);
         }
@@ -2366,6 +2394,7 @@ pub fn delete_local_session(request: DeleteLocalSessionRequest) -> CommandResult
             codex_plus_core::paths::default_app_state_dir().join("backups"),
         ),
         &session,
+        Some(&home),
     );
     log_manager_event(
         "manager.delete_local_session.finish",

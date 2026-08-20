@@ -400,6 +400,10 @@ type WeixinQrResult = CommandResult<{
   hasToken: boolean;
 }>;
 
+type DesktopCodexCliResult = CommandResult<{
+  path: string | null;
+}>;
+
 type RelayResult = CommandResult<{
   authenticated: boolean;
   authSource: string;
@@ -2223,6 +2227,19 @@ export function App() {
     }
   };
 
+  const useDesktopCodexCli = async () => {
+    const result = await run(() => call<DesktopCodexCliResult>("find_desktop_codex_cli"));
+    if (!result) return;
+    const path = result.path?.trim();
+    if (isSuccessStatus(result.status) && path) {
+      setSettingsForm((current) => ({
+        ...current,
+        weixinConnectCodexPath: path,
+      }));
+    }
+    showResultNotice(t("Codex CLI 路径"), result);
+  };
+
   const resetSettings = async () => {
     const result = await run(() => call<SettingsResult>("reset_settings"));
     if (result) {
@@ -3180,6 +3197,7 @@ export function App() {
               onStop={() => void stopWeixinConnect()}
               onChooseWorkDir={() => void chooseWeixinPath("workDir")}
               onChooseCodexPath={() => void chooseWeixinPath("codexPath")}
+              onUseDesktopCodexCli={() => void useDesktopCodexCli()}
               onOpenQr={(url) => void openExternalUrl(url)}
               onCopyQr={(url) => void copyText(url, t("微信登录链接已复制。"))}
             />
@@ -3592,6 +3610,7 @@ function WeixinConnectScreen({
   onStop,
   onChooseWorkDir,
   onChooseCodexPath,
+  onUseDesktopCodexCli,
   onOpenQr,
   onCopyQr,
 }: {
@@ -3606,6 +3625,7 @@ function WeixinConnectScreen({
   onStop: () => void;
   onChooseWorkDir: () => void;
   onChooseCodexPath: () => void;
+  onUseDesktopCodexCli: () => void;
   onOpenQr: (url: string) => void;
   onCopyQr: (url: string) => void;
 }) {
@@ -3844,13 +3864,24 @@ function WeixinConnectScreen({
             <div className="weixin-form-fields">
               <label className="field">
                 <span>{t("Codex CLI 路径")}</span>
-                <div className="weixin-path-row">
+                <div className="weixin-path-row weixin-cli-path-row">
                   <Input
                     className="h-10"
                     onChange={(event) => onFormChange({ ...form, weixinConnectCodexPath: event.target.value })}
                     placeholder={t("留空时从 PATH 查找 codex")}
                     value={form.weixinConnectCodexPath}
                   />
+                  <Button
+                    className="weixin-bundled-cli-button"
+                    onClick={onUseDesktopCodexCli}
+                    size="sm"
+                    title={t("使用桌面版内置 CLI")}
+                    type="button"
+                    variant="secondary"
+                  >
+                    <PackageOpen className="h-4 w-4" />
+                    {t("使用桌面版内置 CLI")}
+                  </Button>
                   <Button onClick={onChooseCodexPath} size="icon" title={t("选择 Codex CLI")} type="button" variant="outline">
                     <ExternalLink className="h-4 w-4" />
                   </Button>
@@ -5789,7 +5820,7 @@ function SessionsScreen({
             <div className="provider-sync-progress session-repair-progress" data-active={providerSyncProgress.active}>
               <div className="provider-sync-progress-head">
                 <strong>{providerSyncProgress.active ? t("正在修复历史会话") : t("历史会话修复进度")}</strong>
-                <span>{providerSyncProgress.percent}%</span>
+                <span>{formatProgressPercent(providerSyncProgress.percent)}%</span>
               </div>
               <div
                 aria-valuemax={100}
@@ -6107,7 +6138,7 @@ function AboutScreen({
             <Metric label={t("状态")} value={update?.status ?? "not_checked"} />
             <Metric label={t("最新版本")} value={update?.latestVersion ?? t("未检查")} />
             <Metric label={t("资源")} value={update?.assetName ?? "-"} />
-            <Metric label={t("进度")} value={`${update?.progress ?? 0}%`} />
+            <Metric label={t("进度")} value={`${formatProgressPercent(update?.progress ?? 0)}%`} />
           </div>
           <Textarea className="log-view" readOnly value={update?.releaseSummary || update?.message || t("尚未检查 GitHub Release；更新会下载并启动安装包。")} />
           <TaskProgressBox completedTitle={t("上次更新结果")} progress={updateInstallProgress} title={t("安装包更新进度")} />
@@ -7997,6 +8028,11 @@ function formatBytes(bytes: number) {
   return `${value >= 10 || index === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[index]}`;
 }
 
+function formatProgressPercent(value: number): string {
+  if (!Number.isFinite(value)) return "0.00";
+  return Math.min(100, Math.max(0, value)).toFixed(2);
+}
+
 function GuideList({ items }: { items: string[] }) {
   return (
     <div className="guide-list">
@@ -8259,7 +8295,7 @@ function TaskProgressBox({ progress, title, completedTitle = t("上次修复结�
     <div className="provider-sync-progress task-progress" data-active={progress.active}>
       <div className="provider-sync-progress-head">
         <strong>{progress.active ? title : completedTitle}</strong>
-        <span>{progress.percent}%</span>
+        <span>{formatProgressPercent(progress.percent)}%</span>
       </div>
       <div
         aria-valuemax={100}
