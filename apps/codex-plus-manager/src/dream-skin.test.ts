@@ -133,7 +133,9 @@ describe("dream skin theme helpers", () => {
       "utf8",
     );
 
-    assert.match(renderer, /const shellMain = document\.querySelector\("main\.main-surface"\)/);
+    assert.match(renderer, /const ensureShellMain = \(\) =>/);
+    assert.match(renderer, /main\[class\*="MainContentSurface"\]/);
+    assert.match(renderer, /data-codex-plus-dream-surface/);
     assert.doesNotMatch(renderer, /!shellMain\s*\|\|\s*!shellSidebar/);
     assert.match(compatibility, /main\[class\*="_MainContentSurface_"\]/);
     assert.match(compatibility, /shellMain\.classList\.add\("main-surface"\)/);

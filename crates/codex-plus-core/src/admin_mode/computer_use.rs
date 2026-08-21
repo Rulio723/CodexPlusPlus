@@ -2025,6 +2025,19 @@ mod platform {
     type IntegrityChecker = dyn Fn(u32) -> anyhow::Result<bool> + Send + Sync;
     type PipeFactory = dyn Fn(&str, &str, bool) -> anyhow::Result<NamedPipeServer> + Send + Sync;
 
+    #[cfg(test)]
+    // The Windows process tests exercise a shared Store runtime, PowerShell, and helper
+    // lifecycle; serialize that boundary without changing production cleanup behavior.
+    fn process_test_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    #[cfg(test)]
+    async fn lock_process_test() -> tokio::sync::MutexGuard<'static, ()> {
+        process_test_lock().lock().await
+    }
+
     struct VerifiedExecutableLease {
         path: std::path::PathBuf,
         _file: std::fs::File,
@@ -3113,6 +3126,7 @@ mod platform {
 
         #[tokio::test]
         async fn elevated_production_helper_runtime_copy_completes_real_readiness() {
+            let _process_test_guard = lock_process_test().await;
             if !process_has_high_integrity(std::process::id()).unwrap_or(false) {
                 eprintln!("SKIP: production Computer Use smoke requires elevation");
                 return;
@@ -3168,6 +3182,7 @@ mod platform {
 
         #[tokio::test]
         async fn elevated_production_computer_use_runtime_restores_the_real_transport() {
+            let _process_test_guard = lock_process_test().await;
             if !process_has_high_integrity(std::process::id()).unwrap_or(false) {
                 eprintln!("SKIP: production Computer Use lifecycle smoke requires elevation");
                 return;
@@ -3383,6 +3398,7 @@ fn main(){let mut b=Vec::new();std::io::stdin().read_to_end(&mut b).unwrap();std
 
         #[tokio::test]
         async fn broker_survives_malformed_client_and_serves_two_sequential_helpers() {
+            let _process_test_guard = lock_process_test().await;
             let temp = tempfile::tempdir().unwrap();
             let helper = compile_reconnect_helper(&temp);
             let helper_hash = format!(
@@ -3558,6 +3574,7 @@ fn main(){let mut b=Vec::new();std::io::stdin().read_to_end(&mut b).unwrap();std
 
         #[tokio::test]
         async fn readiness_probe_fails_when_helper_is_not_high_integrity() {
+            let _process_test_guard = lock_process_test().await;
             let temp = tempfile::tempdir().unwrap();
             let source = temp.path().join("probe_helper.rs");
             let helper = temp.path().join("codex-computer-use.exe");
@@ -3598,6 +3615,7 @@ fn main(){let mut b=Vec::new();std::io::stdin().read_to_end(&mut b).unwrap();std
 
         #[tokio::test]
         async fn readiness_probe_rejects_wrong_helper_sid() {
+            let _process_test_guard = lock_process_test().await;
             let temp = tempfile::tempdir().unwrap();
             let helper = compile_reconnect_helper(&temp);
             let hash = format!(
@@ -3664,6 +3682,7 @@ fn main(){let mut b=Vec::new();std::io::stdin().read_to_end(&mut b).unwrap();std
 
         #[tokio::test]
         async fn official_helper_path_authenticates_while_staged_copy_executes() {
+            let _process_test_guard = lock_process_test().await;
             let temp = tempfile::tempdir().unwrap();
             let source = temp.path().join("fake_helper.rs");
             let helper = temp.path().join("codex-computer-use.exe");
@@ -4046,6 +4065,7 @@ fn main(){let a:Vec<_>=std::env::args().skip(1).collect();if a!=["--expected","v
 
         #[tokio::test]
         async fn job_assignment_failure_terminates_exact_helper_before_returning() {
+            let _process_test_guard = lock_process_test().await;
             let (mut server, _client) = tokio::io::duplex(128);
             let mut child = long_running_child(false);
             let process = exact_process_handle(&child);
@@ -4068,6 +4088,7 @@ fn main(){let a:Vec<_>=std::env::args().skip(1).collect();if a!=["--expected","v
 
         #[tokio::test]
         async fn integrity_error_terminates_exact_helper_before_returning() {
+            let _process_test_guard = lock_process_test().await;
             let (mut server, _client) = tokio::io::duplex(128);
             let mut child = long_running_child(false);
             let process = exact_process_handle(&child);
@@ -4093,6 +4114,7 @@ fn main(){let a:Vec<_>=std::env::args().skip(1).collect();if a!=["--expected","v
 
         #[tokio::test]
         async fn actual_helper_rejects_wrong_logon_session_before_acceptance() {
+            let _process_test_guard = lock_process_test().await;
             let (mut server, _client) = tokio::io::duplex(128);
             let mut child = long_running_child(false);
             let process = exact_process_handle(&child);
@@ -4123,6 +4145,7 @@ fn main(){let a:Vec<_>=std::env::args().skip(1).collect();if a!=["--expected","v
 
         #[tokio::test]
         async fn actual_helper_rejects_missing_logon_identity_before_acceptance() {
+            let _process_test_guard = lock_process_test().await;
             let (mut server, _client) = tokio::io::duplex(128);
             let mut child = long_running_child(false);
             let process = exact_process_handle(&child);
@@ -4151,6 +4174,7 @@ fn main(){let a:Vec<_>=std::env::args().skip(1).collect();if a!=["--expected","v
 
         #[tokio::test]
         async fn accepted_write_failure_terminates_exact_helper_before_returning() {
+            let _process_test_guard = lock_process_test().await;
             let mut stream = FailingWriteStream;
             let mut child = long_running_child(false);
             let process = exact_process_handle(&child);
@@ -4176,6 +4200,7 @@ fn main(){let a:Vec<_>=std::env::args().skip(1).collect();if a!=["--expected","v
 
         #[tokio::test]
         async fn invalid_direction_terminates_helper_without_deadlock() {
+            let _process_test_guard = lock_process_test().await;
             let (server, mut client) = tokio::io::duplex(128);
             let child = long_running_child(false);
             let relay = tokio::spawn(assert_relay_failure_terminates_child(server, child));
@@ -4187,6 +4212,7 @@ fn main(){let a:Vec<_>=std::env::args().skip(1).collect();if a!=["--expected","v
 
         #[tokio::test]
         async fn client_disconnect_terminates_helper_without_deadlock() {
+            let _process_test_guard = lock_process_test().await;
             let (server, client) = tokio::io::duplex(128);
             let child = long_running_child(false);
             drop(client);
@@ -4227,6 +4253,7 @@ fn main(){let a:Vec<_>=std::env::args().skip(1).collect();if a!=["--expected","v
 
         #[tokio::test]
         async fn writer_failure_terminates_helper_without_deadlock() {
+            let _process_test_guard = lock_process_test().await;
             assert_relay_failure_terminates_child(FailingWriteStream, long_running_child(true))
                 .await;
         }

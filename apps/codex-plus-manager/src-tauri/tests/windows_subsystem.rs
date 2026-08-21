@@ -206,7 +206,7 @@ fn administrator_second_invocation_only_activates_existing_session() {
 }
 
 #[test]
-fn windows_binaries_request_administrator_privileges() {
+fn windows_binaries_run_as_invoker_without_administrator_privileges() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let manager_build =
         std::fs::read_to_string(manifest_dir.join("build.rs")).expect("read manager build.rs");
@@ -229,9 +229,162 @@ fn windows_binaries_request_administrator_privileges() {
 
     assert!(manager_build.contains("windows-app-manifest.xml"));
     assert!(launcher_build.contains("windows-app-manifest.xml"));
-    assert!(windows_manifest.contains("requireAdministrator"));
+    // Elevated launcher processes also elevate Codex, so Explorer file drops are blocked by UIPI.
+    assert!(windows_manifest.contains("asInvoker"));
+    assert!(!windows_manifest.contains("requireAdministrator"));
     assert!(windows_manifest.contains("Microsoft.Windows.Common-Controls"));
-    assert!(windows_installer.contains("RequestExecutionLevel admin"));
+    assert!(windows_installer.contains("RequestExecutionLevel user"));
+    assert!(!windows_installer.contains("RequestExecutionLevel admin"));
+}
+
+#[test]
+fn per_user_secure_recovery_contract_matches_as_invoker_installer_and_embedded_payloads() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest_dir
+        .parent()
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::parent)
+        .unwrap();
+    let installer =
+        std::fs::read_to_string(root.join("scripts/installer/windows/CodexPlusPlus.nsi"))
+            .expect("read windows installer");
+    let create =
+        std::fs::read_to_string(root.join("scripts/installer/windows/secure-recovery-create.ps1"))
+            .expect("read recovery create script");
+    let protect =
+        std::fs::read_to_string(root.join("scripts/installer/windows/secure-recovery-file.ps1"))
+            .expect("read recovery file script");
+    let include =
+        std::fs::read_to_string(root.join("scripts/installer/windows/secure-recovery-acl.nsh"))
+            .expect("read generated recovery include");
+    let generator = std::fs::read_to_string(
+        root.join("scripts/installer/windows/generate-secure-recovery-acl.ps1"),
+    )
+    .expect("read recovery include generator");
+
+    assert!(installer.contains("RequestExecutionLevel user"));
+    assert!(!installer.contains("RequestExecutionLevel admin"));
+    assert!(!installer.contains("$WINDIR\\Temp"));
+    assert!(installer.contains("SetOutPath \"$LOCALAPPDATA\""));
+    for script in [&create, &protect] {
+        assert!(script.contains("SpecialFolder]::LocalApplicationData"));
+        assert!(script.contains("WindowsIdentity]::GetCurrent().User"));
+        assert!(script.contains("S-1-5-18"));
+        assert!(script.contains("ReparsePoint"));
+        assert!(script.contains("CodexPlusPlus-Recovery-"));
+        assert!(!script.contains("S-1-5-32-544"));
+        assert!(!script.contains("SpecialFolder]::Windows"));
+    }
+    assert!(create.contains("SetOwner($user)"));
+    assert!(create.contains("SetAccessRuleProtection($true, $false)"));
+    assert!(create.contains("FileSystemAclExtensions, System.IO.FileSystem.AccessControl"));
+    assert!(protect.contains("FileSystemAclExtensions, System.IO.FileSystem.AccessControl"));
+    assert!(create.contains("$aclExtensions::CreateDirectory($security, $path)"));
+    assert!(create.contains("$aclExtensions::GetAccessControl("));
+    assert!(protect.contains("$aclExtensions::GetAccessControl("));
+    assert!(
+        protect.contains("$aclExtensions::SetAccessControl([IO.FileInfo]::new($path), $security)")
+    );
+    assert!(create.contains("[IO.Directory]::CreateDirectory($path, $security)"));
+    assert!(create.contains("[IO.Directory]::GetAccessControl("));
+    assert!(protect.contains("[IO.Directory]::GetAccessControl("));
+    assert!(protect.contains("[IO.File]::SetAccessControl($path, $security)"));
+    assert!(protect.contains("[IO.File]::GetAccessControl("));
+    assert!(!create.contains("Set-Acl"));
+    assert!(!create.contains("Get-Acl"));
+    assert!(!protect.contains("Set-Acl"));
+    assert!(!protect.contains("Get-Acl"));
+    assert!(create.contains("AccessControlSections]::Access"));
+    assert!(create.contains("AccessControlSections]::Owner"));
+    assert!(create.contains("AccessControlSections]::Group"));
+    assert!(protect.contains("AccessControlSections]::Access"));
+    assert!(protect.contains("AccessControlSections]::Owner"));
+    assert!(protect.contains("AccessControlSections]::Group"));
+    assert!(!create.contains("AccessControlSections]::All"));
+    assert!(!protect.contains("AccessControlSections]::All"));
+    assert!(protect.contains("$actualOwner -ne $userSid"));
+    assert!(!protect.contains("secure recovery inherited ACL mismatch"));
+    assert!(generator.contains("Encode-PowerShellPayload"));
+    assert!(generator.contains("Add-PayloadMacros"));
+
+    fn embedded_payload(include: &str, kind: &str) -> String {
+        let count_prefix = format!("!define SECURE_RECOVERY_{kind}_CHUNK_COUNT ");
+        let count = include
+            .lines()
+            .find_map(|line| line.strip_prefix(&count_prefix))
+            .expect("chunk count")
+            .trim_matches('"')
+            .parse::<usize>()
+            .expect("numeric chunk count");
+        assert!((1..=64).contains(&count));
+        (0..count)
+            .map(|index| {
+                let prefix = format!("!define SECURE_RECOVERY_{kind}_COMMAND_{index} ");
+                include
+                    .lines()
+                    .find_map(|line| line.strip_prefix(&prefix))
+                    .expect("payload chunk")
+                    .trim_matches('"')
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    fn decode_powershell(encoded: String) -> String {
+        fn sextet(byte: u8) -> Option<u8> {
+            match byte {
+                b'A'..=b'Z' => Some(byte - b'A'),
+                b'a'..=b'z' => Some(byte - b'a' + 26),
+                b'0'..=b'9' => Some(byte - b'0' + 52),
+                b'+' => Some(62),
+                b'/' => Some(63),
+                _ => None,
+            }
+        }
+        let mut bytes = Vec::new();
+        for quartet in encoded.as_bytes().chunks_exact(4) {
+            let values = [quartet[0], quartet[1], quartet[2], quartet[3]]
+                .map(|byte| if byte == b'=' { None } else { sextet(byte) });
+            let [a, b, c, d] = values;
+            let (a, b) = (
+                a.expect("base64 first sextet"),
+                b.expect("base64 second sextet"),
+            );
+            bytes.push((a << 2) | (b >> 4));
+            if let Some(c) = c {
+                bytes.push((b << 4) | (c >> 2));
+                if let Some(d) = d {
+                    bytes.push((c << 6) | d);
+                }
+            }
+        }
+        let utf16 = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        String::from_utf16(&utf16).expect("UTF-16 payload")
+    }
+
+    assert_eq!(
+        decode_powershell(embedded_payload(&include, "CREATE")),
+        create
+    );
+    assert_eq!(
+        decode_powershell(embedded_payload(&include, "FILE")),
+        protect
+    );
+    let install = installer
+        .split("Section \"Install\"")
+        .nth(1)
+        .and_then(|tail| tail.split("SectionEnd").next())
+        .expect("install section");
+    let create_at = install.find("Call CreateSecureRecoveryDirectory").unwrap();
+    let extract_at = install.find("File /oname=codex-plus-recovery.exe").unwrap();
+    let protect_at = install.find("Call ProtectSecureRecoveryFile").unwrap();
+    let recover_at = install.find("Call RecoverAdminMode").unwrap();
+    let cleanup_at = install.find("Call CleanupSecureRecoveryDirectory").unwrap();
+    assert!(create_at < extract_at && extract_at < protect_at && protect_at < recover_at);
+    assert!(recover_at < cleanup_at);
 }
 
 #[test]
@@ -318,7 +471,10 @@ fn administrator_runtime_is_staged_with_fixed_executable_roles() {
     assert!(!shim_build.contains("codex-plus-launcher"));
     assert!(!shim_build.contains("codex-plus-manager/src-tauri/windows-app-manifest.xml"));
     assert!(launcher_manifest.contains("requireAdministrator"));
-    assert!(manager_manifest.contains("requireAdministrator"));
+    // Keep the manager unelevated so normal Explorer file drops remain available;
+    // only the administrator launcher/shim flow owns elevated work.
+    assert!(manager_manifest.contains("asInvoker"));
+    assert!(!manager_manifest.contains("requireAdministrator"));
     assert!(shim_manifest.contains("asInvoker"));
     assert!(!shim_manifest.contains("requireAdministrator"));
     assert!(launcher.contains("current_exe"));
@@ -559,7 +715,7 @@ fn provider_presets_include_runapi() {
     assert!(presets.contains("id: \"runapi\""));
     assert!(presets.contains("name: \"RunAPI\""));
     assert!(presets.contains("category: \"aggregator\""));
-    assert!(presets.contains("baseUrl: \"https://runapi.co/v1\""));
+    assert!(presets.contains("baseUrl: \"https://runapi.host/v1\""));
 }
 
 #[test]

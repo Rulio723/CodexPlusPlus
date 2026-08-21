@@ -28,7 +28,7 @@ Name "Codex++"
 OutFile "${ROOT}\dist\windows\CodexPlusPlus-${VERSION}-windows-x64-setup.exe"
 InstallDir "$LOCALAPPDATA\Programs\Codex++"
 InstallDirRegKey HKCU "Software\Codex++" "InstallDir"
-RequestExecutionLevel admin
+RequestExecutionLevel user
 SetCompressor /SOLID lzma
 
 !define MUI_ICON "${ROOT}\apps\codex-plus-manager\src-tauri\icons\icon.ico"
@@ -222,7 +222,7 @@ FunctionEnd
 Function CleanupSecureRecoveryDirectory
   System::Call 'Kernel32::SetEnvironmentVariableW(w "CODEXPP_RECOVERY_FILE", p 0)'
   StrCmp $AdminRecoveryDir "" cleanup_recovery_done
-  SetOutPath "$WINDIR\Temp"
+  SetOutPath "$LOCALAPPDATA"
   StrCmp $AdminRecoveryFile "" cleanup_recovery_directory
   Delete "$AdminRecoveryFile"
 
@@ -368,7 +368,7 @@ FunctionEnd
 Function un.CleanupSecureRecoveryDirectory
   System::Call 'Kernel32::SetEnvironmentVariableW(w "CODEXPP_RECOVERY_FILE", p 0)'
   StrCmp $AdminRecoveryDir "" cleanup_recovery_done
-  SetOutPath "$WINDIR\Temp"
+  SetOutPath "$LOCALAPPDATA"
   StrCmp $AdminRecoveryFile "" cleanup_recovery_directory
   Delete "$AdminRecoveryFile"
 

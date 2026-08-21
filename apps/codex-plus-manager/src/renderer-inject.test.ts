@@ -78,7 +78,66 @@ function usageAlertRuntime(renderer: string, cards: FakeElement[], managed: Fake
   return { runtime: create(windowValue, document, FakeElement), selectors, windowValue };
 }
 
+function installRendererStyle(renderer: string) {
+  const start = renderer.indexOf("  function installStyle()");
+  const end = renderer.indexOf("\n  function defaultCodexPlusSettings", start);
+  assert.ok(start >= 0 && end > start);
+  const source = renderer.slice(start, end);
+  const requiredNames = new Set([
+    "styleId",
+    "codexDeleteStyleVersion",
+    ...Array.from(source.matchAll(/\$\{([A-Za-z_$][A-Za-z0-9_$]*)/g), (match) => match[1]),
+  ]);
+  const declarations = Array.from(requiredNames, (name) => {
+    const declaration = renderer.match(new RegExp(`^  const ${name} = .+;$`, "m"))
+      ?? renderer.match(new RegExp(`^  const ${name} = [\\s\\S]*?^  };$`, "m"));
+    assert.ok(declaration, `missing renderer declaration for ${name}`);
+    return declaration[0];
+  }).join("\n");
+  const appended: Array<{ dataset: Record<string, string>; id?: string; textContent?: string }> = [];
+  const document = {
+    getElementById() {
+      return null;
+    },
+    createElement() {
+      return { dataset: {} };
+    },
+    documentElement: {
+      appendChild(node: (typeof appended)[number]) {
+        appended.push(node);
+      },
+    },
+  };
+  const install = new Function("document", `${declarations}\n${source}\ninstallStyle();`) as (documentValue: typeof document) => void;
+
+  install(document);
+  return appended;
+}
+
 describe("renderer injection header compatibility", () => {
+  it("adds the session copy shortcut through the native fork action", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+
+    assert.match(renderer, /原地复制会话 - Codex\+\+/);
+    assert.match(renderer, /createSessionMoreMenuItem\("原地复制会话 - Codex\+\+"/);
+    assert.match(renderer, /getAttribute\("aria-label"\)[\s\S]*聊天操作/);
+    assert.match(renderer, /从这里创建聊天分支/);
+    assert.match(renderer, /data-app-action-sidebar-thread-selected/);
+    assert.match(renderer, /sessionCopyMenuActivationTimeoutMs/);
+    assert.doesNotMatch(renderer, /\n\s*refreshSessionCopyMenuItems\(\);/);
+  });
+
+  it("automatically renames a session through the native title suggestion", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+
+    assert.match(renderer, /自动重命名当前会话/);
+    assert.match(renderer, /activateSessionAutoRenameMenuItem/);
+    assert.match(renderer, /input\[aria-label="聊天标题"\], input\[aria-label="Chat title"\]/);
+    assert.match(renderer, /button\.classList\.contains\("text-info"\)/);
+    assert.match(renderer, /\^\(保存\|Save\)\$/);
+    assert.match(renderer, /Codex 未能生成新名称/);
+  });
+
   it("anchors the Codex++ menu to current and legacy application top bars only", async () => {
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
 
@@ -95,6 +154,15 @@ describe("renderer injection header compatibility", () => {
     assert.match(renderer, /!window\.electronBridge/);
     assert.ok(renderer.includes("/^app:\\\/\\\/\\-\\//i.test(window.location.href)"));
     assert.match(renderer, /codexPlusIsNodeTestHarness/);
+  });
+
+  it("initializes renderer styles without unresolved template identifiers", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+
+    const appended = installRendererStyle(renderer);
+
+    assert.equal(appended.length, 1);
+    assert.match(appended[0].textContent ?? "", /#codex-plus-menu/);
   });
 
   it("hides only the official usage alert and restores it without changing upstream styles", async () => {

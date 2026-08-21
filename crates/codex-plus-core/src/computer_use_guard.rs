@@ -28,6 +28,7 @@ const SKY_INTERNAL_COMPUTER_USE_CLIENT_IMPORT: &str =
 const SKY_PACKAGE_EXPORTS_BACKUP: &str = "package.json.bak-codexpp-runtime-exports";
 const ADMIN_HELPER_HOOK_BEGIN: &str = "/* codex-plus-admin-computer-use:begin */";
 const ADMIN_HELPER_HOOK_END: &str = "/* codex-plus-admin-computer-use:end */";
+const ADMIN_HELPER_HOOK_CONTRACT_PREFIX: &str = "/* codex-plus-admin-computer-use:contract=";
 #[cfg(test)]
 const SUPPORTED_SKY_VERSION: &str = "0.4.20";
 const LEGACY_HELPER_TRANSPORT_LAUNCH_TEMPLATE: &str = "const i=s(e(this,w,\"f\"),e(this,v,\"f\"),{env:null==e(this,y,\"f\")?void 0:Object.assign(Object.assign({},P().env),e(this,y,\"f\")),stdio:[\"pipe\",\"pipe\",\"pipe\"],windowsHide:!0});";
@@ -56,6 +57,13 @@ const SKY_0611_HELPER_SHA256: &[&str] =
     &["7a95d14ebf992955d8ab8e6c57a75545ed7d18e864b0f5c1b9fe7f47685bd897"];
 const SKY_0611_HELPER_TRANSPORT_SHA256: &str =
     "56ac031983d85e4718f10c5a814923afe2cb4ead649466eef02b1b4d4cf63e40";
+const SKY_0617_HELPER_TRANSPORT_LAUNCH_TEMPLATE: &str = "const i=s(e(this,w,\"f\"),e(this,v,\"f\"),{env:null==e(this,k,\"f\")?void 0:Object.assign(Object.assign({},J().env),e(this,k,\"f\")),stdio:[\"pipe\",\"pipe\",\"pipe\"],windowsHide:!0});";
+const SKY_0617_HELPER_TRANSPORT_LAUNCH_SHA256: &str =
+    "e0947865a916350fca1a7f79f116649704841c5e51b89e0d996629c589d911fe";
+const SKY_0617_HELPER_SHA256: &[&str] =
+    &["db8f4486d527c91b80266faf77fdc38266b1d3960efbba35d0a6aab4caaf6aee"];
+const SKY_0617_HELPER_TRANSPORT_SHA256: &str =
+    "9ba7f5f8d6512f3e42e6957d50660b0a02c9819628c004edd65bfe61b1a3538f";
 
 #[cfg(test)]
 const HELPER_TRANSPORT_LAUNCH_TEMPLATE: &str = LEGACY_HELPER_TRANSPORT_LAUNCH_TEMPLATE;
@@ -70,6 +78,7 @@ struct SupportedComputerUseContract {
     launch_template: &'static str,
     launch_template_sha256: &'static str,
     process_expression: &'static str,
+    environment_expression: &'static str,
 }
 
 const SUPPORTED_COMPUTER_USE_CONTRACTS: &[SupportedComputerUseContract] = &[
@@ -80,6 +89,7 @@ const SUPPORTED_COMPUTER_USE_CONTRACTS: &[SupportedComputerUseContract] = &[
         launch_template: LEGACY_HELPER_TRANSPORT_LAUNCH_TEMPLATE,
         launch_template_sha256: LEGACY_HELPER_TRANSPORT_LAUNCH_SHA256,
         process_expression: "P()",
+        environment_expression: "e(this,y,\"f\")",
     },
     SupportedComputerUseContract {
         sky_version: "0.5.2",
@@ -88,6 +98,7 @@ const SUPPORTED_COMPUTER_USE_CONTRACTS: &[SupportedComputerUseContract] = &[
         launch_template: LEGACY_HELPER_TRANSPORT_LAUNCH_TEMPLATE,
         launch_template_sha256: LEGACY_HELPER_TRANSPORT_LAUNCH_SHA256,
         process_expression: "P()",
+        environment_expression: "e(this,y,\"f\")",
     },
     SupportedComputerUseContract {
         sky_version: "0.6.2",
@@ -96,6 +107,7 @@ const SUPPORTED_COMPUTER_USE_CONTRACTS: &[SupportedComputerUseContract] = &[
         launch_template: SKY_062_HELPER_TRANSPORT_LAUNCH_TEMPLATE,
         launch_template_sha256: SKY_062_HELPER_TRANSPORT_LAUNCH_SHA256,
         process_expression: "H()",
+        environment_expression: "e(this,y,\"f\")",
     },
     SupportedComputerUseContract {
         sky_version: "0.6.6",
@@ -104,6 +116,7 @@ const SUPPORTED_COMPUTER_USE_CONTRACTS: &[SupportedComputerUseContract] = &[
         launch_template: LEGACY_HELPER_TRANSPORT_LAUNCH_TEMPLATE,
         launch_template_sha256: LEGACY_HELPER_TRANSPORT_LAUNCH_SHA256,
         process_expression: "P()",
+        environment_expression: "e(this,y,\"f\")",
     },
     SupportedComputerUseContract {
         sky_version: "0.6.11",
@@ -112,6 +125,16 @@ const SUPPORTED_COMPUTER_USE_CONTRACTS: &[SupportedComputerUseContract] = &[
         launch_template: SKY_0611_HELPER_TRANSPORT_LAUNCH_TEMPLATE,
         launch_template_sha256: SKY_0611_HELPER_TRANSPORT_LAUNCH_SHA256,
         process_expression: "J()",
+        environment_expression: "e(this,y,\"f\")",
+    },
+    SupportedComputerUseContract {
+        sky_version: "0.6.17-202608171537-pr-1300023-7efba775c041",
+        helper_sha256: SKY_0617_HELPER_SHA256,
+        transport_sha256: SKY_0617_HELPER_TRANSPORT_SHA256,
+        launch_template: SKY_0617_HELPER_TRANSPORT_LAUNCH_TEMPLATE,
+        launch_template_sha256: SKY_0617_HELPER_TRANSPORT_LAUNCH_SHA256,
+        process_expression: "J()",
+        environment_expression: "e(this,k,\"f\")",
     },
 ];
 const ADMIN_HELPER_TRANSPORT_BACKUP: &str = "helper_transport.js.bak-codex-plus-admin";
@@ -254,8 +277,9 @@ fn patch_admin_helper_transport(
     );
     let descriptor = serde_json::to_string(&descriptor_path.to_string_lossy().as_ref())?;
     let process_expression = contract.process_expression;
+    let environment_expression = contract.environment_expression;
     let replacement = format!(
-        "{ADMIN_HELPER_HOOK_BEGIN}const originalCommand=e(this,w,\"f\"),originalArgs=e(this,v,\"f\");let adminDescriptor;try{{adminDescriptor=JSON.parse({process_expression}.getBuiltinModule(\"node:fs\").readFileSync({descriptor},\"utf8\"))}}catch{{throw new Error(\"administrator Computer Use unavailable\")}}if(!adminDescriptor||typeof adminDescriptor.shimPath!==\"string\"||!adminDescriptor.shimPath||typeof adminDescriptor.pipeName!==\"string\"||!adminDescriptor.pipeName||typeof adminDescriptor.sessionId!==\"string\"||!adminDescriptor.sessionId||typeof adminDescriptor.proofPath!==\"string\"||!adminDescriptor.proofPath||typeof originalCommand!==\"string\"||!originalCommand||!Array.isArray(originalArgs)||!originalArgs.every(value=>typeof value===\"string\"))throw new Error(\"administrator Computer Use unavailable\");const adminCommand=adminDescriptor.shimPath,adminArgs=[\"computer-use-client\",\"--pipe\",adminDescriptor.pipeName,\"--session\",adminDescriptor.sessionId,\"--proof-file\",adminDescriptor.proofPath,\"--\",originalCommand,...originalArgs];const i=s(adminCommand,adminArgs,{{env:null==e(this,y,\"f\")?void 0:Object.assign(Object.assign({{}},{process_expression}.env),e(this,y,\"f\")),stdio:[\"pipe\",\"pipe\",\"pipe\"],windowsHide:!0}});{ADMIN_HELPER_HOOK_END}"
+        "{ADMIN_HELPER_HOOK_BEGIN}{ADMIN_HELPER_HOOK_CONTRACT_PREFIX}{sky_version} */const originalCommand=e(this,w,\"f\"),originalArgs=e(this,v,\"f\");let adminDescriptor;try{{adminDescriptor=JSON.parse({process_expression}.getBuiltinModule(\"node:fs\").readFileSync({descriptor},\"utf8\"))}}catch{{throw new Error(\"administrator Computer Use unavailable\")}}if(!adminDescriptor||typeof adminDescriptor.shimPath!==\"string\"||!adminDescriptor.shimPath||typeof adminDescriptor.pipeName!==\"string\"||!adminDescriptor.pipeName||typeof adminDescriptor.sessionId!==\"string\"||!adminDescriptor.sessionId||typeof adminDescriptor.proofPath!==\"string\"||!adminDescriptor.proofPath||typeof originalCommand!==\"string\"||!originalCommand||!Array.isArray(originalArgs)||!originalArgs.every(value=>typeof value===\"string\"))throw new Error(\"administrator Computer Use unavailable\");const adminCommand=adminDescriptor.shimPath,adminArgs=[\"computer-use-client\",\"--pipe\",adminDescriptor.pipeName,\"--session\",adminDescriptor.sessionId,\"--proof-file\",adminDescriptor.proofPath,\"--\",originalCommand,...originalArgs];const i=s(adminCommand,adminArgs,{{env:null=={environment_expression}?void 0:Object.assign(Object.assign({{}},{process_expression}.env),{environment_expression}),stdio:[\"pipe\",\"pipe\",\"pipe\"],windowsHide:!0}});{ADMIN_HELPER_HOOK_END}"
     );
     Ok(contents.replacen(contract.launch_template, &replacement, 1))
 }
@@ -282,12 +306,20 @@ fn remove_admin_helper_transport_patch(contents: &str) -> anyhow::Result<String>
         "computer_use_contract_incompatible"
     );
     let hook_body = &contents[begin + ADMIN_HELPER_HOOK_BEGIN.len()..end_start];
-    let contract = SUPPORTED_COMPUTER_USE_CONTRACTS
-        .iter()
-        .find(|contract| {
-            hook_body.contains(&format!("{}.getBuiltinModule", contract.process_expression))
-        })
-        .context("computer_use_contract_incompatible")?;
+    let contract = if let Some(version) = hook_body
+        .strip_prefix(ADMIN_HELPER_HOOK_CONTRACT_PREFIX)
+        .and_then(|body| body.split_once(" */").map(|(version, _)| version))
+    {
+        supported_computer_use_contract(version).context("computer_use_contract_incompatible")?
+    } else {
+        // 兼容早期未写入合同标识的 hook；新 hook 始终使用显式版本标识避免 J() 合同歧义。
+        SUPPORTED_COMPUTER_USE_CONTRACTS
+            .iter()
+            .find(|contract| {
+                hook_body.contains(&format!("{}.getBuiltinModule", contract.process_expression))
+            })
+            .context("computer_use_contract_incompatible")?
+    };
     let mut restored = String::with_capacity(contents.len());
     restored.push_str(&contents[..begin]);
     restored.push_str(contract.launch_template);
@@ -2498,6 +2530,8 @@ mod tests {
 "#;
     const HELPER_TRANSPORT_062_FIXTURE: &str = r#"import{spawn as s}from"node:child_process";const H=()=>globalThis.process;const e=()=>{};const w=0,v=0,y=0;function launch(){const i=s(e(this,w,"f"),e(this,v,"f"),{env:null==e(this,y,"f")?void 0:Object.assign(Object.assign({},H().env),e(this,y,"f")),stdio:["pipe","pipe","pipe"],windowsHide:!0});return i}
 "#;
+    const HELPER_TRANSPORT_0617_FIXTURE: &str = r#"import{spawn as s}from"node:child_process";function J(){return globalThis.process}const e=()=>{};const w=0,v=0,k=0;function launch(){const i=s(e(this,w,"f"),e(this,v,"f"),{env:null==e(this,k,"f")?void 0:Object.assign(Object.assign({},J().env),e(this,k,"f")),stdio:["pipe","pipe","pipe"],windowsHide:!0});return i}
+"#;
 
     #[cfg(windows)]
     #[test]
@@ -2544,6 +2578,15 @@ mod tests {
         assert_eq!(
             supported_transport_sha256("0.6.11"),
             Some("56ac031983d85e4718f10c5a814923afe2cb4ead649466eef02b1b4d4cf63e40")
+        );
+        assert_eq!(
+            supported_helper_sha256s("0.6.17-202608171537-pr-1300023-7efba775c041")
+                .and_then(|hashes| hashes.first().copied()),
+            Some("db8f4486d527c91b80266faf77fdc38266b1d3960efbba35d0a6aab4caaf6aee")
+        );
+        assert_eq!(
+            supported_transport_sha256("0.6.17-202608171537-pr-1300023-7efba775c041"),
+            Some("9ba7f5f8d6512f3e42e6957d50660b0a02c9819628c004edd65bfe61b1a3538f")
         );
         assert_eq!(supported_helper_sha256s("0.5.3"), None);
         assert_eq!(supported_transport_sha256("0.5.3"), None);
@@ -2991,6 +3034,40 @@ notify = ["C:\\missing-runtime\\codex-computer-use.exe", "turn-ended"]
 
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("helper_transport-0.6.2.mjs");
+        std::fs::write(&script, patched).unwrap();
+        let status = std::process::Command::new("node")
+            .arg("--check")
+            .arg(&script)
+            .status()
+            .expect("Node.js is required for helper hook syntax verification");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn computer_use_guard_admin_hook_supports_sky_0617_k_options_slot() {
+        const SKY_0617: &str = "0.6.17-202608171537-pr-1300023-7efba775c041";
+        let descriptor = Path::new(r"C:\Users\me\.codex\admin-computer-use.json");
+        let patched =
+            patch_admin_helper_transport(HELPER_TRANSPORT_0617_FIXTURE, SKY_0617, descriptor)
+                .expect("Sky 0.6.17 transport must patch");
+        assert!(patched.contains(
+            "codex-plus-admin-computer-use:contract=0.6.17-202608171537-pr-1300023-7efba775c041"
+        ));
+        assert!(patched.contains("J().getBuiltinModule"));
+        assert!(patched.contains("null==e(this,k,\"f\")"));
+        assert!(patched.contains("Object.assign({},J().env),e(this,k,\"f\")"));
+        assert!(!patched.contains("e(this,y,\"f\")"));
+        assert_eq!(
+            patch_admin_helper_transport(&patched, SKY_0617, descriptor).unwrap(),
+            patched
+        );
+        assert_eq!(
+            remove_admin_helper_transport_patch(&patched).unwrap(),
+            HELPER_TRANSPORT_0617_FIXTURE
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("helper_transport-0.6.17.mjs");
         std::fs::write(&script, patched).unwrap();
         let status = std::process::Command::new("node")
             .arg("--check")
