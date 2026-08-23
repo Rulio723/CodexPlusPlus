@@ -193,7 +193,7 @@ apps/codex-plus-manager/src/dream-skin.test.ts
 - `RequestExecutionLevel admin`。
 - 安装前检测并结束 Codex/Codex++ 进程。
 - 安装 launcher、manager、admin shim、terminal shim。
-- 包含 PowerShell 7 兼容运行时和恢复程序。
+- 包含轻量管理员终端兼容 shim 和恢复程序；完整 PowerShell 7 runtime 不再随包分发，安装时在本机 PowerShell 7 与 Windows PowerShell 5.1 之间选择。
 - 使用 Codex++ 自定义图标。
 - 安装和卸载均包含安全恢复文件处理。
 

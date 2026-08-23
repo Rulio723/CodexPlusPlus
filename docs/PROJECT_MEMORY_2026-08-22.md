@@ -136,3 +136,25 @@ D:/Codex/Codex++/output/upstream-sync-2026-08-22/installer-force-stop-loop/rollb
 2. 不得在上游合并时删除循环重枚举、新 PID 捕获、双路强制结束或连续空轮确认。
 3. 重新打包时使用新的唯一文件名和 SHA-256，不覆盖已验证包。
 4. 完整安装器会结束正在运行的 Codex++/ChatGPT；保持当前对话时，使用 High RunAs 临时锁文件 fixture 验证，不直接启动安装器。
+
+## 7. 管理员终端 PowerShell 选择（2026-08-23）
+
+Windows 安装包不得再内置完整 PowerShell 7 portable runtime。`admin-terminal/pwsh.exe` 是 Codex++ 自身的轻量安全 shim，不是 PowerShell 7 本体。
+
+安装器必须：
+
+1. 检测本机 PowerShell 7。
+2. 检测到时提示用户选择 PowerShell 7 或 Windows PowerShell 5.1；静默安装默认选择 PowerShell 7。
+3. 未检测到时提示并选择 Windows 10/11 自带的 Windows PowerShell 5.1。
+4. 安装所选 shim 为 `admin-terminal/pwsh.exe`，并写入 `admin-terminal/shell-mode.txt`。
+5. 升级时移除旧版本残留的 `runtime/powershell7` 目录。
+6. broker 必须严格遵循 `shell-mode.txt`；旧安装没有该文件时，才允许按 PowerShell 7 → Windows PowerShell 5.1 自动回退。
+
+发布 staging 保留两个明确命名的 shim 输入：
+
+```text
+admin-terminal/pwsh-powershell7.exe
+admin-terminal/pwsh-windows-powershell.exe
+```
+
+两者都是同一安全传输 shim 的选择变体，不包含 PowerShell runtime；真正的 shell 来自本机安装。

@@ -74,6 +74,7 @@ mod platform {
     const OFFICIAL_PACKAGE_NAME: &str = "OpenAI.Codex";
     const OFFICIAL_PACKAGE_FAMILY: &str = "OpenAI.Codex_2p2nqsd0c76g0";
     const OFFICIAL_PUBLISHER_ID: &str = "2p2nqsd0c76g0";
+    const TERMINAL_SHELL_MODE_FILE: &str = "shell-mode.txt";
     const OFFICIAL_RUNTIME_COMPANION_NAMES: [&str; 4] = [
         "codex-code-mode-host.exe",
         "codex-command-runner.exe",
@@ -852,24 +853,86 @@ mod platform {
         .context("failed to start official Codex exec-server")
     }
 
-    fn resolve_terminal_shell(terminal_host: &Path) -> anyhow::Result<PathBuf> {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TerminalShellPreference {
+        PowerShell7,
+        WindowsPowerShell,
+    }
+
+    fn parse_terminal_shell_preference(value: &str) -> Option<TerminalShellPreference> {
+        match value.trim() {
+            "powershell7" => Some(TerminalShellPreference::PowerShell7),
+            "windows-powershell" => Some(TerminalShellPreference::WindowsPowerShell),
+            _ => None,
+        }
+    }
+
+    fn configured_terminal_shell_preference(
+        terminal_host: &Path,
+    ) -> anyhow::Result<Option<TerminalShellPreference>> {
         let install_dir = terminal_host
             .parent()
             .context("administrator terminal host install directory is unavailable")?;
-        let bundled = install_dir
-            .join("runtime")
-            .join("powershell7")
-            .join("pwsh.exe");
-        let mut candidates = vec![bundled];
-        candidates.extend(system_powershell7_candidates());
-        candidates.push(
-            trusted_system_directory()?
-                .join("WindowsPowerShell")
-                .join("v1.0")
-                .join("powershell.exe"),
-        );
-        first_existing_terminal_shell(candidates)
-            .context("PowerShell 7 and Windows PowerShell 5.1 were not found")
+        let preference_path = install_dir
+            .join("admin-terminal")
+            .join(TERMINAL_SHELL_MODE_FILE);
+        let value = match std::fs::read_to_string(&preference_path) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "read administrator terminal shell preference {}",
+                        preference_path.display()
+                    )
+                });
+            }
+        };
+        parse_terminal_shell_preference(&value)
+            .map(Some)
+            .context("administrator terminal shell preference is invalid")
+    }
+
+    fn select_terminal_shell(
+        preference: Option<TerminalShellPreference>,
+        powershell7_candidates: impl IntoIterator<Item = PathBuf>,
+        windows_powershell: PathBuf,
+    ) -> Option<PathBuf> {
+        match preference {
+            Some(TerminalShellPreference::PowerShell7) => {
+                first_existing_terminal_shell(powershell7_candidates)
+            }
+            Some(TerminalShellPreference::WindowsPowerShell) => {
+                first_existing_terminal_shell([windows_powershell])
+            }
+            None => first_existing_terminal_shell(
+                powershell7_candidates
+                    .into_iter()
+                    .chain(std::iter::once(windows_powershell)),
+            ),
+        }
+    }
+
+    fn resolve_terminal_shell(terminal_host: &Path) -> anyhow::Result<PathBuf> {
+        let preference = configured_terminal_shell_preference(terminal_host)?;
+        let windows_powershell = trusted_system_directory()?
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        select_terminal_shell(
+            preference,
+            system_powershell7_candidates(),
+            windows_powershell,
+        )
+        .with_context(|| match preference {
+            Some(TerminalShellPreference::PowerShell7) => {
+                "PowerShell 7 was selected during installation but is unavailable"
+            }
+            Some(TerminalShellPreference::WindowsPowerShell) => {
+                "Windows PowerShell 5.1 was selected during installation but is unavailable"
+            }
+            None => "PowerShell 7 and Windows PowerShell 5.1 were not found",
+        })
     }
 
     fn system_powershell7_candidates() -> Vec<PathBuf> {
@@ -880,6 +943,15 @@ mod platform {
                 candidates.push(root.join("PowerShell").join("7").join("pwsh.exe"));
                 candidates.extend(store_powershell7_candidates(&root.join("WindowsApps")));
             }
+        }
+        if let Some(root) = std::env::var_os("LOCALAPPDATA") {
+            candidates.push(
+                PathBuf::from(root)
+                    .join("Programs")
+                    .join("PowerShell")
+                    .join("7")
+                    .join("pwsh.exe"),
+            );
         }
         if let Some(path) = std::env::var_os("PATH") {
             candidates
@@ -1914,36 +1986,79 @@ mod platform {
         }
 
         #[test]
-        fn terminal_shell_selection_prefers_bundled_7_then_system_7_then_legacy_5_1() {
+        fn terminal_shell_selection_honors_installer_preference_and_legacy_auto_mode() {
             let temp = tempfile::tempdir().unwrap();
-            let bundled = temp.path().join("runtime").join("pwsh.exe");
             let system = temp.path().join("system").join("pwsh.exe");
             let legacy = temp.path().join("system32").join("powershell.exe");
-            for path in [&bundled, &system, &legacy] {
+            for path in [&system, &legacy] {
                 std::fs::create_dir_all(path.parent().unwrap()).unwrap();
                 std::fs::write(path, b"fixture").unwrap();
             }
 
             assert_eq!(
-                first_existing_terminal_shell([bundled.clone(), system.clone(), legacy.clone(),]),
-                Some(bundled.clone())
+                select_terminal_shell(
+                    Some(TerminalShellPreference::PowerShell7),
+                    [system.clone()],
+                    legacy.clone(),
+                ),
+                Some(system.clone())
             );
             assert_eq!(
-                first_existing_terminal_shell([
-                    temp.path().join("missing-pwsh.exe"),
-                    system.clone(),
+                select_terminal_shell(
+                    Some(TerminalShellPreference::WindowsPowerShell),
+                    [system.clone()],
                     legacy.clone(),
-                ]),
+                ),
+                Some(legacy.clone())
+            );
+            assert_eq!(
+                select_terminal_shell(None, [system.clone()], legacy.clone()),
                 Some(system)
             );
             assert_eq!(
-                first_existing_terminal_shell([
-                    temp.path().join("missing-pwsh.exe"),
-                    temp.path().join("missing-system-pwsh.exe"),
-                    legacy.clone(),
-                ]),
+                select_terminal_shell(None, [temp.path().join("missing-pwsh.exe")], legacy.clone(),),
                 Some(legacy)
             );
+        }
+
+        #[test]
+        fn terminal_shell_preference_parser_accepts_only_installer_values() {
+            assert_eq!(
+                parse_terminal_shell_preference("powershell7\r\n"),
+                Some(TerminalShellPreference::PowerShell7)
+            );
+            assert_eq!(
+                parse_terminal_shell_preference("windows-powershell\n"),
+                Some(TerminalShellPreference::WindowsPowerShell)
+            );
+            assert_eq!(parse_terminal_shell_preference("auto"), None);
+            assert_eq!(parse_terminal_shell_preference("cmd"), None);
+        }
+
+        #[test]
+        fn terminal_shell_preference_reads_the_installer_marker_next_to_the_shim() {
+            let temp = tempfile::tempdir().unwrap();
+            let terminal_dir = temp.path().join("admin-terminal");
+            std::fs::create_dir_all(&terminal_dir).unwrap();
+            let terminal_host = temp.path().join("codex-plus-admin-shim.exe");
+
+            assert_eq!(
+                configured_terminal_shell_preference(&terminal_host).unwrap(),
+                None
+            );
+
+            std::fs::write(
+                terminal_dir.join(TERMINAL_SHELL_MODE_FILE),
+                "powershell7\r\n",
+            )
+            .unwrap();
+            assert_eq!(
+                configured_terminal_shell_preference(&terminal_host).unwrap(),
+                Some(TerminalShellPreference::PowerShell7)
+            );
+
+            std::fs::write(terminal_dir.join(TERMINAL_SHELL_MODE_FILE), "cmd\n").unwrap();
+            assert!(configured_terminal_shell_preference(&terminal_host).is_err());
         }
 
         #[test]

@@ -446,6 +446,13 @@ fn administrator_runtime_is_staged_with_fixed_executable_roles() {
                 .contains("Copy-Item target/release/codex-plus-admin-shim.exe dist/windows/app/")
         );
         assert!(workflow.contains("Remove-Item dist/windows/app -Recurse -Force"));
+        assert!(workflow.contains(
+            "Copy-Item target/release/codex-plus-terminal-shim.exe dist/windows/app/admin-terminal/pwsh-powershell7.exe"
+        ));
+        assert!(workflow.contains(
+            "Copy-Item target/release/codex-plus-terminal-shim.exe dist/windows/app/admin-terminal/pwsh-windows-powershell.exe"
+        ));
+        assert!(!workflow.contains("stage-powershell7.ps1"));
         for binary in [
             "codex-plus-plus.exe",
             "codex-plus-plus-manager.exe",
@@ -501,9 +508,17 @@ fn administrator_runtime_is_staged_with_fixed_executable_roles() {
             "File \"${ROOT}\\dist\\windows\\app\\codex-plus-plus.exe\"",
             "File \"${ROOT}\\dist\\windows\\app\\codex-plus-plus-manager.exe\"",
             "File \"${ROOT}\\dist\\windows\\app\\codex-plus-admin-shim.exe\"",
-            "File /oname=pwsh.exe \"${ROOT}\\dist\\windows\\app\\admin-terminal\\pwsh.exe\"",
+            "File /oname=pwsh.exe \"${ROOT}\\dist\\windows\\app\\admin-terminal\\pwsh-powershell7.exe\"",
+            "File /oname=pwsh.exe \"${ROOT}\\dist\\windows\\app\\admin-terminal\\pwsh-windows-powershell.exe\"",
             "File /oname=codex-plus-recovery.exe \"${ROOT}\\dist\\windows\\app\\codex-plus-plus.exe\"",
         ]
+    );
+    assert!(installer.contains("Call SelectAdministratorPowerShell"));
+    assert!(installer.contains("MessageBox MB_YESNO|MB_ICONQUESTION"));
+    assert!(installer.contains("FileWrite $0 \"$AdminTerminalShell$\\r$\\n\""));
+    assert!(installer.contains("Delete \"$INSTDIR\\admin-terminal\\shell-mode.txt\""));
+    assert!(
+        !installer.contains("File /r \"${ROOT}\\dist\\windows\\app\\runtime\\powershell7\\*\"")
     );
     assert!(!installer.contains("auth.json"));
     assert!(!installer.contains("environments.toml"));

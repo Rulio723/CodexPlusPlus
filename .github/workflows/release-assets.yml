@@ -47,9 +47,8 @@ jobs:
           Copy-Item target/release/codex-plus-plus-manager.exe dist/windows/app/
           Copy-Item target/release/codex-plus-admin-shim.exe dist/windows/app/
           New-Item -ItemType Directory -Force dist/windows/app/admin-terminal | Out-Null
-          Copy-Item target/release/codex-plus-terminal-shim.exe dist/windows/app/admin-terminal/pwsh.exe
-          & .\scripts\installer\windows\stage-powershell7.ps1 -Destination dist/windows/app/runtime/powershell7
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item target/release/codex-plus-terminal-shim.exe dist/windows/app/admin-terminal/pwsh-powershell7.exe
+          Copy-Item target/release/codex-plus-terminal-shim.exe dist/windows/app/admin-terminal/pwsh-windows-powershell.exe
 
       - name: Build Windows zip asset
         shell: pwsh

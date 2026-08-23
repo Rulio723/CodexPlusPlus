@@ -25,6 +25,7 @@ Var PowerShell7PathIndex
 Var PowerShell7Candidate
 Var PowerShell7Version
 Var PowerShell7Major
+Var AdminTerminalShell
 
 ; The launcher has a requireAdministrator manifest.  Keep its path in a
 ; controlled environment variable and let PowerShell's ShellExecute runas
@@ -154,6 +155,26 @@ powershell7_candidate_done:
 
 powershell7_candidate_found:
   StrCpy $PowerShell7Installed 1
+FunctionEnd
+
+Function SelectAdministratorPowerShell
+  Call DetectPowerShell7
+  StrCpy $AdminTerminalShell "windows-powershell"
+  StrCmp $PowerShell7Installed 1 administrator_powershell_prompt administrator_powershell_legacy
+
+administrator_powershell_prompt:
+  MessageBox MB_YESNO|MB_ICONQUESTION "检测到本机已安装 PowerShell 7。管理员终端是否使用 PowerShell 7？选择“否”将使用 Windows 10/11 自带的 Windows PowerShell 5.1；安装包不会再内置完整 PowerShell 7 runtime。" /SD IDYES IDYES administrator_powershell_7 IDNO administrator_powershell_done
+
+administrator_powershell_7:
+  StrCpy $AdminTerminalShell "powershell7"
+  DetailPrint "管理员终端将使用本机 PowerShell 7。"
+  Goto administrator_powershell_done
+
+administrator_powershell_legacy:
+  MessageBox MB_OK|MB_ICONINFORMATION "未检测到本机 PowerShell 7。管理员终端将使用 Windows 10/11 自带的 Windows PowerShell 5.1；安装包不会下载或内置 PowerShell 7。" /SD IDOK
+  DetailPrint "未检测到本机 PowerShell 7，管理员终端将使用 Windows PowerShell 5.1。"
+
+administrator_powershell_done:
 FunctionEnd
 
 Function CreateSecureRecoveryDirectory
@@ -490,17 +511,7 @@ FunctionEnd
 
 Section "Install"
   StrCpy $InstallAdminRecoveryTrySucceeded 0
-  Call DetectPowerShell7
-  StrCmp $PowerShell7Installed 1 install_powershell7_skip install_powershell7_required
-
-install_powershell7_required:
-  DetailPrint "未检测到本机 PowerShell 7，强制安装内置 PowerShell 7。"
-  Goto install_powershell7_done
-
-install_powershell7_skip:
-  DetailPrint "检测到本机已安装 PowerShell 7，跳过安装内置 PowerShell 7。"
-
-install_powershell7_done:
+  Call SelectAdministratorPowerShell
   Call CreateSecureRecoveryDirectory
   SetOutPath "$AdminRecoveryDir"
   File /oname=codex-plus-recovery.exe "${ROOT}\dist\windows\app\codex-plus-plus.exe"
@@ -518,13 +529,37 @@ install_recovery_already_done:
   File "${ROOT}\dist\windows\app\codex-plus-plus-manager.exe"
   File "${ROOT}\dist\windows\app\codex-plus-admin-shim.exe"
   SetOutPath "$INSTDIR\admin-terminal"
-  File /oname=pwsh.exe "${ROOT}\dist\windows\app\admin-terminal\pwsh.exe"
-  DetailPrint "正在安装内置 PowerShell 7 runtime，管理员模式始终使用随包版本。"
-  SetOutPath "$INSTDIR\runtime\powershell7"
-  File /r "${ROOT}\dist\windows\app\runtime\powershell7\*"
-  Goto install_runtime_done
+  StrCmp $AdminTerminalShell "powershell7" install_terminal_powershell7 install_terminal_windows_powershell
 
-install_runtime_done:
+install_terminal_powershell7:
+  File /oname=pwsh.exe "${ROOT}\dist\windows\app\admin-terminal\pwsh-powershell7.exe"
+  Goto install_terminal_shim_done
+
+install_terminal_windows_powershell:
+  File /oname=pwsh.exe "${ROOT}\dist\windows\app\admin-terminal\pwsh-windows-powershell.exe"
+
+install_terminal_shim_done:
+  ClearErrors
+  FileOpen $0 "$INSTDIR\admin-terminal\shell-mode.txt" w
+  IfErrors install_terminal_mode_write_failed
+  FileWrite $0 "$AdminTerminalShell$\r$\n"
+  IfErrors install_terminal_mode_write_close_failed
+  FileClose $0
+  DetailPrint "已安装轻量管理员终端 shim；shell 模式：$AdminTerminalShell。"
+  ; Upgrades remove the old bundled portable runtime. The selected shell now
+  ; comes from the operating system installation.
+  RMDir /r "$INSTDIR\runtime\powershell7"
+  RMDir "$INSTDIR\runtime"
+  Goto install_terminal_mode_done
+
+install_terminal_mode_write_failed:
+  Abort "管理员终端 shell 模式写入失败，请关闭占用安装目录的程序后重试。"
+
+install_terminal_mode_write_close_failed:
+  FileClose $0
+  Goto install_terminal_mode_write_failed
+
+install_terminal_mode_done:
   SetOutPath "$INSTDIR"
 
   Delete "$DESKTOP\Codex++ 绠＄悊宸ュ叿.lnk"
@@ -574,6 +609,7 @@ uninstall_recovery_already_done:
   Delete "$INSTDIR\codex-plus-plus-manager.exe"
   Delete "$INSTDIR\codex-plus-admin-shim.exe"
   Delete "$INSTDIR\admin-terminal\pwsh.exe"
+  Delete "$INSTDIR\admin-terminal\shell-mode.txt"
   RMDir "$INSTDIR\admin-terminal"
   RMDir /r "$INSTDIR\runtime\powershell7"
   RMDir "$INSTDIR\runtime"
