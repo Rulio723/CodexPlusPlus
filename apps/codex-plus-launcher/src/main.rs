@@ -616,6 +616,7 @@ impl LaunchHooks for LauncherHooks {
                             updated_workspace_roots: 0,
                             skipped_locked_rollout_files: Vec::new(),
                             encrypted_content_warning: None,
+                            repair_audit: codex_plus_data::ProviderSyncAudit::default(),
                         },
                         completion_error,
                     ));
@@ -646,6 +647,7 @@ impl LaunchHooks for LauncherHooks {
                             updated_workspace_roots: 0,
                             skipped_locked_rollout_files: Vec::new(),
                             encrypted_content_warning: None,
+                            repair_audit: codex_plus_data::ProviderSyncAudit::default(),
                         },
                         None,
                     ));
@@ -978,6 +980,14 @@ impl BridgeDataService for LauncherDataService {
         .await
         .map_err(|error| anyhow::anyhow!("Remote Control session recovery task failed: {error}"))?
     }
+
+    async fn export_session_file(&self, session: SessionRef) -> anyhow::Result<Value> {
+        LauncherDataService::export_session_file(self, session).await
+    }
+
+    async fn import_session_file(&self, payload: Value) -> anyhow::Result<Value> {
+        LauncherDataService::import_session_file(self, payload).await
+    }
 }
 
 impl LauncherDataService {
@@ -1001,6 +1011,24 @@ impl LauncherDataService {
         )
         .with_allowed_db_paths(allowed_db_paths)
         .with_codex_home(codex_plus_core::codex_sqlite::default_codex_home_dir())
+    }
+
+    async fn export_session_file(&self, session: SessionRef) -> anyhow::Result<Value> {
+        let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+        tokio::task::spawn_blocking(move || {
+            codex_plus_core::session_share::export_rollout(&home, &session.session_id)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("session export task failed: {error}"))?
+    }
+
+    async fn import_session_file(&self, payload: Value) -> anyhow::Result<Value> {
+        let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+        tokio::task::spawn_blocking(move || {
+            codex_plus_core::session_share::import_rollout(&home, &payload)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("session import task failed: {error}"))?
     }
 }
 
@@ -1184,6 +1212,7 @@ async fn inject_with_context(
             }
         }
     }
+
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Codex injection failed")))
 }
 

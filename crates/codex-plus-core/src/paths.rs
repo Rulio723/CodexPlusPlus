@@ -6,6 +6,7 @@ const SETTINGS_FILE: &str = "settings.json";
 const LATEST_STATUS_FILE: &str = "latest-status.json";
 const DIAGNOSTIC_LOG_FILE: &str = "codex-plus.log";
 const PENDING_PROVIDER_IMPORT_FILE: &str = "pending-provider-import.json";
+const PENDING_SESSION_SHARE_FILE: &str = "pending-session-share.txt";
 const PENDING_REMOTE_CONTROL_RECOVERY_FILE: &str = "pending-remote-control-recovery.json";
 
 pub fn default_app_state_dir() -> PathBuf {
@@ -33,6 +34,10 @@ pub fn default_diagnostic_log_path() -> PathBuf {
 
 pub fn default_pending_provider_import_path() -> PathBuf {
     default_app_state_dir().join(PENDING_PROVIDER_IMPORT_FILE)
+}
+
+pub fn default_pending_session_share_path() -> PathBuf {
+    default_app_state_dir().join(PENDING_SESSION_SHARE_FILE)
 }
 
 /// 官方账号保险库与密钥材料保存在应用状态目录中，避免写入 Codex HOME。

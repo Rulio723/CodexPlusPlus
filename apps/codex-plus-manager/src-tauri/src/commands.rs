@@ -247,6 +247,20 @@ pub struct LocalSessionsPayload {
     pub offset: usize,
     pub limit: usize,
     pub has_more: bool,
+    pub total_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionImportPayload {
+    pub session_id: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingSessionSharePayload {
+    pub url: Option<String>,
 }
 
 const DEFAULT_LOCAL_SESSIONS_PAGE_SIZE: usize = 50;
@@ -2490,9 +2504,18 @@ pub fn list_local_sessions(
     let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
     let db_paths = codex_plus_core::codex_sqlite::codex_session_db_paths_from_home(&home);
     let mut sessions = Vec::new();
+    let mut session_ids = std::collections::HashSet::new();
     let mut errors = Vec::new();
     for db_path in &db_paths {
         let adapter = local_session_adapter(db_path);
+        match adapter.list_local_session_ids() {
+            Ok(ids) => session_ids.extend(ids),
+            Err(error) if db_path.exists() => {
+                errors.push(format!("{}: {error}", db_path.to_string_lossy()));
+                continue;
+            }
+            Err(_) => continue,
+        }
         match adapter.list_local_sessions_limited(fetch_limit) {
             Ok(mut items) => sessions.append(&mut items),
             Err(error) if db_path.exists() => {
@@ -2524,6 +2547,7 @@ pub fn list_local_sessions(
         offset,
         limit,
         has_more,
+        total_count: session_ids.len(),
     };
     let page = offset / limit + 1;
     if errors.is_empty() {
@@ -2623,6 +2647,86 @@ pub async fn import_session_archive(
         ),
         Ok(Err(error)) => failed(&format!("导入会话失败：{error:#}"), Default::default()),
         Err(error) => failed(&format!("导入会话任务失败：{error}"), Default::default()),
+    }
+}
+
+#[tauri::command]
+pub fn import_local_session(path: String) -> CommandResult<SessionImportPayload> {
+    let source_path = PathBuf::from(path.trim());
+    if source_path.as_os_str().is_empty() {
+        return failed(
+            "请选择要导入的会话文件。",
+            SessionImportPayload {
+                session_id: String::new(),
+                title: String::new(),
+            },
+        );
+    }
+    let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+    match codex_plus_core::session_share::import_rollout_file(&home, &source_path) {
+        Ok(result) => ok(
+            "会话已导入 Codex++。请刷新会话列表；如果仍未显示，请重启 Codex。",
+            SessionImportPayload {
+                session_id: result
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                title: result
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("导入的会话")
+                    .to_string(),
+            },
+        ),
+        Err(error) => failed(
+            &format!("导入会话失败：{error}"),
+            SessionImportPayload {
+                session_id: String::new(),
+                title: String::new(),
+            },
+        ),
+    }
+}
+
+#[tauri::command]
+pub fn load_pending_session_share() -> CommandResult<PendingSessionSharePayload> {
+    match codex_plus_core::session_share::load_pending_session_share() {
+        Ok(url) => ok("已读取待导入会话链接。", PendingSessionSharePayload { url }),
+        Err(error) => failed(
+            &format!("读取待导入会话链接失败：{error}"),
+            PendingSessionSharePayload { url: None },
+        ),
+    }
+}
+
+#[tauri::command]
+pub async fn import_session_url(url: String) -> CommandResult<SessionImportPayload> {
+    let empty = || SessionImportPayload {
+        session_id: String::new(),
+        title: String::new(),
+    };
+    let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+    match codex_plus_core::session_share::import_shared_session_url(&home, &url).await {
+        Ok(result) => {
+            let _ = codex_plus_core::session_share::clear_pending_session_share();
+            ok(
+                "会话已导入 Codex++。请刷新会话列表；如果仍未显示，请重启 Codex。",
+                SessionImportPayload {
+                    session_id: result
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    title: result
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or("导入的会话")
+                        .to_string(),
+                },
+            )
+        }
+        Err(error) => failed(&format!("导入分享会话失败：{error}"), empty()),
     }
 }
 
@@ -3243,10 +3347,19 @@ fn is_success_sync_status(status: &codex_plus_data::ProviderSyncStatus) -> bool 
 fn provider_sync_command_result(sync: codex_plus_data::ProviderSyncResult) -> CommandResult<Value> {
     let succeeded = is_success_sync_status(&sync.status);
     let success_message = format!(
-        "供应商已同步一次：{} 个会话文件，{} 行索引，跳过 {} 个占用文件。",
+        "供应商已同步一次：{} 个会话文件，{} 行索引，跳过 {} 个占用文件。{}",
         sync.changed_session_files,
         sync.sqlite_rows_updated,
-        sync.skipped_locked_rollout_files.len()
+        sync.skipped_locked_rollout_files.len(),
+        if sync.repair_audit.catalog_only_sessions > 0 {
+            format!(
+                " 审计发现 {} 条仅存在于会话目录的记录，其中 {} 条没有可用恢复来源。",
+                sync.repair_audit.catalog_only_sessions,
+                sync.repair_audit.catalog_only_without_recovery_source,
+            )
+        } else {
+            String::new()
+        }
     );
     let failure_message = format!("历史会话修复未执行：{}", sync.message);
     let payload = json!({
@@ -3262,6 +3375,7 @@ fn provider_sync_command_result(sync: codex_plus_data::ProviderSyncResult) -> Co
         "sqliteCatalogRowsRemoved": sync.sqlite_catalog_rows_removed,
         "updatedWorkspaceRoots": sync.updated_workspace_roots,
         "encryptedContentWarning": sync.encrypted_content_warning,
+        "repairAudit": sync.repair_audit,
         "backupDir": sync.backup_dir,
         "syncMessage": sync.message,
     });
@@ -5867,6 +5981,7 @@ mod tests {
             sqlite_catalog_rows_removed: 0,
             updated_workspace_roots: 0,
             encrypted_content_warning: None,
+            repair_audit: codex_plus_data::ProviderSyncAudit::default(),
         }
     }
 
@@ -6626,6 +6741,7 @@ mod tests {
 
         assert_eq!(result.status, "ok");
         assert_eq!(result.payload.sessions.len(), 1);
+        assert_eq!(result.payload.total_count, 1);
         assert_eq!(result.payload.sessions[0].id, "t1");
         assert_eq!(result.payload.sessions[0].title, "Legacy Copy");
         assert_eq!(
@@ -6650,6 +6766,7 @@ mod tests {
         assert_eq!(first_page.payload.sessions[0].id, "t2");
         assert_eq!(first_page.payload.sessions[1].id, "t1");
         assert!(first_page.payload.has_more);
+        assert_eq!(first_page.payload.total_count, 3);
 
         let second_page = list_local_sessions(Some(ListLocalSessionsRequest {
             offset: 2,
@@ -6660,6 +6777,7 @@ mod tests {
         assert_eq!(second_page.payload.sessions.len(), 1);
         assert_eq!(second_page.payload.sessions[0].id, "t3");
         assert!(!second_page.payload.has_more);
+        assert_eq!(second_page.payload.total_count, 3);
     }
 
     #[test]

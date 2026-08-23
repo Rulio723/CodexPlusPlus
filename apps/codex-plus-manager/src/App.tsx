@@ -485,6 +485,16 @@ type LocalSessionsResult = CommandResult<{
   offset: number;
   limit: number;
   hasMore: boolean;
+  totalCount: number;
+}>;
+
+type SessionImportResult = CommandResult<{
+  sessionId: string;
+  title: string;
+}>;
+
+type PendingSessionShareResult = CommandResult<{
+  url: string | null;
 }>;
 
 type SessionPathMapping = {
@@ -712,6 +722,12 @@ type ProviderSyncPayload = {
   updatedWorkspaceRoots?: number;
   prunedSessionIndexEntries?: number;
   encryptedContentWarning?: string | null;
+  repairAudit?: {
+    catalogOnlySessions: number;
+    catalogOnlyWithCurrentRollout: number;
+    catalogOnlyWithBackupDatabase: number;
+    catalogOnlyWithoutRecoverySource: number;
+  };
   backupDir?: string | null;
 };
 
@@ -1093,6 +1109,7 @@ export function App() {
   const [sessionImportPreview, setSessionImportPreview] = useState<SessionArchivePreviewResult | null>(null);
   const [sessionImportError, setSessionImportError] = useState("");
   const [sessionTransferBusy, setSessionTransferBusy] = useState(false);
+  const [sessionShareUrl, setSessionShareUrl] = useState("");
   const [zedRemoteProjects, setZedRemoteProjects] = useState<ZedRemoteProjectsResult | null>(null);
   const [liveContextEntries, setLiveContextEntries] = useState<CodexContextEntries | null>(null);
   const [skillInventory, setSkillInventory] = useState<SkillInventoryResult | null>(null);
@@ -1540,6 +1557,51 @@ export function App() {
       if (!silent || !isSuccessStatus(result.status)) showResultNotice(t("会话管理"), result, { silentSuccess: true });
     }
     return result;
+  };
+
+  const importLocalSession = async () => {
+    let selected: string | string[] | null;
+    try {
+      selected = await open({
+        title: t("导入 Codex 会话"),
+        multiple: false,
+        directory: false,
+        filters: [{ name: t("会话文件"), extensions: ["jsonl", "json", "txt"] }],
+      });
+    } catch (error) {
+      showNotice(t("会话导入"), tf("打开选择器失败：{0}", [stringifyError(error)]), "failed");
+      return;
+    }
+    const path = Array.isArray(selected) ? selected[0] : selected;
+    if (!path) return;
+    const result = await run(() => call<SessionImportResult>("import_local_session", { path }));
+    if (!result) return;
+    showResultNotice(t("会话导入"), result);
+    if (isSuccessStatus(result.status)) await refreshLocalSessions(true, 0);
+  };
+
+  const refreshPendingSessionShare = async (silent = true) => {
+    const result = await run(() => call<PendingSessionShareResult>("load_pending_session_share"));
+    if (result?.url) setSessionShareUrl(result.url);
+    if (result && (!silent || !isSuccessStatus(result.status))) {
+      showResultNotice(t("会话导入"), result, { silentSuccess: true });
+    }
+    return result;
+  };
+
+  const importSessionUrl = async (value = sessionShareUrl) => {
+    const url = value.trim();
+    if (!url) {
+      showNotice(t("会话导入"), t("请粘贴 Codex++ 分享链接。"), "failed");
+      return;
+    }
+    const result = await run(() => call<SessionImportResult>("import_session_url", { url }));
+    if (!result) return;
+    showResultNotice(t("会话导入"), result);
+    if (isSuccessStatus(result.status)) {
+      setSessionShareUrl("");
+      await refreshLocalSessions(true, 0);
+    }
   };
 
   const refreshZedRemoteProjects = async (silent = false) => {
@@ -3081,6 +3143,7 @@ export function App() {
       await refreshEnvConflicts(true);
       await refreshProviderSyncTargets(true);
       await refreshPendingProviderImport(true);
+      await refreshPendingSessionShare(true);
       await refreshRemotePluginMarketplace(true);
     })();
   }, []);
@@ -3099,6 +3162,7 @@ export function App() {
   useEffect(() => {
     const timer = window.setInterval(() => {
       void refreshPendingProviderImport(true);
+      void refreshPendingSessionShare(true);
     }, 1200);
     return () => window.clearInterval(timer);
   }, []);
@@ -3387,6 +3451,10 @@ export function App() {
       setUserScriptEnabled,
       deleteUserScript,
       refreshLocalSessions,
+      importLocalSession,
+      importSessionUrl,
+      sessionShareUrl,
+      setSessionShareUrl,
       deleteLocalSession,
       deleteLocalSessions,
       exportSessionArchive,
@@ -3432,7 +3500,7 @@ export function App() {
       disableWatcher: () => watcherAction("disable_watcher"),
       toggleTheme: () => setTheme((current) => (current === "dark" ? "light" : "dark")),
     }),
-    [route, launchForm, settingsForm, settings, overview, removeOwnedData, update, updateInstallProgress.active, officialAccountBusy, logs, diagnostics, theme, relayFiles, localSessions, zedRemoteProjects, selectedProviderSyncTarget, envConflicts, relayEnvironment, ccsProviders, sessionImportPreview, sessionImportError, sessionTransferBusy, skillOperationBusy, dreamSkinLibrary, dreamSkinMarket, selectedDreamSkinTheme, savedDreamSkinThemeDraft, dreamSkinThemeDraft, dreamSkinDraftDirty, pendingDreamSkinRestart],
+    [route, launchForm, settingsForm, settings, overview, removeOwnedData, update, updateInstallProgress.active, officialAccountBusy, logs, diagnostics, theme, relayFiles, localSessions, sessionShareUrl, importSessionUrl, zedRemoteProjects, selectedProviderSyncTarget, envConflicts, relayEnvironment, ccsProviders, sessionImportPreview, sessionImportError, sessionTransferBusy, skillOperationBusy, dreamSkinLibrary, dreamSkinMarket, selectedDreamSkinTheme, savedDreamSkinThemeDraft, dreamSkinThemeDraft, dreamSkinDraftDirty, pendingDreamSkinRestart],
   );
   const hasUpdate = update?.updateAvailable === true;
 
@@ -3799,6 +3867,10 @@ type Actions = {
   setUserScriptEnabled: (key: string, enabled: boolean) => Promise<void>;
   deleteUserScript: (key: string) => Promise<void>;
   refreshLocalSessions: (silent?: boolean, offset?: number) => Promise<LocalSessionsResult | null>;
+  importLocalSession: () => Promise<void>;
+  importSessionUrl: (url?: string) => Promise<void>;
+  sessionShareUrl: string;
+  setSessionShareUrl: (url: string) => void;
   deleteLocalSession: (session: LocalSession) => Promise<void>;
   deleteLocalSessions: (sessions: LocalSession[]) => Promise<void>;
   exportSessionArchive: (sessionIds: string[]) => Promise<void>;
@@ -4279,7 +4351,7 @@ function WeixinConnectScreen({
                     type="button"
                     variant="secondary"
                   >
-                    <PackageOpen className="h-4 w-4" />
+                    <FileUp className="h-4 w-4" />
                     {t("使用桌面版内置 CLI")}
                   </Button>
                   <Button onClick={onChooseCodexPath} size="icon" title={t("选择 Codex CLI")} type="button" variant="outline">
@@ -6026,6 +6098,7 @@ function SessionsScreen({
   const hasNextPage = sessions?.hasMore === true;
   const activeCount = items.filter((item) => !item.archived).length;
   const archivedCount = items.length - activeCount;
+  const totalCount = sessions?.totalCount ?? items.length;
   const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(() => new Set());
   const [selectionMode, setSelectionMode] = useState(false);
   const [bulkDeleting, setBulkDeleting] = useState(false);
@@ -6080,6 +6153,10 @@ function SessionsScreen({
         <CardContent className="sessions-overview-content">
           <div className="session-summary-bar">
             <div>
+              <span>{t("会话总数")}</span>
+              <strong>{tf("{0} 个", [totalCount])}</strong>
+            </div>
+            <div>
               <span>{t("当前页会话")}</span>
               <strong>{tf("{0} 个", [items.length])}</strong>
             </div>
@@ -6113,28 +6190,22 @@ function SessionsScreen({
               </select>
             </Field>
           </div>
-          <Toolbar>
-            <Button onClick={() => void actions.refreshLocalSessions()}>
-              <RefreshCw className="h-4 w-4" />
-              {t("刷新会话")}
-            </Button>
-            <Button disabled={actions.sessionTransferBusy || !items.length} onClick={() => void actions.exportSessionArchive([])} variant="outline">
-              <Download className="h-4 w-4" />
-              {actions.sessionTransferBusy ? t("正在处理…") : t("导出全部")}
-            </Button>
-            <Button disabled={actions.sessionTransferBusy} onClick={() => void actions.chooseSessionArchive()} variant="outline">
-              <Upload className="h-4 w-4" />
-              {t("导入会话包")}
-            </Button>
-            <Button disabled={providerSyncProgress.active} onClick={() => void actions.syncProvidersNow()} variant="outline">
-              <RefreshCw className="h-4 w-4" />
-              {providerSyncProgress.active ? t("正在修复…") : t("立刻修复历史会话")}
-            </Button>
-          </Toolbar>
-          <div className="provider-sync-progress" data-active={providerSyncProgress.active}>
-            <div className="provider-sync-progress-head">
-              <strong>{providerSyncProgress.active ? t("正在修复历史会话") : t("历史会话修复进度")}</strong>
-              <span>{providerSyncProgress.percent}%</span>
+          <div className="session-repair-tools">
+            <label className="switch-row compact session-auto-repair">
+              <input checked={form.providerSyncEnabled} onChange={(event) => onFormChange({ ...form, providerSyncEnabled: event.currentTarget.checked })} type="checkbox" />
+              <span><strong>{t("启动前自动修复历史会话")}</strong><small>{t("启动 Codex 前整理旧对话的归属标记。")}</small></span><ToggleVisual />
+            </label>
+            <div className="session-repair-actions">
+              <Button onClick={() => void actions.refreshLocalSessions()} variant="outline"><RefreshCw className="h-4 w-4" />{t("刷新会话")}</Button>
+              <Button onClick={() => void actions.importLocalSession()} variant="outline"><FileUp className="h-4 w-4" />{t("导入文件")}</Button>
+              <Button disabled={actions.sessionTransferBusy || !items.length} onClick={() => void actions.exportSessionArchive([])} variant="outline"><Download className="h-4 w-4" />{actions.sessionTransferBusy ? t("正在处理…") : t("导出全部")}</Button>
+              <Button disabled={actions.sessionTransferBusy} onClick={() => void actions.chooseSessionArchive()} variant="outline"><Upload className="h-4 w-4" />{t("导入会话包")}</Button>
+              <Button disabled={providerSyncProgress.active} onClick={() => void actions.syncProvidersNow()} variant="outline"><Wrench className="h-4 w-4" />{providerSyncProgress.active ? t("正在修复…") : t("修复历史会话")}</Button>
+              <Button onClick={() => void actions.saveSettings()}><Save className="h-4 w-4" />{t("保存设置")}</Button>
+            </div>
+            <div className="session-share-import">
+              <Input aria-label={t("会话分享链接")} onChange={(event) => actions.setSessionShareUrl(event.currentTarget.value)} placeholder={t("粘贴 Codex++ 会话分享链接")} value={actions.sessionShareUrl} />
+              <Button disabled={!actions.sessionShareUrl.trim()} onClick={() => void actions.importSessionUrl()} variant="outline"><Download className="h-4 w-4" />{t("导入链接")}</Button>
             </div>
           </div>
 
@@ -6165,21 +6236,6 @@ function SessionsScreen({
             <Info className="h-4 w-4" />
             <span>{t("导入或导出会话迁移包前必须完全退出 Codex；迁移包包含完整对话和本地项目路径，但不包含账号、API Key 或项目源码。")}</span>
           </div>
-          <label className="switch-row">
-            <input
-              checked={form.providerSyncEnabled}
-              onChange={(event) => onFormChange({ ...form, providerSyncEnabled: event.currentTarget.checked })}
-              type="checkbox"
-            />
-            <span>
-              <strong>{t("启动前自动修复历史会话")}</strong>
-              <small>{t("开启后，通过 Codex++ 启动 Codex 前自动整理一次旧对话的归属标记。")}</small>
-            </span>
-            <ToggleVisual />
-          </label>
-          <Toolbar>
-            <Button onClick={() => void actions.saveSettings()}>{t("保存自动修复设置")}</Button>
-          </Toolbar>
         </CardContent>
       </Panel>
       <Panel className="sessions-list-panel">
@@ -10253,7 +10309,7 @@ function withGeneratedRelayFiles(profile: RelayProfile): RelayProfile {
   }
   return {
     ...profile,
-    configContents: buildRelayConfigToml(profile, { includeBearerToken: false, requiresOpenAiAuth: false }),
+    configContents: buildRelayConfigToml(profile, { includeBearerToken: false, requiresOpenAiAuth: true }),
     authContents: buildRelayAuthJson(profile),
   };
 }

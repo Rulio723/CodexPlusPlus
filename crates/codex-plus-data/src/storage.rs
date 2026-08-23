@@ -3,7 +3,7 @@ use codex_plus_core::models::{DeleteResult, DeleteStatus, SessionRef};
 use rusqlite::types::{ToSqlOutput, Value as SqlValue, ValueRef};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, ToSql};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
@@ -24,8 +24,9 @@ pub fn delete_local_from_paths(
     let mut backup_tokens = Vec::new();
     for db_path in db_paths {
         let adapter = match codex_home {
-            Some(home) => SQLiteStorageAdapter::new(db_path, backup_store.clone())
-                .with_codex_home(home),
+            Some(home) => {
+                SQLiteStorageAdapter::new(db_path, backup_store.clone()).with_codex_home(home)
+            }
             None => SQLiteStorageAdapter::new(db_path, backup_store.clone()),
         };
         let candidate_result = adapter.delete_local(session);
@@ -78,6 +79,33 @@ enum SchemaKind {
     GenericSessions,
     CodexThreads,
     CodexAutomationRuns,
+}
+
+fn codex_thread_filter(db: &Connection) -> anyhow::Result<String> {
+    let mut subagent_filters = Vec::new();
+    if has_table(db, "thread_spawn_edges")?
+        && table_columns(db, "thread_spawn_edges")?
+            .iter()
+            .any(|column| column == "child_thread_id")
+    {
+        subagent_filters.push(
+            "NOT EXISTS (SELECT 1 FROM thread_spawn_edges e WHERE e.child_thread_id = threads.id)",
+        );
+    }
+    if has_table(db, "agent_job_items")?
+        && table_columns(db, "agent_job_items")?
+            .iter()
+            .any(|column| column == "assigned_thread_id")
+    {
+        subagent_filters.push(
+            "NOT EXISTS (SELECT 1 FROM agent_job_items j WHERE j.assigned_thread_id = threads.id)",
+        );
+    }
+    Ok(if subagent_filters.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", subagent_filters.join(" AND "))
+    })
 }
 
 fn sqlite_limit(limit: usize) -> i64 {
@@ -176,6 +204,26 @@ impl SQLiteStorageAdapter {
         }
     }
 
+    pub fn list_local_session_ids(&self) -> anyhow::Result<Vec<String>> {
+        if !self.db_path.exists() {
+            return Ok(Vec::new());
+        }
+        let db = Connection::open(&self.db_path)?;
+        let (table, id_column, filter) = match schema_kind(&db)? {
+            Some(SchemaKind::CodexThreads) => ("threads", "id", codex_thread_filter(&db)?),
+            Some(SchemaKind::CodexAutomationRuns) => (
+                "automation_runs",
+                "thread_id",
+                "WHERE COALESCE(thread_id, '') <> ''".to_string(),
+            ),
+            _ => anyhow::bail!("Unsupported local storage schema"),
+        };
+        let sql = format!("SELECT {id_column} FROM {table} {filter} ORDER BY {id_column}");
+        let mut stmt = db.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     fn list_codex_threads(
         &self,
         db: &Connection,
@@ -198,30 +246,7 @@ impl SQLiteStorageAdapter {
             "NULL"
         };
         let rollout_path = optional_column_expression(&columns, "rollout_path", "''");
-        let mut subagent_filters = Vec::new();
-        if has_table(db, "thread_spawn_edges")?
-            && table_columns(db, "thread_spawn_edges")?
-                .iter()
-                .any(|column| column == "child_thread_id")
-        {
-            subagent_filters.push(
-                "NOT EXISTS (SELECT 1 FROM thread_spawn_edges e WHERE e.child_thread_id = threads.id)",
-            );
-        }
-        if has_table(db, "agent_job_items")?
-            && table_columns(db, "agent_job_items")?
-                .iter()
-                .any(|column| column == "assigned_thread_id")
-        {
-            subagent_filters.push(
-                "NOT EXISTS (SELECT 1 FROM agent_job_items j WHERE j.assigned_thread_id = threads.id)",
-            );
-        }
-        let child_thread_filter = if subagent_filters.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", subagent_filters.join(" AND "))
-        };
+        let child_thread_filter = codex_thread_filter(db)?;
         let sql = format!(
             "SELECT id, {title}, {cwd}, {model_provider}, {archived}, {updated_at_ms}, {rollout_path}
              FROM threads
@@ -712,16 +737,16 @@ impl SQLiteStorageAdapter {
                 }
             }
         }
-        let session_index_note = self
-            .codex_home
-            .as_deref()
-            .and_then(|home| {
-                crate::provider_sync::remove_session_index_entry(home, &thread_id)
-                    .err()
-                    .map(|error| format!("session_index.jsonl 清理失败：{error}"))
-            });
+        let session_index_note = self.codex_home.as_deref().and_then(|home| {
+            crate::provider_sync::remove_session_index_entry(home, &thread_id)
+                .err()
+                .map(|error| format!("session_index.jsonl 清理失败：{error}"))
+        });
         if !file_errors.is_empty() {
-            let mut message = format!("本地数据库已删除，但文件删除失败：{}", file_errors.join("; "));
+            let mut message = format!(
+                "本地数据库已删除，但文件删除失败：{}",
+                file_errors.join("; ")
+            );
             if let Some(note) = session_index_note.as_deref() {
                 message = format!("{message}；{note}");
             }

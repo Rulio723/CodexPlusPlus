@@ -553,6 +553,7 @@ export const EN_PLAIN: Record<string, string> = {
     "Forces the Codex app's built-in zh-CN language pack to avoid falling back to English when Statsig/VPN is unreachable. Requires restarting Codex to fully apply.",
   "当前": "Current",
   "当前页会话": "Sessions on this page",
+  "会话总数": "Total sessions",
   "当前页未归档": "Active on this page",
   "当前页已归档": "Archived on this page",
   "当前 provider": "current provider",
@@ -1058,7 +1059,6 @@ export const EN_TEMPLATE: Record<string, string> = {
   "，清理 {0} 条误列的子任务侧边栏索引":
     ", removed {0} incorrectly listed subtask sidebar index entry/entries",
   "，清理 {0} 条失效任务索引": ", pruned {0} stale task index entry/entries",
-  "，补齐 {0} 条侧边栏索引": ", backfilled {0} sidebar index row(s)",
   "\n...以及另外 {0} 个会话": "\n...and {0} more session(s)",
   "{0}（{1}）": "{0} ({1})",
   "{0} · {1} 个成员": "{0} · {1} member(s)",
@@ -1186,9 +1186,6 @@ export const EN_BACKEND: Record<string, string> = {
   "脚本删除失败": "Failed to delete script",
   "只允许打开 http 或 https 链接。": "Only http or https links can be opened.",
   "已在系统浏览器打开链接。": "Link opened in system browser.",
-  "安装入口": "Install entrypoints",
-  "卸载入口": "Uninstall entrypoints",
-  "修复快捷方式": "Repair shortcuts",
   "修复后重新读取设置失败": "Failed to reload settings after repair",
   "插件市场需要初始化或注册。": "Plugin marketplace needs initialization or registration.",
   "插件市场已可用。": "Plugin marketplace is available.",
@@ -1234,7 +1231,6 @@ export const EN_BACKEND: Record<string, string> = {
   "纯 API 配置写入后未检测到完整 custom provider，请检查 config.toml 和供应商 API Key。": "After writing pure API config, no complete custom provider was detected. Please check config.toml and the provider API Key.",
   "供应商导入后重新读取设置失败": "Failed to reload settings after provider import",
   "诊断日志已写入。": "Diagnostics log written.",
-  "未命名供应商": "Unnamed provider",
   "响应内容为空": "Response is empty",
 };
 
