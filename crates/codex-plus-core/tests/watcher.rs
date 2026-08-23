@@ -7,9 +7,18 @@ use codex_plus_core::watcher::{
 
 #[cfg(windows)]
 use codex_plus_core::watcher::{
-    WindowsProcessInfo, find_codex_processes_from_snapshot,
+    WindowsProcessInfo, admin_recovery_process_ids_from_snapshot,
+    find_codex_processes_from_snapshot,
     find_session_index_cleanup_blocking_processes_from_snapshot,
+    stop_admin_recovery_processes_with_hooks, stop_windows_process_id_and_wait,
 };
+
+#[cfg(windows)]
+use std::cell::{Cell, RefCell};
+#[cfg(windows)]
+use std::collections::VecDeque;
+#[cfg(windows)]
+use std::time::Duration;
 
 #[test]
 fn cdp_listening_returns_true_for_bound_loopback_port() {
@@ -297,4 +306,378 @@ fn find_codex_processes_ignores_unrelated_processes() {
     ];
 
     assert!(find_codex_processes_from_snapshot(&processes).is_empty());
+}
+
+#[cfg(windows)]
+#[test]
+fn admin_recovery_process_filter_matches_exact_names_and_excludes_current_pid() {
+    let processes = [
+        WindowsProcessInfo {
+            process_id: 40,
+            parent_process_id: 0,
+            exe_file: "CHATGPT.EXE".to_string(),
+            executable_path: None,
+        },
+        WindowsProcessInfo {
+            process_id: 41,
+            parent_process_id: 0,
+            exe_file: "codex-plus-plus-manager.exe".to_string(),
+            executable_path: None,
+        },
+        WindowsProcessInfo {
+            process_id: 42,
+            parent_process_id: 0,
+            exe_file: "codex-plus-plus-manager.exe".to_string(),
+            executable_path: None,
+        },
+        WindowsProcessInfo {
+            process_id: 43,
+            parent_process_id: 0,
+            exe_file: "codex-plus-plus.exe".to_string(),
+            executable_path: None,
+        },
+        WindowsProcessInfo {
+            process_id: 44,
+            parent_process_id: 0,
+            exe_file: "codex-plus-plus-manager.exe.bak".to_string(),
+            executable_path: None,
+        },
+        WindowsProcessInfo {
+            process_id: 45,
+            parent_process_id: 0,
+            exe_file: "notepad.exe".to_string(),
+            executable_path: None,
+        },
+        WindowsProcessInfo {
+            process_id: 46,
+            parent_process_id: 0,
+            exe_file: "codex-plus-recovery.exe".to_string(),
+            executable_path: None,
+        },
+        WindowsProcessInfo {
+            process_id: 47,
+            parent_process_id: 0,
+            exe_file: "codex-plus-admin-shim.exe".to_string(),
+            executable_path: None,
+        },
+    ];
+
+    assert_eq!(
+        admin_recovery_process_ids_from_snapshot(&processes, 46),
+        vec![43, 41, 42, 47, 40]
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn strict_windows_process_stop_terminates_exact_temporary_pid() {
+    let mut child = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 30",
+        ])
+        .spawn()
+        .expect("spawn harmless temporary process");
+    let process_id = child.id();
+
+    let result = stop_windows_process_id_and_wait(process_id);
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    result.expect("terminate and wait for exact temporary process");
+    assert!(child.try_wait().expect("reap temporary process").is_some());
+}
+
+#[cfg(windows)]
+#[test]
+fn strict_windows_process_stop_accepts_natural_exit_before_termination() {
+    let mut child = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "exit 0",
+        ])
+        .spawn()
+        .expect("spawn short-lived temporary process");
+    let process_id = child.id();
+    child.wait().expect("wait for temporary process to exit");
+
+    stop_windows_process_id_and_wait(process_id)
+        .expect("a target that exited before termination is already stopped");
+}
+
+#[cfg(windows)]
+#[test]
+fn strict_windows_process_stop_releases_running_exe_for_overwrite() {
+    let system_exe = std::env::var_os("WINDIR")
+        .map(std::path::PathBuf::from)
+        .expect("Windows directory")
+        .join("System32")
+        .join("ping.exe");
+    assert!(
+        system_exe.is_file(),
+        "trusted system fixture exists: {system_exe:?}"
+    );
+
+    let temp_dir = tempfile::tempdir().expect("temporary fixture directory");
+    let target_exe = temp_dir.path().join("codex-plus-plus-manager.exe");
+    std::fs::copy(&system_exe, &target_exe).expect("stage trusted system fixture");
+    let expected_bytes = std::fs::read(&system_exe).expect("read trusted system fixture");
+
+    let mut child = std::process::Command::new(&target_exe)
+        .args(["-t", "127.0.0.1"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn copied executable fixture");
+    let process_id = child.id();
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        child
+            .try_wait()
+            .expect("check copied executable fixture")
+            .is_none(),
+        "copied executable fixture must remain running"
+    );
+
+    let locked_overwrite = std::fs::copy(&system_exe, &target_exe);
+    let stop_result = stop_windows_process_id_and_wait(process_id);
+    if stop_result.is_err() {
+        let _ = child.kill();
+    }
+    stop_result.expect("stop copied executable fixture");
+    assert!(
+        child
+            .try_wait()
+            .expect("reap copied executable fixture")
+            .is_some(),
+        "stopped copied executable fixture must exit"
+    );
+
+    assert!(
+        locked_overwrite.is_err(),
+        "running executable image should reject overwrite"
+    );
+    std::fs::copy(&system_exe, &target_exe).expect("overwrite released executable image");
+    assert_eq!(
+        std::fs::read(&target_exe).expect("read overwritten executable image"),
+        expected_bytes
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn strict_windows_process_stop_rejects_current_and_invalid_pid() {
+    let current_process_id = std::process::id();
+    assert!(stop_windows_process_id_and_wait(current_process_id).is_err());
+    assert!(stop_windows_process_id_and_wait(0).is_err());
+    assert_eq!(std::process::id(), current_process_id);
+}
+
+#[cfg(windows)]
+fn recovery_fixture_process(process_id: u32, exe_file: &str) -> WindowsProcessInfo {
+    WindowsProcessInfo {
+        process_id,
+        parent_process_id: 0,
+        exe_file: exe_file.to_string(),
+        executable_path: None,
+    }
+}
+
+#[cfg(windows)]
+fn recovery_fixture_snapshot(
+    current_process_id: u32,
+    targets: &[(u32, &str)],
+) -> Vec<WindowsProcessInfo> {
+    let mut snapshot = vec![recovery_fixture_process(
+        current_process_id,
+        "watcher-test.exe",
+    )];
+    snapshot.extend(
+        targets
+            .iter()
+            .map(|(process_id, exe_file)| recovery_fixture_process(*process_id, exe_file)),
+    );
+    snapshot
+}
+
+#[cfg(windows)]
+#[test]
+fn admin_recovery_retries_a_failed_termination_on_the_next_round() {
+    let current_process_id = std::process::id();
+    let mut snapshots = VecDeque::from([
+        recovery_fixture_snapshot(current_process_id, &[(101, "codex-plus-plus.exe")]),
+        recovery_fixture_snapshot(current_process_id, &[(101, "codex-plus-plus.exe")]),
+        recovery_fixture_snapshot(current_process_id, &[]),
+        recovery_fixture_snapshot(current_process_id, &[]),
+    ]);
+    let calls = RefCell::new(Vec::new());
+    let attempts = Cell::new(0);
+
+    let result = stop_admin_recovery_processes_with_hooks(
+        current_process_id,
+        move || snapshots.pop_front().expect("scripted recovery snapshot"),
+        |process_id| {
+            calls.borrow_mut().push(process_id);
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            attempt >= 2
+        },
+        |_| {},
+        || Duration::ZERO,
+        Duration::from_secs(1),
+    );
+
+    assert!(
+        result.is_ok(),
+        "recovery should retry a transient termination failure"
+    );
+    assert_eq!(&*calls.borrow(), &[101, 101]);
+}
+
+#[cfg(windows)]
+#[test]
+fn admin_recovery_treats_a_pid_that_disappears_before_retry_as_success() {
+    let current_process_id = std::process::id();
+    let mut snapshots = VecDeque::from([
+        recovery_fixture_snapshot(current_process_id, &[(102, "codex-plus-plus.exe")]),
+        recovery_fixture_snapshot(current_process_id, &[]),
+        recovery_fixture_snapshot(current_process_id, &[]),
+    ]);
+    let calls = RefCell::new(Vec::new());
+
+    let result = stop_admin_recovery_processes_with_hooks(
+        current_process_id,
+        move || snapshots.pop_front().expect("scripted recovery snapshot"),
+        |process_id| {
+            calls.borrow_mut().push(process_id);
+            false
+        },
+        |_| {},
+        || Duration::ZERO,
+        Duration::from_secs(1),
+    );
+
+    assert!(
+        result.is_ok(),
+        "a naturally exited target is already stopped"
+    );
+    assert_eq!(&*calls.borrow(), &[102]);
+}
+
+#[cfg(windows)]
+#[test]
+fn admin_recovery_captures_a_restarted_target_with_a_new_pid() {
+    let current_process_id = std::process::id();
+    let mut snapshots = VecDeque::from([
+        recovery_fixture_snapshot(current_process_id, &[(103, "codex-plus-plus.exe")]),
+        recovery_fixture_snapshot(current_process_id, &[(104, "codex-plus-plus.exe")]),
+        recovery_fixture_snapshot(current_process_id, &[]),
+        recovery_fixture_snapshot(current_process_id, &[]),
+    ]);
+    let calls = RefCell::new(Vec::new());
+
+    let result = stop_admin_recovery_processes_with_hooks(
+        current_process_id,
+        move || snapshots.pop_front().expect("scripted recovery snapshot"),
+        |process_id| {
+            calls.borrow_mut().push(process_id);
+            true
+        },
+        |_| {},
+        || Duration::ZERO,
+        Duration::from_secs(1),
+    );
+
+    assert!(
+        result.is_ok(),
+        "recovery should stop a restarted target too"
+    );
+    assert_eq!(&*calls.borrow(), &[103, 104]);
+}
+
+#[cfg(windows)]
+#[test]
+fn admin_recovery_requires_two_consecutive_empty_rounds() {
+    let current_process_id = std::process::id();
+    let mut snapshots = VecDeque::from([
+        recovery_fixture_snapshot(current_process_id, &[]),
+        recovery_fixture_snapshot(current_process_id, &[]),
+    ]);
+    let rounds = std::rc::Rc::new(Cell::new(0));
+    let rounds_for_enumerator = rounds.clone();
+    let sleeps = Cell::new(0);
+
+    let result = stop_admin_recovery_processes_with_hooks(
+        current_process_id,
+        move || {
+            rounds_for_enumerator.set(rounds_for_enumerator.get() + 1);
+            snapshots
+                .pop_front()
+                .expect("scripted empty recovery snapshot")
+        },
+        |_| panic!("empty rounds must not terminate a process"),
+        |_| sleeps.set(sleeps.get() + 1),
+        || Duration::ZERO,
+        Duration::from_secs(1),
+    );
+
+    assert!(result.is_ok());
+    assert_eq!(rounds.get(), 2);
+    assert_eq!(sleeps.get(), 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn admin_recovery_returns_timeout_error_for_a_persistent_target() {
+    let current_process_id = std::process::id();
+    let calls = RefCell::new(Vec::new());
+    let elapsed_ticks = Cell::new(0);
+
+    let result = stop_admin_recovery_processes_with_hooks(
+        current_process_id,
+        move || recovery_fixture_snapshot(current_process_id, &[(105, "codex-plus-plus.exe")]),
+        |process_id| {
+            calls.borrow_mut().push(process_id);
+            false
+        },
+        |_| {},
+        || {
+            let tick = elapsed_ticks.get() + 1;
+            elapsed_ticks.set(tick);
+            Duration::from_millis(tick)
+        },
+        Duration::from_millis(3),
+    );
+
+    let error = result.expect_err("persistent target must hit the injected timeout");
+    assert!(error.to_string().contains("timed out"));
+    assert!(error.to_string().contains("105"));
+    assert!(calls.borrow().len() >= 3);
+}
+
+#[cfg(windows)]
+#[test]
+fn force_termination_fallback_uses_absolute_pid_taskkill_without_tree_kill() {
+    let source = include_str!("../src/watcher.rs");
+    let start = source
+        .find("fn force_terminate_process")
+        .expect("force termination helper");
+    let body = source[start..]
+        .split("/// Select only the exact image names")
+        .next()
+        .expect("force termination helper body");
+
+    assert!(body.contains("if !system_root.is_absolute()"));
+    assert!(body.contains(".join(\"System32\")"));
+    assert!(body.contains(".join(\"taskkill.exe\")"));
+    assert!(body.contains(".args([\"/PID\", process_id_arg.as_str(), \"/F\"])"));
+    assert!(body.contains(".creation_flags(CREATE_NO_WINDOW)"));
+    assert!(!body.contains("/T"));
 }

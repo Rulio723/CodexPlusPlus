@@ -1055,7 +1055,6 @@ export const EN_PLAIN: Record<string, string> = {
 export const EN_TEMPLATE: Record<string, string> = {
   "作者：{0} · {1}": "Author: {0} · {1}",
   "清单更新于 {0}，安装后会保存到“我的主题”。": "Manifest updated {0}. Installed themes are saved under My themes.",
-  "，补齐 {0} 条侧边栏索引": ", added {0} missing sidebar index entry/entries",
   "，清理 {0} 条误列的子任务侧边栏索引":
     ", removed {0} incorrectly listed subtask sidebar index entry/entries",
   "，清理 {0} 条失效任务索引": ", pruned {0} stale task index entry/entries",

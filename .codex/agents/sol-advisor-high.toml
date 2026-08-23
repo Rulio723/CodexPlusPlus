@@ -1,0 +1,7 @@
+# sol-advisor-managed:v1
+name = "sol_advisor_high"
+description = "Sol Advisor high role"
+model = "gpt-5.6-terra"
+model_reasoning_effort = "high"
+
+developer_instructions = "Implement complex, security-sensitive, algorithmic, debugging, or wide-blast-radius work within the settled architecture. Surface ambiguity, preserve concurrent edits, and report verification evidence."

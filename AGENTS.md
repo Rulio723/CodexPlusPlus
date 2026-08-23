@@ -58,3 +58,11 @@
 - feature 分支命名：`codex/per-model-context` 或类似
 - 定期 `git fetch upstream && git rebase upstream/main` 保持同步
 - 目标：全栈完成后向主仓提 PR 合并
+
+## 项目持久记忆（2026-08-22）
+
+当前 Windows 安装器的必须保留行为与发布证据记录在：
+
+- `docs/PROJECT_MEMORY_2026-08-22.md`
+
+后续 agent 在处理 Windows 安装、更新、恢复或进程结束逻辑前，必须先读取该文件。不得将当前“提升权限后循环强制结束占用进程”回退为单次 `taskkill`、Medium token 结束进程或一次失败即放弃的实现。

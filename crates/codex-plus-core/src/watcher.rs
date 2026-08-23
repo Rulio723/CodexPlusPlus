@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 #[cfg(any(windows, target_os = "macos"))]
 use std::process::{Command, Stdio};
@@ -151,6 +153,249 @@ pub fn process_ids_still_running(
         .into_iter()
         .filter(|process_id| expected.contains(process_id))
         .collect()
+}
+
+#[cfg(windows)]
+const ADMIN_RECOVERY_PROCESS_IMAGE_NAMES: [&str; 5] = [
+    "codex-plus-plus.exe",
+    "codex-plus-plus-manager.exe",
+    "codex-plus-recovery.exe",
+    "codex-plus-admin-shim.exe",
+    "ChatGPT.exe",
+];
+
+#[cfg(windows)]
+const ADMIN_RECOVERY_STOP_WAIT_TIMEOUT_MS: u64 = 30_000;
+
+#[cfg(windows)]
+const ADMIN_RECOVERY_STOP_WAIT_INTERVAL_MS: u64 = 150;
+
+#[cfg(windows)]
+const ADMIN_RECOVERY_EMPTY_ROUNDS_REQUIRED: usize = 2;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(windows)]
+fn force_terminate_process(process_id: u32) -> bool {
+    if process_id == 0 || process_id == std::process::id() {
+        return false;
+    }
+    if crate::windows_integration::terminate_process(process_id) {
+        return true;
+    }
+
+    let Some(system_root) = std::env::var_os("SystemRoot") else {
+        return false;
+    };
+    let system_root = PathBuf::from(system_root);
+    if !system_root.is_absolute() {
+        return false;
+    }
+    let taskkill_path = system_root.join("System32").join("taskkill.exe");
+    let process_id_arg = process_id.to_string();
+    Command::new(taskkill_path)
+        .args(["/PID", process_id_arg.as_str(), "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Select only the exact image names that can block an administrator-mode update.
+/// The recovery launcher itself is excluded by process id, and results are ordered
+/// so launcher/watchdog processes are terminated before their dependants.
+#[cfg(windows)]
+pub fn admin_recovery_process_ids_from_snapshot(
+    processes: &[WindowsProcessInfo],
+    current_process_id: u32,
+) -> Vec<u32> {
+    let mut priorities: HashMap<u32, usize> = HashMap::new();
+    for process in processes {
+        if process.process_id == current_process_id {
+            continue;
+        }
+        let Some(priority) = ADMIN_RECOVERY_PROCESS_IMAGE_NAMES
+            .iter()
+            .position(|name| process.exe_file.eq_ignore_ascii_case(name))
+        else {
+            continue;
+        };
+        priorities
+            .entry(process.process_id)
+            .and_modify(|existing| *existing = (*existing).min(priority))
+            .or_insert(priority);
+    }
+    let mut ordered = priorities.into_iter().collect::<Vec<_>>();
+    ordered.sort_unstable_by_key(|(process_id, priority)| (*priority, *process_id));
+    ordered
+        .into_iter()
+        .map(|(process_id, _)| process_id)
+        .collect()
+}
+
+#[cfg(windows)]
+fn usable_admin_recovery_snapshot(
+    processes: &[WindowsProcessInfo],
+    current_process_id: u32,
+) -> anyhow::Result<()> {
+    if processes.is_empty()
+        || !processes
+            .iter()
+            .any(|process| process.process_id == current_process_id)
+    {
+        anyhow::bail!(
+            "administrator recovery process enumeration was unavailable or omitted the current process"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn stop_processes_with_hooks<E, T, S, N, F>(
+    current_process_id: u32,
+    mut enumerate: E,
+    mut terminate: T,
+    mut sleep: S,
+    mut elapsed: N,
+    timeout: Duration,
+    select_process_ids: F,
+    allow_initial_empty: bool,
+    description: &str,
+) -> anyhow::Result<()>
+where
+    E: FnMut() -> Vec<WindowsProcessInfo>,
+    T: FnMut(u32) -> bool,
+    S: FnMut(Duration),
+    N: FnMut() -> Duration,
+    F: Fn(&[WindowsProcessInfo], u32) -> Vec<u32>,
+{
+    let mut observed_target = false;
+    let mut empty_rounds = 0;
+    let mut remaining = Vec::new();
+    let mut failed_terminations = Vec::new();
+
+    loop {
+        let snapshot = enumerate();
+        usable_admin_recovery_snapshot(&snapshot, current_process_id)?;
+        let process_ids = select_process_ids(&snapshot, current_process_id);
+        if process_ids.is_empty() {
+            remaining.clear();
+            failed_terminations.clear();
+            if !observed_target && allow_initial_empty {
+                return Ok(());
+            }
+            empty_rounds += 1;
+            if empty_rounds >= ADMIN_RECOVERY_EMPTY_ROUNDS_REQUIRED {
+                return Ok(());
+            }
+        } else {
+            observed_target = true;
+            empty_rounds = 0;
+            remaining = process_ids.clone();
+            failed_terminations.clear();
+            for process_id in process_ids {
+                if process_id == 0 || process_id == current_process_id {
+                    anyhow::bail!(
+                        "refusing to terminate invalid or current process id {process_id}"
+                    );
+                }
+                if !terminate(process_id) {
+                    failed_terminations.push(process_id);
+                }
+            }
+        }
+
+        if elapsed() >= timeout {
+            if remaining.is_empty() && empty_rounds < ADMIN_RECOVERY_EMPTY_ROUNDS_REQUIRED {
+                continue;
+            }
+            anyhow::bail!(
+                "{description} termination timed out; remaining process ids: {remaining:?}; last failed termination ids: {failed_terminations:?}"
+            );
+        }
+        sleep(Duration::from_millis(ADMIN_RECOVERY_STOP_WAIT_INTERVAL_MS));
+    }
+}
+
+#[cfg(windows)]
+fn stop_process_ids_and_wait(process_id: u32) -> anyhow::Result<()> {
+    let current_process_id = std::process::id();
+    if process_id == 0 || process_id == current_process_id {
+        anyhow::bail!("refusing to terminate invalid or current process id {process_id}");
+    }
+    let started = std::time::Instant::now();
+    stop_processes_with_hooks(
+        current_process_id,
+        crate::windows_integration::enumerate_processes,
+        force_terminate_process,
+        std::thread::sleep,
+        move || started.elapsed(),
+        Duration::from_millis(ADMIN_RECOVERY_STOP_WAIT_TIMEOUT_MS),
+        |snapshot, _| {
+            snapshot
+                .iter()
+                .any(|process| process.process_id == process_id)
+                .then_some(vec![process_id])
+                .unwrap_or_default()
+        },
+        true,
+        "exact process",
+    )
+}
+
+/// Strict exact-PID stop-and-wait seam used by recovery and Windows tests.
+#[cfg(windows)]
+pub fn stop_windows_process_id_and_wait(process_id: u32) -> anyhow::Result<()> {
+    stop_process_ids_and_wait(process_id)
+}
+
+/// Deterministic hook seam for Windows recovery-loop tests.
+#[doc(hidden)]
+#[cfg(windows)]
+pub fn stop_admin_recovery_processes_with_hooks<E, T, S>(
+    current_process_id: u32,
+    enumerate: E,
+    terminate: T,
+    sleep: S,
+    elapsed: impl FnMut() -> Duration,
+    timeout: Duration,
+) -> anyhow::Result<()>
+where
+    E: FnMut() -> Vec<WindowsProcessInfo>,
+    T: FnMut(u32) -> bool,
+    S: FnMut(Duration),
+{
+    stop_processes_with_hooks(
+        current_process_id,
+        enumerate,
+        terminate,
+        sleep,
+        elapsed,
+        timeout,
+        admin_recovery_process_ids_from_snapshot,
+        false,
+        "administrator recovery process",
+    )
+}
+
+/// Repeatedly stop every exact update-blocking image after stale state is restored.
+/// Transient termination failures and newly restarted matching processes are retried;
+/// only a hard timeout with a surviving target returns an error.
+#[cfg(windows)]
+pub fn stop_admin_recovery_processes_and_wait() -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
+    stop_admin_recovery_processes_with_hooks(
+        std::process::id(),
+        crate::windows_integration::enumerate_processes,
+        force_terminate_process,
+        std::thread::sleep,
+        move || started.elapsed(),
+        Duration::from_millis(ADMIN_RECOVERY_STOP_WAIT_TIMEOUT_MS),
+    )
 }
 
 #[cfg(windows)]

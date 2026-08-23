@@ -565,10 +565,20 @@
   const codexPlusDreamSkinRevision = String(window.__CODEX_PLUS_DREAM_SKIN_REVISION__ || "1");
   window.__codexProjectMoveRuntimeId = (window.__codexProjectMoveRuntimeId || 0) + 1;
   const codexProjectMoveRuntimeId = window.__codexProjectMoveRuntimeId;
+  window.__codexCatalogOnlyVisibilityRuntimeId = (window.__codexCatalogOnlyVisibilityRuntimeId || 0) + 1;
+  const codexCatalogOnlyVisibilityRuntimeId = window.__codexCatalogOnlyVisibilityRuntimeId;
   clearTimeout(window.__codexProjectMoveProjectionTimer);
   clearTimeout(window.__codexProjectMoveChatsSortTimer);
   window.__codexProjectMoveProjectionTimer = null;
   window.__codexProjectMoveChatsSortTimer = null;
+  clearTimeout(window.__codexCatalogOnlyVisibilityTimer);
+  window.__codexCatalogOnlyVisibilityTimer = null;
+  clearTimeout(window.__codexInternalSubagentUnreadPruneTimer);
+  window.__codexInternalSubagentUnreadPruneTimer = null;
+  clearTimeout(window.__codexInternalSubagentUnreadBootstrapTimer);
+  window.__codexInternalSubagentUnreadBootstrapTimer = null;
+  (window.__codexInternalSubagentUnreadBootstrapTimers || []).forEach((timer) => clearTimeout(timer));
+  window.__codexInternalSubagentUnreadBootstrapTimers = [];
   clearTimeout(window.__codexThreadScrollSaveTimer);
   window.__codexThreadScrollSaveTimer = null;
   (window.__codexThreadScrollRestoreTimers || []).forEach((timer) => clearTimeout(timer));
@@ -5187,6 +5197,24 @@
   let cachedSessionRows = [];
   let cachedSessionRowsAt = 0;
   let threadIdBadgeActive = false;
+  const internalSubagentThreadIds = new Set();
+  let internalSubagentUnreadPruneInFlight = null;
+  let internalSubagentUnreadPruneScheduled = false;
+  let internalSubagentUnreadPruneRetryPending = false;
+  let internalSubagentUnreadPruneTimer = null;
+  let internalSubagentUnreadPruneLastSignature = "";
+  let internalSubagentUnreadBootstrapTimer = null;
+  let internalSubagentUnreadBootstrapAttempts = 0;
+
+  function allSidebarThreadRows() {
+    const rows = Array.from(document.querySelectorAll(selectors.sidebarThread));
+    let hasInternalSubagent = false;
+    rows.forEach((row) => {
+      if (syncInternalSubagentRowVisibility(row)) hasInternalSubagent = true;
+    });
+    if (hasInternalSubagent) scheduleInternalSubagentUnreadPrune();
+    return rows.filter((row) => !isInternalSubagentRow(row));
+  }
 
   function sessionRows(forceRefresh = false) {
     const now = Date.now();
@@ -5195,9 +5223,7 @@
       if (cachedSessionRows.length > 0) return cachedSessionRows;
     }
 
-    const rows = Array.from(document.querySelectorAll(selectors.sidebarThread));
-    rows.forEach(syncInternalSubagentRowVisibility);
-    cachedSessionRows = rows.filter((row) => !isInternalSubagentRow(row) && !isCatalogOnlyRow(row));
+    cachedSessionRows = allSidebarThreadRows().filter((row) => !isCatalogOnlyRow(row));
     cachedSessionRowsAt = now;
     return cachedSessionRows;
   }
@@ -5285,18 +5311,36 @@
   }
 
   function isInternalSubagentRow(row) {
+    const item = row.closest?.('[role="listitem"]') || row;
+    if (row.dataset?.codexInternalSubagentRow === "true" || item.dataset?.codexInternalSubagentRow === "true") {
+      return true;
+    }
     return reactThreadSourceFromRow(row) === "subagent";
   }
 
-  function syncInternalSubagentRowVisibility(row) {
+  function registerInternalSubagentThreadId(sessionId) {
+    const key = codexThreadStateKey(sessionId);
+    if (!key || internalSubagentThreadIds.has(key)) return false;
+    internalSubagentThreadIds.add(key);
+    scheduleInternalSubagentUnreadPrunePoll();
+    return true;
+  }
+
+  function syncInternalSubagentRowVisibility(row, catalogEntry = null) {
     const item = row.closest?.('[role="listitem"]') || row;
-    if (isInternalSubagentRow(row)) {
+    const sessionId = sessionRefFromRow(row).session_id;
+    const internalSubagent = isInternalSubagentRow(row)
+      || catalogEntry?.internal_subagent === true
+      || internalSubagentThreadIds.has(codexThreadStateKey(sessionId));
+    if (internalSubagent) {
       item.dataset.codexInternalSubagentRow = "true";
       row.dataset.codexInternalSubagentRow = "true";
-      return;
+      registerInternalSubagentThreadId(sessionId);
+      return true;
     }
     delete item.dataset.codexInternalSubagentRow;
     delete row.dataset.codexInternalSubagentRow;
+    return false;
   }
 
   function isCatalogOnlyRow(row) {
@@ -5304,11 +5348,14 @@
     return row.dataset.codexCatalogOnlyRow === "true" || item.dataset.codexCatalogOnlyRow === "true";
   }
 
-  function syncCatalogOnlyRowVisibility(row, missingFromStorage) {
+  function syncCatalogOnlyRowVisibility(row, missingFromStorage, catalogEntry = null) {
     const item = row.closest?.('[role="listitem"]') || row;
     const ref = sessionRefFromRow(row);
     const timestampMs = uuidV7TimestampMs(ref.session_id);
+    const hasCatalogSourceDetail = catalogEntry?.source_detail_present === true;
     const isStaleCatalogOnly = missingFromStorage
+      && hasCatalogSourceDetail
+      && catalogEntry?.rollout_exists === false
       && !!normalizedCodexThreadUuid(ref.session_id)
       && timestampMs > 0
       && Date.now() - timestampMs >= catalogOnlyGracePeriodMs;
@@ -5350,6 +5397,18 @@
       fromRow: sessionRefFromRow,
       threadSourceFromRow: reactThreadSourceFromRow,
       isInternalSubagentRow,
+    };
+  }
+
+  if (window.__CODEX_PLUS_TEST_UNREAD_STATE__) {
+    window.__codexPlusUnreadStateTest = {
+      stateKey: codexThreadStateKey,
+      prune: (stateValue, internalIds) => pruneInternalSubagentUnreadState(stateValue, internalIds),
+      internalIds: () => Array.from(internalSubagentThreadIds),
+      pruneFromCodex: (force = false) => pruneInternalSubagentUnreadStateFromCodex(force),
+      schedulePrune: (force = false) => scheduleInternalSubagentUnreadPrune(force),
+      classifyExisting: () => classifyExistingSidebarRows(),
+      bootstrap: () => scheduleInternalSubagentUnreadBootstrap(),
     };
   }
 
@@ -6258,7 +6317,9 @@
       return typeof module?.n === "function" ? module.n : null;
     }
     if (assetPrefix.startsWith("app-initial-")) {
-      return typeof module?.qut === "function" ? module.qut : null;
+      return typeof module?.kTt === "function"
+        ? module.kTt
+        : typeof module?.qut === "function" ? module.qut : null;
     }
     return null;
   }
@@ -6293,6 +6354,111 @@
 
   async function setCodexGlobalState(key, value) {
     return await codexStateCall("set-global-state", { params: { key, value } });
+  }
+
+  const persistedAtomStateKey = "electron-persisted-atom-state";
+  const unreadThreadIdsByHostStateKey = "unread-thread-ids-by-host-v1";
+
+  function codexThreadStateKey(value) {
+    const canonical = normalizedCodexThreadUuid(value);
+    if (canonical) return canonical.toLowerCase();
+    const raw = String(value || "").trim().replace(/^local:/i, "");
+    return raw ? raw.toLowerCase() : "";
+  }
+
+  function pruneInternalSubagentUnreadState(stateValue, internalIds = internalSubagentThreadIds) {
+    if (!stateValue || typeof stateValue !== "object" || Array.isArray(stateValue)) {
+      return { value: stateValue, changed: false };
+    }
+    const internalIdSet = internalIds instanceof Set
+      ? internalIds
+      : new Set((Array.isArray(internalIds) ? internalIds : []).map(codexThreadStateKey).filter(Boolean));
+    if (internalIdSet.size < 1) return { value: stateValue, changed: false };
+    let nextValue = stateValue;
+    let changed = false;
+    for (const [hostId, threadIds] of Object.entries(stateValue)) {
+      if (!Array.isArray(threadIds)) continue;
+      const filtered = threadIds.filter((threadId) => !internalIdSet.has(codexThreadStateKey(threadId)));
+      if (filtered.length === threadIds.length) continue;
+      if (!changed) nextValue = { ...stateValue };
+      nextValue[hostId] = filtered;
+      changed = true;
+    }
+    return { value: nextValue, changed };
+  }
+
+  function internalSubagentThreadIdSignature() {
+    return Array.from(internalSubagentThreadIds).sort().join("\n");
+  }
+
+  const internalSubagentUnreadPrunePollMs = 1_000;
+
+  async function pruneInternalSubagentUnreadStateFromCodex(force = false) {
+    const signature = internalSubagentThreadIdSignature();
+    if (!signature || (!force && signature === internalSubagentUnreadPruneLastSignature)) return false;
+    const stateValue = objectGlobalState(await getCodexGlobalState(persistedAtomStateKey));
+    const pruned = pruneInternalSubagentUnreadState(stateValue[unreadThreadIdsByHostStateKey]);
+    if (pruned.changed) {
+      await setCodexGlobalState(persistedAtomStateKey, {
+        ...stateValue,
+        [unreadThreadIdsByHostStateKey]: pruned.value,
+      });
+    }
+    internalSubagentUnreadPruneLastSignature = signature;
+    return pruned.changed;
+  }
+
+  function scheduleInternalSubagentUnreadPrune(force = false) {
+    const signature = internalSubagentThreadIdSignature();
+    if (!signature) return;
+    if (!force && signature === internalSubagentUnreadPruneLastSignature && !internalSubagentUnreadPruneRetryPending) return;
+    if (internalSubagentUnreadPruneScheduled || internalSubagentUnreadPruneInFlight) {
+      if (force || signature !== internalSubagentUnreadPruneLastSignature) {
+        internalSubagentUnreadPruneRetryPending = true;
+      }
+      return;
+    }
+    const runForce = force || internalSubagentUnreadPruneRetryPending;
+    internalSubagentUnreadPruneRetryPending = false;
+    internalSubagentUnreadPruneScheduled = true;
+    Promise.resolve().then(() => {
+      internalSubagentUnreadPruneScheduled = false;
+      internalSubagentUnreadPruneInFlight = pruneInternalSubagentUnreadStateFromCodex(runForce)
+        .catch(() => false)
+        .finally(() => {
+          internalSubagentUnreadPruneInFlight = null;
+          if (internalSubagentUnreadPruneRetryPending) scheduleInternalSubagentUnreadPrune(true);
+        });
+    });
+  }
+
+  function scheduleInternalSubagentUnreadPrunePoll() {
+    if (internalSubagentUnreadPruneTimer || internalSubagentThreadIds.size < 1) return;
+    internalSubagentUnreadPruneTimer = setTimeout(() => {
+      internalSubagentUnreadPruneTimer = null;
+      window.__codexInternalSubagentUnreadPruneTimer = null;
+      if (internalSubagentThreadIds.size < 1) return;
+      scheduleInternalSubagentUnreadPrune(true);
+      scheduleInternalSubagentUnreadPrunePoll();
+    }, internalSubagentUnreadPrunePollMs);
+    window.__codexInternalSubagentUnreadPruneTimer = internalSubagentUnreadPruneTimer;
+  }
+
+  function scheduleInternalSubagentUnreadBootstrap() {
+    if (internalSubagentUnreadBootstrapTimer || internalSubagentThreadIds.size > 0) return;
+    if (internalSubagentUnreadBootstrapAttempts >= 20) return;
+    internalSubagentUnreadBootstrapAttempts += 1;
+    internalSubagentUnreadBootstrapTimer = setTimeout(() => {
+      internalSubagentUnreadBootstrapTimer = null;
+      window.__codexInternalSubagentUnreadBootstrapTimer = null;
+      if (internalSubagentThreadIds.size > 0) return;
+      try {
+        classifyExistingSidebarRows();
+      } catch {
+      }
+      if (internalSubagentThreadIds.size < 1) scheduleInternalSubagentUnreadBootstrap();
+    }, 250);
+    window.__codexInternalSubagentUnreadBootstrapTimer = internalSubagentUnreadBootstrapTimer;
   }
 
   function dispatchCodexPlusMessage(dispatcher, type, payload) {
@@ -6973,6 +7139,10 @@
     return bareId || variants[0] || "";
   }
 
+  function projectMoveSessionKey(sessionId) {
+    return sessionKey(sessionId);
+  }
+
   function uuidV7TimestampMs(sessionId) {
     const id = sessionKey(sessionId).replaceAll("-", "");
     if (!/^[0-9a-fA-F]{12}/.test(id)) return 0;
@@ -7641,28 +7811,107 @@
         const result = await postJson("/thread-sort-keys", { sessions: refs }).catch(() => ({ status: "failed", sort_keys: [] }));
         chatsSortLastFetchAt = Date.now();
         const byId = new Map();
+        const catalogById = new Map();
         if (result?.status === "ok" && Array.isArray(result?.sort_keys)) {
           result.sort_keys.forEach((item) => {
             const key = projectMoveSessionKey(String(item?.session_id || ""));
             if (key) byId.set(key, item);
           });
         }
+        if (result?.status === "ok" && Array.isArray(result?.catalog_rows)) {
+          result.catalog_rows.forEach((item) => {
+            const key = projectMoveSessionKey(String(item?.session_id || ""));
+            if (key) catalogById.set(key, item);
+            if (item?.internal_subagent === true) {
+              registerInternalSubagentThreadId(item.session_id);
+            }
+          });
+        }
         rows.forEach((row) => {
           const ref = sessionRefFromRow(row);
           const payload = byId.get(projectMoveSessionKey(ref.session_id));
-          syncCatalogOnlyRowVisibility(row, result?.status === "ok" && !payload);
+          syncInternalSubagentRowVisibility(
+            row,
+            catalogById.get(projectMoveSessionKey(ref.session_id)),
+          );
+          syncCatalogOnlyRowVisibility(
+            row,
+            result?.status === "ok" && !payload,
+            catalogById.get(projectMoveSessionKey(ref.session_id)),
+          );
           const trustedSortMs = timestampMsFromPayload(payload);
           const sortMs = trustedSortMs || sortMsForSession(ref.session_id, row.dataset.codexProjectMoveSortMs || rowListItem(row).dataset.codexProjectMoveSortMs);
           row.dataset.codexProjectMoveSortMs = String(sortMs || 0);
           rowListItem(row).dataset.codexProjectMoveSortMs = String(sortMs || 0);
           if (trustedSortMs) updateRowTimeLabel(row, trustedSortMs);
         });
+        if (internalSubagentThreadIdSignature()) scheduleInternalSubagentUnreadPrune(true);
       }
       if (chatsSortNeedsCorrection(rows)) reorderChatsRows(rows);
       chatsSortSignature = visibleChatsRows().map((row) => projectMoveSessionKey(sessionRefFromRow(row).session_id)).join("|");
     } finally {
       chatsSortInFlight = false;
     }
+  }
+
+  let catalogOnlyVisibilityInFlight = false;
+  let catalogOnlyVisibilityLastFetchAt = 0;
+  let catalogOnlyVisibilityTimer = null;
+
+  async function applyCatalogOnlyVisibility() {
+    if (window.__codexCatalogOnlyVisibilityRuntimeId !== codexCatalogOnlyVisibilityRuntimeId) return;
+    if (catalogOnlyVisibilityInFlight) return;
+    const rows = allSidebarThreadRows();
+    if (rows.length < 1) return;
+    if (Date.now() - catalogOnlyVisibilityLastFetchAt < chatsSortDbRefreshIntervalMs) return;
+    const refs = rows.map(sessionRefFromRow).filter((ref) => ref.session_id);
+    if (refs.length < 1) return;
+    catalogOnlyVisibilityInFlight = true;
+    try {
+      const result = await postJson("/thread-sort-keys", { sessions: refs }).catch(() => ({ status: "failed" }));
+      if (window.__codexCatalogOnlyVisibilityRuntimeId !== codexCatalogOnlyVisibilityRuntimeId) return;
+      catalogOnlyVisibilityLastFetchAt = Date.now();
+      if (result?.status !== "ok") return;
+      const stateIds = new Set(
+        (Array.isArray(result.sort_keys) ? result.sort_keys : [])
+          .map((item) => projectMoveSessionKey(String(item?.session_id || "")))
+          .filter(Boolean),
+      );
+      const catalogById = new Map();
+      (Array.isArray(result.catalog_rows) ? result.catalog_rows : []).forEach((item) => {
+        const key = projectMoveSessionKey(String(item?.session_id || ""));
+        if (key) catalogById.set(key, item);
+        if (item?.internal_subagent === true) {
+          registerInternalSubagentThreadId(item.session_id);
+        }
+      });
+      rows.forEach((row) => {
+        const ref = sessionRefFromRow(row);
+        const key = projectMoveSessionKey(ref.session_id);
+        syncInternalSubagentRowVisibility(row, catalogById.get(key));
+        syncCatalogOnlyRowVisibility(row, !stateIds.has(key), catalogById.get(key));
+      });
+      if (internalSubagentThreadIdSignature()) scheduleInternalSubagentUnreadPrune(true);
+      cachedSessionRowsAt = 0;
+    } finally {
+      catalogOnlyVisibilityInFlight = false;
+    }
+  }
+
+  function scheduleCatalogOnlyVisibility(delay = chatsSortDbRefreshIntervalMs) {
+    if (window.__codexCatalogOnlyVisibilityRuntimeId !== codexCatalogOnlyVisibilityRuntimeId) return;
+    if (catalogOnlyVisibilityTimer || window.__codexCatalogOnlyVisibilityTimer) return;
+    if (allSidebarThreadRows().length < 1) return;
+    catalogOnlyVisibilityTimer = setTimeout(() => {
+      catalogOnlyVisibilityTimer = null;
+      window.__codexCatalogOnlyVisibilityTimer = null;
+      if (window.__codexCatalogOnlyVisibilityRuntimeId !== codexCatalogOnlyVisibilityRuntimeId) return;
+      applyCatalogOnlyVisibility().catch((error) => {
+        window.__codexCatalogOnlyVisibilityFailures = window.__codexCatalogOnlyVisibilityFailures || [];
+        window.__codexCatalogOnlyVisibilityFailures.push(String(error?.stack || error));
+      }).finally(() => scheduleCatalogOnlyVisibility());
+    }, delay);
+    window.__codexCatalogOnlyVisibilityTimer = catalogOnlyVisibilityTimer;
   }
 
   function scheduleChatsSortCorrection(delay = chatsSortRefreshIntervalMs) {
@@ -11084,6 +11333,7 @@
     updateDeleteButtonOffsets();
     scheduleProjectMoveProjection();
     scheduleChatsSortCorrection();
+    scheduleCatalogOnlyVisibility();
     archivedPageRows().forEach(attachArchivedPageDeleteButton);
     refreshConversationView();
     installCodexServiceTierBadge();
@@ -11175,9 +11425,41 @@
     scan();
   }
 
+  function collectSidebarRowsFromMutationNode(node, rows) {
+    if (node?.nodeType !== 1) return;
+    if (node.matches?.(selectors.sidebarThread)) rows.add(node);
+    node.querySelectorAll?.(selectors.sidebarThread).forEach((row) => rows.add(row));
+  }
+
+  function classifyAddedSidebarRows(mutations) {
+    if (!mutations) return;
+    const rows = new Set();
+    mutations.forEach((mutation) => {
+      Array.from(mutation.addedNodes || []).forEach((node) => collectSidebarRowsFromMutationNode(node, rows));
+      if (mutation.target?.nodeType === 1 && mutation.target.matches?.(selectors.sidebarThread)) {
+        rows.add(mutation.target);
+      }
+    });
+    let hasInternalSubagent = false;
+    rows.forEach((row) => {
+      if (syncInternalSubagentRowVisibility(row)) hasInternalSubagent = true;
+    });
+    if (hasInternalSubagent) scheduleInternalSubagentUnreadPrune();
+  }
+
+  function classifyExistingSidebarRows() {
+    const rows = Array.from(document.querySelectorAll(selectors.sidebarThread));
+    let hasInternalSubagent = false;
+    rows.forEach((row) => {
+      if (syncInternalSubagentRowVisibility(row)) hasInternalSubagent = true;
+    });
+    if (hasInternalSubagent) scheduleInternalSubagentUnreadPrune();
+  }
+
   function scheduleScan(mutations) {
     window.__codexSessionDeleteLastMutations = mutations;
     scheduleZedRemoteMenuRefresh(mutations);
+    schedulePluginAutoExpand();
     if (!shouldScheduleScan(mutations)) return;
     if (window.__codexSessionDeleteScanPending) return;
     window.__codexSessionDeleteScanPending = true;
@@ -11203,7 +11485,16 @@
   };
   window.addEventListener("resize", window.__codexPlusResizeHandler);
   window.__codexSessionDeleteObserver?.disconnect();
-  window.__codexSessionDeleteObserver = new MutationObserver(scheduleScan);
+  window.__codexSessionDeleteObserver = new MutationObserver((mutations) => {
+    if (internalSubagentThreadIds.size < 1) {
+      try {
+        classifyExistingSidebarRows();
+      } catch {
+      }
+    }
+    classifyAddedSidebarRows(mutations);
+    scheduleScan(mutations);
+  });
   window.__codexSessionDeleteObserver.observe(document.body || document.documentElement, {
     childList: true,
     subtree: true,
@@ -11219,6 +11510,13 @@
   document.removeEventListener("click", window.__codexSessionActionTriggerClickHandler, true);
   window.__codexSessionActionTriggerClickHandler = rememberSessionActionTrigger;
   document.addEventListener("click", window.__codexSessionActionTriggerClickHandler, true);
+  window.__codexInternalSubagentUnreadBootstrapReached = (window.__codexInternalSubagentUnreadBootstrapReached || 0) + 1;
+  scheduleInternalSubagentUnreadBootstrap();
+  try {
+    classifyExistingSidebarRows();
+  } catch {
+    scheduleInternalSubagentUnreadBootstrap();
+  }
 })();
 
 // === 粘贴修复 (CodexPlusPlus 页面增强) ===

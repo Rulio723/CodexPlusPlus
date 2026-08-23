@@ -78,6 +78,7 @@ pub struct SQLiteStorageAdapter {
 enum SchemaKind {
     GenericSessions,
     CodexThreads,
+    CodexLocalThreadCatalog,
     CodexAutomationRuns,
 }
 
@@ -171,6 +172,9 @@ impl SQLiteStorageAdapter {
             match schema_kind(&db)? {
                 Some(SchemaKind::GenericSessions) => self.delete_generic_session(&mut db, session),
                 Some(SchemaKind::CodexThreads) => self.delete_codex_thread(&mut db, session),
+                Some(SchemaKind::CodexLocalThreadCatalog) => {
+                    self.delete_codex_local_thread_catalog(&mut db, session)
+                }
                 Some(SchemaKind::CodexAutomationRuns) => {
                     self.delete_codex_automation_run(&mut db, session)
                 }
@@ -216,6 +220,15 @@ impl SQLiteStorageAdapter {
                 "thread_id",
                 "WHERE COALESCE(thread_id, '') <> ''".to_string(),
             ),
+            _ if has_table(&db, "automation_runs")?
+                && has_columns(&db, "automation_runs", &["thread_id"])? =>
+            {
+                (
+                    "automation_runs",
+                    "thread_id",
+                    "WHERE COALESCE(thread_id, '') <> ''".to_string(),
+                )
+            }
             _ => anyhow::bail!("Unsupported local storage schema"),
         };
         let sql = format!("SELECT {id_column} FROM {table} {filter} ORDER BY {id_column}");
@@ -500,6 +513,137 @@ impl SQLiteStorageAdapter {
         result.unwrap_or_else(
             |err| json!({"status": "failed", "message": err.to_string(), "sort_keys": []}),
         )
+    }
+
+    /// Return catalog-only metadata without exposing the catalog's source paths.
+    /// The renderer uses this to distinguish a still-readable rollout from an
+    /// orphaned catalog row that no longer has a backing local thread.
+    pub fn codex_local_catalog_rows(&self, sessions: &[SessionRef]) -> serde_json::Value {
+        if !self.db_path.exists() {
+            return json!({
+                "status": "failed",
+                "message": format!("Database not found: {}", self.db_path.to_string_lossy()),
+                "catalog_rows": [],
+            });
+        }
+        let thread_ids = sessions
+            .iter()
+            .filter(|session| !session.session_id.is_empty())
+            .map(|session| normalize_codex_thread_id(&session.session_id))
+            .fold(Vec::<String>::new(), |mut acc, id| {
+                if !acc.contains(&id) && acc.len() < 200 {
+                    acc.push(id);
+                }
+                acc
+            });
+        if thread_ids.is_empty() {
+            return json!({"status": "ok", "catalog_rows": []});
+        }
+        let result = (|| -> anyhow::Result<Value> {
+            let db = Connection::open(&self.db_path)?;
+            if !has_table(&db, "local_thread_catalog")?
+                || !has_columns(&db, "local_thread_catalog", &["thread_id"])?
+            {
+                return Ok(json!({
+                    "status": "failed",
+                    "message": "Unsupported local catalog schema",
+                    "catalog_rows": [],
+                }));
+            }
+            let catalog_columns = table_columns(&db, "local_thread_catalog")?
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let source_detail_expr =
+                optional_column_expression(&catalog_columns, "source_detail", "NULL");
+            let source_kind_expr =
+                optional_column_expression(&catalog_columns, "source_kind", "NULL");
+            let thread_source_expr =
+                optional_column_expression(&catalog_columns, "thread_source", "NULL");
+            let mut stmt = db.prepare(&format!(
+                "SELECT thread_id, {source_detail_expr} AS source_detail, \
+                    {source_kind_expr} AS source_kind, {thread_source_expr} AS thread_source \
+                 FROM local_thread_catalog"
+            ))?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?;
+            let mut catalog_rows = Vec::<Value>::new();
+            for row in rows {
+                let (thread_id, source_detail, source_kind, thread_source) = row?;
+                if !thread_ids.iter().any(|id| id == &thread_id) {
+                    continue;
+                }
+                let source_detail_present = source_detail
+                    .as_deref()
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false);
+                let rollout_exists = source_detail_present
+                    && source_detail
+                        .as_deref()
+                        .map(Path::new)
+                        .is_some_and(Path::is_file);
+                let internal_subagent = catalog_row_is_internal_subagent(
+                    thread_source.as_deref(),
+                    source_kind.as_deref(),
+                );
+                if let Some(existing) = catalog_rows.iter_mut().find(|item| {
+                    item.get("session_id").and_then(Value::as_str) == Some(thread_id.as_str())
+                }) {
+                    if let Some(existing) = existing.as_object_mut() {
+                        existing.insert(
+                            "source_detail_present".to_string(),
+                            json!(
+                                existing
+                                    .get("source_detail_present")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false)
+                                    || source_detail_present
+                            ),
+                        );
+                        existing.insert(
+                            "rollout_exists".to_string(),
+                            json!(
+                                existing
+                                    .get("rollout_exists")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false)
+                                    || rollout_exists
+                            ),
+                        );
+                        existing.insert(
+                            "internal_subagent".to_string(),
+                            json!(
+                                existing
+                                    .get("internal_subagent")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false)
+                                    || internal_subagent
+                            ),
+                        );
+                    }
+                } else {
+                    catalog_rows.push(json!({
+                        "session_id": thread_id,
+                        "source_detail_present": source_detail_present,
+                        "rollout_exists": rollout_exists,
+                        "internal_subagent": internal_subagent,
+                    }));
+                }
+            }
+            Ok(json!({"status": "ok", "catalog_rows": catalog_rows}))
+        })();
+        result.unwrap_or_else(|err| {
+            json!({
+                "status": "failed",
+                "message": err.to_string(),
+                "catalog_rows": [],
+            })
+        })
     }
 
     pub fn codex_thread_usage_history(&self, session: &SessionRef) -> serde_json::Value {
@@ -817,6 +961,80 @@ impl SQLiteStorageAdapter {
         }
         Ok(local_deleted(&thread_id, &token, &backup_path))
     }
+
+    fn delete_codex_local_thread_catalog(
+        &self,
+        db: &mut Connection,
+        session: &SessionRef,
+    ) -> anyhow::Result<DeleteResult> {
+        let thread_id = normalize_codex_thread_id(&session.session_id);
+        let mut tables = Map::new();
+        backup_related_rows(
+            db,
+            &mut tables,
+            "local_thread_catalog",
+            "thread_id = ?1",
+            &[&thread_id],
+        )?;
+        backup_related_rows(
+            db,
+            &mut tables,
+            "thread_timeline_ledger",
+            "thread_id = ?1",
+            &[&thread_id],
+        )?;
+        backup_related_rows(
+            db,
+            &mut tables,
+            "automation_runs",
+            "thread_id = ?1",
+            &[&thread_id],
+        )?;
+        backup_related_rows(
+            db,
+            &mut tables,
+            "inbox_items",
+            "thread_id = ?1",
+            &[&thread_id],
+        )?;
+        if tables.values().all(|rows| {
+            rows.as_array()
+                .map(|items| items.is_empty())
+                .unwrap_or(true)
+        }) {
+            return Ok(failed(
+                &session.session_id,
+                "Thread not found in local storage".to_string(),
+            ));
+        }
+        let token =
+            self.backup_store
+                .write_backup(&thread_id, &self.db_path, Value::Object(tables))?;
+        let backup_path = self.backup_store.path_for(&token);
+        let delete_result = (|| -> anyhow::Result<()> {
+            let tx = db.transaction()?;
+            delete_related_rows(&tx, "local_thread_catalog", "thread_id = ?1", &[&thread_id])?;
+            delete_related_rows(
+                &tx,
+                "thread_timeline_ledger",
+                "thread_id = ?1",
+                &[&thread_id],
+            )?;
+            delete_related_rows(&tx, "automation_runs", "thread_id = ?1", &[&thread_id])?;
+            delete_related_rows(&tx, "inbox_items", "thread_id = ?1", &[&thread_id])?;
+            tx.commit()?;
+            Ok(())
+        })();
+        if let Err(err) = delete_result {
+            return Ok(failed_with_undo(
+                &thread_id,
+                err.to_string(),
+                &token,
+                Some(&backup_path),
+            ));
+        }
+        Ok(local_deleted(&thread_id, &token, &backup_path))
+    }
 }
 
 fn optional_column_expression<'a>(
@@ -829,6 +1047,39 @@ fn optional_column_expression<'a>(
     } else {
         fallback
     }
+}
+
+fn catalog_row_is_internal_subagent(
+    thread_source: Option<&str>,
+    source_kind: Option<&str>,
+) -> bool {
+    if let Some(thread_source) = thread_source
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return thread_source.eq_ignore_ascii_case("subagent");
+    }
+    let Some(source_kind) = source_kind.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    if source_kind.eq_ignore_ascii_case("subagent") {
+        return true;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(source_kind) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return value
+            .as_str()
+            .is_some_and(|value| value.eq_ignore_ascii_case("subagent"));
+    };
+    if object.contains_key("subagent") {
+        return true;
+    }
+    ["thread_source", "source_kind", "kind", "type"]
+        .iter()
+        .filter_map(|key| object.get(*key).and_then(Value::as_str))
+        .any(|value| value.eq_ignore_ascii_case("subagent"))
 }
 
 fn failed(session_id: &str, message: String) -> DeleteResult {
@@ -1113,6 +1364,11 @@ fn schema_kind(db: &Connection) -> anyhow::Result<Option<SchemaKind>> {
     if has_table(db, "threads")? && has_columns(db, "threads", &["id", "title", "rollout_path"])? {
         return Ok(Some(SchemaKind::CodexThreads));
     }
+    if has_table(db, "local_thread_catalog")?
+        && has_columns(db, "local_thread_catalog", &["thread_id"])?
+    {
+        return Ok(Some(SchemaKind::CodexLocalThreadCatalog));
+    }
     if has_table(db, "automation_runs")? && has_columns(db, "automation_runs", &["thread_id"])? {
         return Ok(Some(SchemaKind::CodexAutomationRuns));
     }
@@ -1172,6 +1428,8 @@ fn validate_restore_tables(tables: &Map<String, Value>) -> anyhow::Result<()> {
         "agent_job_items",
         "automation_runs",
         "inbox_items",
+        "local_thread_catalog",
+        "thread_timeline_ledger",
         "__files",
         "__session_index",
     ];
@@ -1240,6 +1498,8 @@ fn restore_conflict_key_columns<'a>(table: &str, row: &'a Map<String, Value>) ->
         "sessions" | "threads" => &["id"],
         "messages" => &["id"],
         "automation_runs" | "inbox_items" => &["thread_id"],
+        "local_thread_catalog" => &["host_id", "thread_id"],
+        "thread_timeline_ledger" => &["host_id", "thread_id", "sequence"],
         "thread_dynamic_tools" => &["thread_id", "tool_name"],
         "thread_goals" => &["thread_id", "goal"],
         "thread_spawn_edges" => &["parent_thread_id", "child_thread_id"],

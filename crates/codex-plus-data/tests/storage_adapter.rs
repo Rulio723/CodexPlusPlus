@@ -3,7 +3,7 @@ use codex_plus_data::{
     BackupStore, SQLiteStorageAdapter, delete_local_from_paths,
     move_codex_thread_workspace_from_paths,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use serde_json::json;
 use std::fs;
 use std::path::Path;
@@ -82,6 +82,107 @@ fn create_codex_thread_db(path: &Path, rollout_path: &Path) {
     db.execute(
         "INSERT INTO agent_job_items (id, assigned_thread_id) VALUES ('job1', 't1')",
         [],
+    )
+    .unwrap();
+}
+
+fn create_codex_local_catalog_db(path: &Path) {
+    let db = Connection::open(path).unwrap();
+    db.execute(
+        "CREATE TABLE local_thread_catalog (
+            host_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL,
+            display_title TEXT NOT NULL,
+            source_created_at REAL NOT NULL,
+            source_updated_at REAL NOT NULL,
+            cwd TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            source_detail TEXT,
+            model_provider TEXT NOT NULL,
+            git_branch TEXT,
+            observation_sequence INTEGER NOT NULL,
+            missing_candidate INTEGER NOT NULL DEFAULT 0,
+            thread_source TEXT,
+            source_recency_at REAL NOT NULL DEFAULT 0,
+            pending_observed_title INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (host_id, thread_id)
+        )",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE thread_timeline_ledger (
+            host_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            record_id TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            PRIMARY KEY (host_id, thread_id, sequence)
+        )",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE automation_runs (thread_id TEXT PRIMARY KEY)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE inbox_items (id TEXT PRIMARY KEY, thread_id TEXT)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO local_thread_catalog (
+            host_id, thread_id, display_title, source_created_at, source_updated_at,
+            cwd, source_kind, source_detail, model_provider, git_branch,
+            observation_sequence, missing_candidate, thread_source, source_recency_at,
+            pending_observed_title
+        ) VALUES ('local', 't1', 'Catalog-only thread', 1, 2, '', 'exec', NULL, 'openai', NULL, 1, 0, 'user', 2, 0)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO thread_timeline_ledger (host_id, thread_id, sequence, record_id, payload_json)
+         VALUES ('local', 't1', 1, 'record-1', '{}')",
+        [],
+    )
+    .unwrap();
+    db.execute("INSERT INTO automation_runs (thread_id) VALUES ('t1')", [])
+        .unwrap();
+    db.execute(
+        "INSERT INTO inbox_items (id, thread_id) VALUES ('inbox-1', 't1')",
+        [],
+    )
+    .unwrap();
+}
+
+fn create_catalog_metadata_db(path: &Path) {
+    let db = Connection::open(path).unwrap();
+    db.execute(
+        "CREATE TABLE local_thread_catalog (
+            thread_id TEXT PRIMARY KEY,
+            source_detail TEXT,
+            source_kind TEXT,
+            thread_source TEXT
+        )",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO local_thread_catalog (thread_id, source_kind, thread_source)
+         VALUES (?1, 'cli', 'user'), (?2, 'cli', 'subagent'),
+                (?3, ?4, NULL), (?5, 'subagent', NULL),
+                (?6, ?7, 'user')",
+        params![
+            "t-user",
+            "t-thread-source",
+            "t-json",
+            r#"{"subagent":{"thread_spawn":true}}"#,
+            "t-literal",
+            "t-explicit-user",
+            r#"{"thread_source":"subagent"}"#,
+        ],
     )
     .unwrap();
 }
@@ -496,6 +597,207 @@ fn delete_codex_thread_sqlite_dir_layout_removes_session_index_entry_and_undo_re
 }
 
 #[test]
+fn delete_codex_local_catalog_schema_removes_orphan_rows_and_undo_restores_everything() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("codex-dev.db");
+    create_codex_local_catalog_db(&db_path);
+    let backups = BackupStore::new(tmp.path().join("backups"));
+    let adapter = SQLiteStorageAdapter::new(&db_path, backups.clone());
+    Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "UPDATE local_thread_catalog SET source_detail = ?1 WHERE thread_id = 't1'",
+            [tmp.path()
+                .join("missing-rollout.jsonl")
+                .to_string_lossy()
+                .to_string()],
+        )
+        .unwrap();
+    let valid_rollout = tmp.path().join("valid-rollout.jsonl");
+    fs::write(&valid_rollout, "{}\n").unwrap();
+    Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "INSERT INTO local_thread_catalog (
+                host_id, thread_id, display_title, source_created_at, source_updated_at,
+                cwd, source_kind, source_detail, model_provider, git_branch,
+                observation_sequence, missing_candidate, thread_source, source_recency_at,
+                pending_observed_title
+            ) VALUES ('local', 't2', 'Catalog thread with rollout', 1, 2, '', 'exec', ?1, 'openai', NULL, 2, 0, 'user', 2, 0)",
+            [valid_rollout.to_string_lossy().to_string()],
+        )
+        .unwrap();
+
+    let catalog = adapter.codex_local_catalog_rows(&[
+        session("local:t1", "Catalog-only thread"),
+        session("local:t2", "Catalog thread with rollout"),
+    ]);
+    assert_eq!(catalog["status"], "ok");
+    assert_eq!(catalog["catalog_rows"][0]["source_detail_present"], true);
+    assert_eq!(catalog["catalog_rows"][0]["rollout_exists"], false);
+    assert_eq!(catalog["catalog_rows"][1]["rollout_exists"], true);
+
+    let deleted = adapter.delete_local(&session("local:t1", "Catalog-only thread"));
+
+    assert_eq!(deleted.status, DeleteStatus::LocalDeleted);
+    let db = Connection::open(&db_path).unwrap();
+    for (table, column) in [
+        ("local_thread_catalog", "thread_id"),
+        ("thread_timeline_ledger", "thread_id"),
+        ("automation_runs", "thread_id"),
+        ("inbox_items", "thread_id"),
+    ] {
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE {column} = 't1'");
+        assert_eq!(
+            db.query_row(&sql, [], |row| row.get::<_, i64>(0)).unwrap(),
+            0
+        );
+    }
+    drop(db);
+
+    let restored = adapter.undo(deleted.undo_token.as_deref().unwrap());
+
+    assert_eq!(restored.status, DeleteStatus::Undone);
+    let db = Connection::open(&db_path).unwrap();
+    for (table, column) in [
+        ("local_thread_catalog", "thread_id"),
+        ("thread_timeline_ledger", "thread_id"),
+        ("automation_runs", "thread_id"),
+        ("inbox_items", "thread_id"),
+    ] {
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE {column} = 't1'");
+        assert_eq!(
+            db.query_row(&sql, [], |row| row.get::<_, i64>(0)).unwrap(),
+            1
+        );
+    }
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM local_thread_catalog WHERE thread_id = 't2'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn codex_local_catalog_rows_marks_internal_subagents_without_sensitive_metadata() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("catalog-metadata.sqlite");
+    create_catalog_metadata_db(&db_path);
+    let adapter = SQLiteStorageAdapter::new(&db_path, BackupStore::new(tmp.path().join("backups")));
+    let catalog = adapter.codex_local_catalog_rows(&[
+        session("local:t-user", "user"),
+        session("local:t-thread-source", "thread source"),
+        session("local:t-json", "json fallback"),
+        session("local:t-literal", "literal fallback"),
+        session("local:t-explicit-user", "explicit user"),
+    ]);
+
+    assert_eq!(catalog["status"], "ok");
+    let rows = catalog["catalog_rows"].as_array().unwrap();
+    let internal_by_id = rows
+        .iter()
+        .map(|row| {
+            (
+                row["session_id"].as_str().unwrap(),
+                row["internal_subagent"].as_bool().unwrap(),
+            )
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(internal_by_id["t-user"], false);
+    assert_eq!(internal_by_id["t-thread-source"], true);
+    assert_eq!(internal_by_id["t-json"], true);
+    assert_eq!(internal_by_id["t-literal"], true);
+    assert_eq!(internal_by_id["t-explicit-user"], false);
+    for row in rows {
+        let object = row.as_object().unwrap();
+        assert!(!object.contains_key("thread_source"));
+        assert!(!object.contains_key("source_kind"));
+        assert!(!object.contains_key("source_detail"));
+        assert!(!object.contains_key("cwd"));
+        assert!(!object.contains_key("agent_path"));
+    }
+}
+
+#[test]
+fn codex_local_catalog_rows_keeps_minimal_schema_compatible() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("minimal-catalog.sqlite");
+    let db = Connection::open(&db_path).unwrap();
+    db.execute(
+        "CREATE TABLE local_thread_catalog (thread_id TEXT PRIMARY KEY)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO local_thread_catalog (thread_id) VALUES ('minimal')",
+        [],
+    )
+    .unwrap();
+    drop(db);
+
+    let adapter = SQLiteStorageAdapter::new(&db_path, BackupStore::new(tmp.path().join("backups")));
+    let catalog = adapter.codex_local_catalog_rows(&[session("local:minimal", "minimal")]);
+    assert_eq!(catalog["status"], "ok");
+    assert_eq!(catalog["catalog_rows"][0]["internal_subagent"], false);
+    assert_eq!(catalog["catalog_rows"][0]["source_detail_present"], false);
+    assert_eq!(catalog["catalog_rows"][0]["rollout_exists"], false);
+}
+
+#[test]
+fn combined_threads_and_catalog_schema_keeps_thread_delete_priority_and_catalog_discovery() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("state_5.sqlite");
+    let rollout_path = tmp.path().join("rollout.jsonl");
+    fs::write(&rollout_path, "{}\n").unwrap();
+    create_codex_thread_db(&db_path, &rollout_path);
+    let db = Connection::open(&db_path).unwrap();
+    db.execute(
+        "CREATE TABLE local_thread_catalog (
+            thread_id TEXT PRIMARY KEY,
+            source_detail TEXT
+        )",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO local_thread_catalog (thread_id, source_detail) VALUES ('t1', ?1)",
+        [rollout_path.to_string_lossy().to_string()],
+    )
+    .unwrap();
+    drop(db);
+
+    let adapter = SQLiteStorageAdapter::new(&db_path, BackupStore::new(tmp.path().join("backups")));
+    let catalog = adapter.codex_local_catalog_rows(&[session("local:t1", "Codex Thread")]);
+    assert_eq!(catalog["status"], "ok");
+    assert_eq!(catalog["catalog_rows"][0]["source_detail_present"], true);
+    assert_eq!(catalog["catalog_rows"][0]["rollout_exists"], true);
+
+    let deleted = adapter.delete_local(&session("local:t1", "Codex Thread"));
+    assert_eq!(deleted.status, DeleteStatus::LocalDeleted);
+    let db = Connection::open(&db_path).unwrap();
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM threads WHERE id = 't1'", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM local_thread_catalog WHERE thread_id = 't1'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
 fn delete_local_from_paths_removes_duplicate_threads_from_all_databases() {
     let tmp = tempdir().unwrap();
     let first_db = tmp.path().join("first.sqlite");
@@ -825,6 +1127,7 @@ fn list_local_sessions_reads_automation_runs_from_catalog_mixed_schema() {
     assert_eq!(sessions[0].title, "Automation thread");
     assert_eq!(sessions[0].cwd, "C:/catalog");
     assert_eq!(sessions[0].updated_at_ms, Some(200));
+    assert_eq!(adapter.list_local_session_ids().unwrap(), ["t1"]);
 }
 
 #[test]

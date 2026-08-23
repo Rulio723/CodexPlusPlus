@@ -383,8 +383,9 @@ fn per_user_secure_recovery_contract_matches_as_invoker_installer_and_embedded_p
     let protect_at = install.find("Call ProtectSecureRecoveryFile").unwrap();
     let recover_at = install.find("Call RecoverAdminMode").unwrap();
     let cleanup_at = install.find("Call CleanupSecureRecoveryDirectory").unwrap();
+    let overwrite_at = install.find("SetOutPath \"$INSTDIR\"").unwrap();
     assert!(create_at < extract_at && extract_at < protect_at && protect_at < recover_at);
-    assert!(recover_at < cleanup_at);
+    assert!(recover_at < cleanup_at && cleanup_at < overwrite_at);
 }
 
 #[test]
@@ -484,7 +485,7 @@ fn administrator_runtime_is_staged_with_fixed_executable_roles() {
     assert!(installer.contains("Delete \"$INSTDIR\\codex-plus-admin-shim.exe\""));
     assert_eq!(
         installer
-            .matches("taskkill.exe\" /IM codex-plus-admin-shim.exe /T /F")
+            .matches("taskkill.exe\" /IM codex-plus-admin-shim.exe /F")
             .count(),
         4
     );
@@ -789,7 +790,143 @@ fn windows_installer_uses_guarded_retry_before_admin_recovery() {
         assert!(attempt < stop && stop < recover);
     }
 
+    for function_name in ["StopRunningCodexPlus", "un.StopRunningCodexPlus"] {
+        let function = source
+            .split(&format!("Function {function_name}"))
+            .nth(1)
+            .and_then(|tail| tail.split("FunctionEnd").next())
+            .expect("stop-running function");
+        assert_eq!(
+            function
+                .lines()
+                .filter(|line| line.contains("taskkill.exe"))
+                .count(),
+            10,
+            "{function_name} should issue five image kills in two rounds"
+        );
+        assert!(
+            !function.contains(" /T "),
+            "{function_name} must not recurse process trees"
+        );
+        for image in [
+            "codex-plus-plus-manager.exe",
+            "codex-plus-plus.exe",
+            "codex-plus-recovery.exe",
+            "codex-plus-admin-shim.exe",
+            "ChatGPT.exe",
+        ] {
+            let command = format!("taskkill.exe\" /IM {image} /F");
+            assert_eq!(
+                function.matches(&command).count(),
+                2,
+                "{function_name} should kill {image} in both rounds"
+            );
+        }
+    }
+
+    let launcher = std::fs::read_to_string(root.join("apps/codex-plus-launcher/src/main.rs"))
+        .expect("read launcher source");
+    let recovery_start = launcher
+        .find("if recover_only")
+        .expect("recover-only branch");
+    let recovery_branch = &launcher[recovery_start..]
+        .split("if helper_only")
+        .next()
+        .expect("recover-only branch body");
+    let state_recovery_at = recovery_branch
+        .find("recover_stale_admin_mode_for_shutdown")
+        .expect("stale state recovery call");
+    let process_stop_at = recovery_branch
+        .find("stop_admin_recovery_processes_and_wait()?")
+        .expect("strict elevated process stop call");
+    assert!(state_recovery_at < process_stop_at);
+    assert!(source.contains("StrCmp $1 0 recovery_done"));
+    assert!(
+        source
+            .contains("Abort \"Administrator mode recovery failed; close Codex++ and try again.\"")
+    );
+
+    fn decode_utf16le_base64(encoded: &str) -> String {
+        fn sextet(byte: u8) -> Option<u8> {
+            match byte {
+                b'A'..=b'Z' => Some(byte - b'A'),
+                b'a'..=b'z' => Some(byte - b'a' + 26),
+                b'0'..=b'9' => Some(byte - b'0' + 52),
+                b'+' => Some(62),
+                b'/' => Some(63),
+                _ => None,
+            }
+        }
+
+        let mut bytes = Vec::new();
+        for quartet in encoded.as_bytes().chunks_exact(4) {
+            let values = [quartet[0], quartet[1], quartet[2], quartet[3]]
+                .map(|byte| if byte == b'=' { None } else { sextet(byte) });
+            let [a, b, c, d] = values;
+            let (a, b) = (
+                a.expect("base64 first sextet"),
+                b.expect("base64 second sextet"),
+            );
+            bytes.push((a << 2) | (b >> 4));
+            if let Some(c) = c {
+                bytes.push((b << 4) | (c >> 2));
+                if let Some(d) = d {
+                    bytes.push((c << 6) | d);
+                }
+            }
+        }
+        let utf16 = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        String::from_utf16(&utf16).expect("UTF-16 PowerShell payload")
+    }
+
+    let command_define = source
+        .lines()
+        .find_map(|line| line.strip_prefix("!define ADMIN_RECOVERY_ELEVATION_COMMAND "))
+        .expect("static elevated recovery command");
+    let encoded_command = command_define.trim_matches('"');
+    let command = decode_utf16le_base64(encoded_command);
+    assert!(command.contains("$env:CODEXPP_RECOVERY_FILE"));
+    assert!(command.contains("Start-Process"));
+    assert!(command.contains("-Verb RunAs"));
+    assert!(command.contains("-PassThru"));
+    assert!(command.contains("-Wait"));
+    assert!(command.contains("exit [int]$x.ExitCode"));
+    assert!(command.contains("catch{exit 1}"));
+    assert!(encoded_command.len() <= 768);
+
+    let expanded_command = format!(
+        "\"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoLogo -NoProfile -NonInteractive -EncodedCommand \"{encoded_command}\""
+    );
+    let expanded_command_utf16_chars = expanded_command.encode_utf16().count();
+    assert!(expanded_command_utf16_chars < 1024);
+    assert!(expanded_command_utf16_chars <= 768);
+
+    assert_eq!(
+        source
+            .matches("nsExec::ExecToLog /TIMEOUT=120000 '\"$SYSDIR\\WindowsPowerShell\\v1.0\\powershell.exe\"")
+            .count(),
+        2
+    );
+    assert!(
+        !source.lines().any(|line| {
+            line.contains("nsExec::ExecToLog") && line.contains("$AdminRecoveryFile")
+        })
+    );
     assert!(source.contains(
-        "nsExec::ExecToLog /TIMEOUT=30000 '\"$AdminRecoveryFile\" --recover-admin-mode'"
+        "SetEnvironmentVariableW(w \"CODEXPP_RECOVERY_FILE\", w \"$AdminRecoveryFile\")"
     ));
+    assert!(source.contains("SetEnvironmentVariableW(w \"CODEXPP_RECOVERY_FILE\", p 0)"));
+    assert!(source.contains("Call InvokeElevatedRecovery"));
+    assert!(source.contains("Call un.InvokeElevatedRecovery"));
+    assert!(
+        source.contains("StrCmp $InstallAdminRecoveryTrySucceeded 1 install_recovery_already_done")
+    );
+    assert!(
+        source.contains(
+            "StrCmp $UninstallAdminRecoveryTrySucceeded 1 uninstall_recovery_already_done"
+        )
+    );
 }

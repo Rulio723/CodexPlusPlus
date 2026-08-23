@@ -14,6 +14,8 @@ ${StrTok}
 
 Var AdminRecoveryDir
 Var AdminRecoveryFile
+Var InstallAdminRecoveryTrySucceeded
+Var UninstallAdminRecoveryTrySucceeded
 Var PowerShell7Installed
 Var PowerShell7ProgramFiles
 Var PowerShell7StoreRoot
@@ -23,6 +25,11 @@ Var PowerShell7PathIndex
 Var PowerShell7Candidate
 Var PowerShell7Version
 Var PowerShell7Major
+
+; The launcher has a requireAdministrator manifest.  Keep its path in a
+; controlled environment variable and let PowerShell's ShellExecute runas
+; verb perform elevation; this avoids nsExec/CreateProcess error 740.
+!define ADMIN_RECOVERY_ELEVATION_COMMAND "JABwAD0AJABlAG4AdgA6AEMATwBEAEUAWABQAFAAXwBSAEUAQwBPAFYARQBSAFkAXwBGAEkATABFADsAaQBmACgAWwBzAHQAcgBpAG4AZwBdADoAOgBJAHMATgB1AGwAbABPAHIAVwBoAGkAdABlAFMAcABhAGMAZQAoACQAcAApACkAewBlAHgAaQB0ACAAMgB9ADsAdAByAHkAewAkAHgAPQBTAHQAYQByAHQALQBQAHIAbwBjAGUAcwBzACAALQBGAGkAbABlAFAAYQB0AGgAIAAkAHAAIAAtAEEAcgBnAHUAbQBlAG4AdABMAGkAcwB0ACAAJwAtAC0AcgBlAGMAbwB2AGUAcgAtAGEAZABtAGkAbgAtAG0AbwBkAGUAJwAgAC0AVgBlAHIAYgAgAFIAdQBuAEEAcwAgAC0AUABhAHMAcwBUAGgAcgB1ACAALQBXAGEAaQB0ACAALQBFAEEAIABTAHQAbwBwADsAZQB4AGkAdAAgAFsAaQBuAHQAXQAkAHgALgBFAHgAaQB0AEMAbwBkAGUAfQBjAGEAdABjAGgAewBlAHgAaQB0ACAAMQB9AA=="
 
 Name "Codex++"
 OutFile "${ROOT}\dist\windows\CodexPlusPlus-${VERSION}-windows-x64-setup.exe"
@@ -244,7 +251,7 @@ Function RecoverAdminMode
   IfFileExists "$AdminRecoveryFile" run_recovery recovery_unavailable
 
 run_recovery:
-  nsExec::ExecToLog '"$AdminRecoveryFile" --recover-admin-mode'
+  Call InvokeElevatedRecovery
   Pop $1
   StrCmp $1 0 recovery_done
   Call CleanupSecureRecoveryDirectory
@@ -257,40 +264,60 @@ recovery_unavailable:
 recovery_done:
 FunctionEnd
 
+Function InvokeElevatedRecovery
+  System::Call 'Kernel32::SetEnvironmentVariableW(w "CODEXPP_RECOVERY_FILE", w "$AdminRecoveryFile") i.r0'
+  StrCmp $0 0 invoke_recovery_environment_failed
+  nsExec::ExecToLog /TIMEOUT=120000 '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -EncodedCommand "${ADMIN_RECOVERY_ELEVATION_COMMAND}"'
+  Pop $1
+  System::Call 'Kernel32::SetEnvironmentVariableW(w "CODEXPP_RECOVERY_FILE", p 0) i.r0'
+  StrCmp $0 0 invoke_recovery_environment_failed
+  Push $1
+  Return
+
+invoke_recovery_environment_failed:
+  System::Call 'Kernel32::SetEnvironmentVariableW(w "CODEXPP_RECOVERY_FILE", p 0)'
+  Push 1
+FunctionEnd
+
 Function TryRecoverAdminMode
+  StrCpy $InstallAdminRecoveryTrySucceeded 0
   IfFileExists "$AdminRecoveryFile" try_run_recovery try_recovery_done
 
 try_run_recovery:
-  nsExec::ExecToLog /TIMEOUT=30000 '"$AdminRecoveryFile" --recover-admin-mode'
+  Call InvokeElevatedRecovery
   Pop $1
-  StrCmp $1 0 try_recovery_done
+  StrCmp $1 0 try_recovery_succeeded
   DetailPrint "Administrator mode is still active; closing Codex++ before retrying recovery."
+  Goto try_recovery_done
+
+try_recovery_succeeded:
+  StrCpy $InstallAdminRecoveryTrySucceeded 1
 
 try_recovery_done:
 FunctionEnd
 
 Function StopRunningCodexPlus
   DetailPrint "Closing running Codex++, recovery helpers, and Codex..."
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-plus-manager.exe /T /F'
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-plus-manager.exe /F'
   Pop $0
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-plus.exe /T /F'
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-plus.exe /F'
   Pop $0
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-recovery.exe /T /F'
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-recovery.exe /F'
   Pop $0
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-admin-shim.exe /T /F'
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-admin-shim.exe /F'
   Pop $0
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM ChatGPT.exe /T /F'
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM ChatGPT.exe /F'
   Pop $0
   Sleep 1000
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-plus-manager.exe /T /F'
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-plus-manager.exe /F'
   Pop $0
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-plus.exe /T /F'
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-plus.exe /F'
   Pop $0
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-recovery.exe /T /F'
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-recovery.exe /F'
   Pop $0
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-admin-shim.exe /T /F'
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-admin-shim.exe /F'
   Pop $0
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM ChatGPT.exe /T /F'
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM ChatGPT.exe /F'
   Pop $0
   Sleep 500
 FunctionEnd
@@ -390,7 +417,7 @@ Function un.RecoverAdminMode
   IfFileExists "$AdminRecoveryFile" run_recovery recovery_unavailable
 
 run_recovery:
-  nsExec::ExecToLog '"$AdminRecoveryFile" --recover-admin-mode'
+  Call un.InvokeElevatedRecovery
   Pop $1
   StrCmp $1 0 recovery_done
   Call un.CleanupSecureRecoveryDirectory
@@ -403,45 +430,66 @@ recovery_unavailable:
 recovery_done:
 FunctionEnd
 
+Function un.InvokeElevatedRecovery
+  System::Call 'Kernel32::SetEnvironmentVariableW(w "CODEXPP_RECOVERY_FILE", w "$AdminRecoveryFile") i.r0'
+  StrCmp $0 0 invoke_recovery_environment_failed
+  nsExec::ExecToLog /TIMEOUT=120000 '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -EncodedCommand "${ADMIN_RECOVERY_ELEVATION_COMMAND}"'
+  Pop $1
+  System::Call 'Kernel32::SetEnvironmentVariableW(w "CODEXPP_RECOVERY_FILE", p 0) i.r0'
+  StrCmp $0 0 invoke_recovery_environment_failed
+  Push $1
+  Return
+
+invoke_recovery_environment_failed:
+  System::Call 'Kernel32::SetEnvironmentVariableW(w "CODEXPP_RECOVERY_FILE", p 0)'
+  Push 1
+FunctionEnd
+
 Function un.TryRecoverAdminMode
+  StrCpy $UninstallAdminRecoveryTrySucceeded 0
   IfFileExists "$AdminRecoveryFile" try_run_recovery try_recovery_done
 
 try_run_recovery:
-  nsExec::ExecToLog /TIMEOUT=30000 '"$AdminRecoveryFile" --recover-admin-mode'
+  Call un.InvokeElevatedRecovery
   Pop $1
-  StrCmp $1 0 try_recovery_done
+  StrCmp $1 0 try_recovery_succeeded
   DetailPrint "Administrator mode is still active; closing Codex++ before retrying recovery."
+  Goto try_recovery_done
+
+try_recovery_succeeded:
+  StrCpy $UninstallAdminRecoveryTrySucceeded 1
 
 try_recovery_done:
 FunctionEnd
 
 Function un.StopRunningCodexPlus
   DetailPrint "Closing running Codex++, recovery helpers, and Codex..."
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-plus-manager.exe /T /F'
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-plus-manager.exe /F'
   Pop $0
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-plus.exe /T /F'
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-plus.exe /F'
   Pop $0
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-recovery.exe /T /F'
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-recovery.exe /F'
   Pop $0
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-admin-shim.exe /T /F'
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-admin-shim.exe /F'
   Pop $0
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM ChatGPT.exe /T /F'
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM ChatGPT.exe /F'
   Pop $0
   Sleep 1000
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-plus-manager.exe /T /F'
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-plus-manager.exe /F'
   Pop $0
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-plus.exe /T /F'
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-plus.exe /F'
   Pop $0
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-recovery.exe /T /F'
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-recovery.exe /F'
   Pop $0
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-admin-shim.exe /T /F'
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM codex-plus-admin-shim.exe /F'
   Pop $0
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM ChatGPT.exe /T /F'
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM ChatGPT.exe /F'
   Pop $0
   Sleep 500
 FunctionEnd
 
 Section "Install"
+  StrCpy $InstallAdminRecoveryTrySucceeded 0
   Call DetectPowerShell7
   StrCmp $PowerShell7Installed 1 install_powershell7_skip install_powershell7_required
 
@@ -460,7 +508,9 @@ install_powershell7_done:
 
   Call TryRecoverAdminMode
   Call StopRunningCodexPlus
+  StrCmp $InstallAdminRecoveryTrySucceeded 1 install_recovery_already_done
   Call RecoverAdminMode
+install_recovery_already_done:
   Call CleanupSecureRecoveryDirectory
 
   SetOutPath "$INSTDIR"
@@ -497,8 +547,8 @@ install_runtime_done:
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Codex++" "InstallLocation" "$INSTDIR"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Codex++" "UninstallString" "$INSTDIR\uninstall.exe"
 SectionEnd
-
 Section "Uninstall"
+  StrCpy $UninstallAdminRecoveryTrySucceeded 0
   Call un.CreateSecureRecoveryDirectory
   SetOutPath "$AdminRecoveryDir"
   File /oname=codex-plus-recovery.exe "${ROOT}\dist\windows\app\codex-plus-plus.exe"
@@ -506,7 +556,9 @@ Section "Uninstall"
 
   Call un.TryRecoverAdminMode
   Call un.StopRunningCodexPlus
+  StrCmp $UninstallAdminRecoveryTrySucceeded 1 uninstall_recovery_already_done
   Call un.RecoverAdminMode
+uninstall_recovery_already_done:
   Call un.CleanupSecureRecoveryDirectory
 
   Delete "$DESKTOP\Codex++.lnk"

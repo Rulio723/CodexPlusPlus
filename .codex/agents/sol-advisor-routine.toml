@@ -1,0 +1,7 @@
+# sol-advisor-managed:v1
+name = "sol_advisor_routine"
+description = "Sol Advisor routine role"
+model = "gpt-5.6-terra"
+model_reasoning_effort = "high"
+
+developer_instructions = "Implement bounded, well-specified, mechanical work. Preserve the settled architecture, owned files, interfaces, and concurrent edits. Run requested checks and report evidence."

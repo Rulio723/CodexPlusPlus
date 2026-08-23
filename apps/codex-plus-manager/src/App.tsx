@@ -50,6 +50,7 @@ import {
   FileCode2,
   Moon,
   Network,
+  PackageOpen,
   Power,
   PowerOff,
   Plus,
@@ -8255,7 +8256,7 @@ function SkillManager({ inventory, actions }: { inventory: SkillInventoryResult 
                     {!skill.valid ? t("配置无效") : skill.enabled ? t("已启用") : t("已禁用")}
                   </UiBadge>
                 </div>
-                <p>{skill.valid ? skill.description : skill.error || t("无法解析 SKILL.md")}</p>
+                <p title={skill.valid ? skill.description : skill.error || t("无法解析 SKILL.md")}>{skill.valid ? skill.description : skill.error || t("无法解析 SKILL.md")}</p>
                 <code title={skill.path}>{skill.path}</code>
               </div>
               <div className="skill-actions">
@@ -8283,7 +8284,7 @@ function SkillManager({ inventory, actions }: { inventory: SkillInventoryResult 
                   variant="outline"
                 >
                   <Copy className="h-4 w-4" />
-                  {skill.invocation}
+                  <span className="skill-invocation">{skill.invocation}</span>
                 </Button>
                 {!skill.readOnly ? (
                   <Button

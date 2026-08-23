@@ -93,6 +93,7 @@ async fn launcher_main(
             &codex_plus_core::codex_home::default_codex_home_dir(),
             &codex_plus_core::paths::default_app_state_dir(),
         )?;
+        codex_plus_core::watcher::stop_admin_recovery_processes_and_wait()?;
         return Ok(());
     }
     if helper_only {
@@ -900,17 +901,116 @@ impl BridgeDataService for LauncherDataService {
     }
 
     async fn thread_sort_key(&self, session: SessionRef) -> anyhow::Result<Value> {
-        let adapter = self.storage_adapter();
-        tokio::task::spawn_blocking(move || adapter.codex_thread_sort_key(&session))
-            .await
-            .map_err(|error| anyhow::anyhow!("thread sort key task failed: {error}"))
+        let db_paths = self.candidate_db_paths();
+        let backup_dir = self.backup_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut result = json!({
+                "status": "failed",
+                "session_id": session.session_id,
+                "message": "Thread not found in local storage",
+            });
+            for db_path in db_paths {
+                let adapter = codex_plus_data::SQLiteStorageAdapter::new(
+                    db_path,
+                    codex_plus_data::BackupStore::new(backup_dir.clone()),
+                );
+                let candidate = adapter.codex_thread_sort_key(&session);
+                if candidate.get("status").and_then(Value::as_str) == Some("ok") {
+                    return candidate;
+                }
+                result = candidate;
+            }
+            result
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("thread sort key task failed: {error}"))
     }
 
     async fn thread_sort_keys(&self, sessions: Vec<SessionRef>) -> anyhow::Result<Value> {
-        let adapter = self.storage_adapter();
-        tokio::task::spawn_blocking(move || adapter.codex_thread_sort_keys(&sessions))
-            .await
-            .map_err(|error| anyhow::anyhow!("thread sort keys task failed: {error}"))
+        let db_paths = self.candidate_db_paths();
+        let backup_dir = self.backup_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut sort_keys = Vec::new();
+            let mut seen_ids = Vec::new();
+            let mut catalog_rows: Vec<Value> = Vec::new();
+            let mut seen_catalog_ids: Vec<String> = Vec::new();
+            let mut any_supported_db = false;
+            for db_path in db_paths {
+                let adapter = codex_plus_data::SQLiteStorageAdapter::new(
+                    db_path,
+                    codex_plus_data::BackupStore::new(backup_dir.clone()),
+                );
+                let candidate = adapter.codex_thread_sort_keys(&sessions);
+                if candidate.get("status").and_then(Value::as_str) == Some("ok") {
+                    any_supported_db = true;
+                    if let Some(items) = candidate.get("sort_keys").and_then(Value::as_array) {
+                        for item in items {
+                            let Some(session_id) = item.get("session_id").and_then(Value::as_str)
+                            else {
+                                continue;
+                            };
+                            if seen_ids.iter().any(|seen| seen == session_id) {
+                                continue;
+                            }
+                            seen_ids.push(session_id.to_string());
+                            sort_keys.push(item.clone());
+                        }
+                    }
+                }
+
+                let catalog = adapter.codex_local_catalog_rows(&sessions);
+                if catalog.get("status").and_then(Value::as_str) == Some("ok") {
+                    any_supported_db = true;
+                    if let Some(items) = catalog.get("catalog_rows").and_then(Value::as_array) {
+                        for item in items {
+                            let Some(session_id) = item.get("session_id").and_then(Value::as_str)
+                            else {
+                                continue;
+                            };
+                            if let Some(existing) = catalog_rows.iter_mut().find(|existing| {
+                                existing.get("session_id").and_then(Value::as_str)
+                                    == Some(session_id)
+                            }) {
+                                if let (Some(existing), Some(item)) =
+                                    (existing.as_object_mut(), item.as_object())
+                                {
+                                    for field in [
+                                        "source_detail_present",
+                                        "rollout_exists",
+                                        "internal_subagent",
+                                    ] {
+                                        let merged = existing
+                                            .get(field)
+                                            .and_then(Value::as_bool)
+                                            .unwrap_or(false)
+                                            || item
+                                                .get(field)
+                                                .and_then(Value::as_bool)
+                                                .unwrap_or(false);
+                                        existing.insert(field.to_string(), json!(merged));
+                                    }
+                                }
+                            } else if !seen_catalog_ids.iter().any(|seen| seen == session_id) {
+                                seen_catalog_ids.push(session_id.to_string());
+                                catalog_rows.push(item.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            if any_supported_db {
+                json!({"status": "ok", "sort_keys": sort_keys, "catalog_rows": catalog_rows})
+            } else {
+                json!({
+                    "status": "failed",
+                    "message": "Unsupported local storage schema",
+                    "sort_keys": [],
+                    "catalog_rows": [],
+                })
+            }
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("thread sort keys task failed: {error}"))
     }
 
     async fn recover_remote_control_session(&self, thread_id: String) -> anyhow::Result<Value> {
@@ -994,6 +1094,13 @@ impl LauncherDataService {
     fn candidate_db_paths(&self) -> Vec<PathBuf> {
         let mut paths = vec![self.db_path.clone()];
         for path in codex_plus_core::codex_sqlite::codex_session_db_paths_from_home(
+            &codex_plus_core::codex_sqlite::default_codex_home_dir(),
+        ) {
+            if !paths.iter().any(|candidate| candidate == &path) {
+                paths.push(path);
+            }
+        }
+        for path in codex_plus_core::codex_sqlite::codex_thread_reference_db_paths_from_home(
             &codex_plus_core::codex_sqlite::default_codex_home_dir(),
         ) {
             if !paths.iter().any(|candidate| candidate == &path) {
@@ -1444,6 +1551,27 @@ mod tests {
         assert!(source.contains("inject_with_context(debug_port, helper_port, ctx, runtime)"));
         assert!(source.contains("async fn ensure_plugin_marketplace_config"));
         assert!(source.contains("self.core.ensure_plugin_marketplace_config(settings).await"));
+    }
+
+    #[test]
+    fn thread_sort_keys_queries_catalog_when_sort_schema_is_missing() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("async fn thread_sort_keys(&self, sessions: Vec<SessionRef>)")
+            .expect("thread sort keys implementation");
+        let body = &source[start..];
+        let sort_query = body
+            .find("let candidate = adapter.codex_thread_sort_keys(&sessions);")
+            .expect("thread sort key query");
+        let catalog_query = body
+            .find("let catalog = adapter.codex_local_catalog_rows(&sessions);")
+            .expect("catalog query");
+        assert!(sort_query < catalog_query);
+        assert!(
+            !body[sort_query..catalog_query]
+                .contains("if candidate.get(\"status\").and_then(Value::as_str) != Some(\"ok\")")
+        );
+        assert!(body[catalog_query..].contains("\"internal_subagent\""));
     }
 
     #[tokio::test]

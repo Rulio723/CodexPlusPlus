@@ -249,6 +249,8 @@ describe("renderer injection header compatibility", () => {
     assert.match(renderer, /reactThreadSourceFromRow/);
     assert.match(renderer, /reactThreadSourceFromRow\(row\)\s*===\s*"subagent"/);
     assert.match(renderer, /data-codex-internal-subagent-row="true"/);
+    assert.match(renderer, /row\.dataset\?\.codexInternalSubagentRow/);
+    assert.match(renderer, /item\.dataset\?\.codexInternalSubagentRow/);
     assert.match(renderer, /sidebar-section-heading="Recents"/);
   });
 
@@ -261,5 +263,65 @@ describe("renderer injection header compatibility", () => {
     assert.match(renderer, /delete item\.dataset\.codexCatalogOnlyRow/);
     assert.match(renderer, /!isCatalogOnlyRow\(row\)/);
     assert.match(renderer, /if \(rows\.length < 1\) return/);
+    assert.match(renderer, /function allSidebarThreadRows\(\)/);
+    assert.match(renderer, /function projectMoveSessionKey\(sessionId\)/);
+    assert.match(renderer, /source_detail_present/);
+    assert.match(renderer, /rollout_exists/);
+    assert.match(renderer, /function applyCatalogOnlyVisibility\(\)/);
+    assert.match(renderer, /scheduleCatalogOnlyVisibility\(\)/);
+    assert.match(renderer, /if \(allSidebarThreadRows\(\)\.length < 1\) return/);
+    assert.match(renderer, /__codexCatalogOnlyVisibilityRuntimeId/);
+  });
+
+  it("prunes only internal-subagent unread IDs through the Codex state API", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+
+    const stateApiStart = renderer.indexOf("function codexStateApiFromModule");
+    const stateApiEnd = renderer.indexOf("\n  async function codexStateApi()", stateApiStart);
+    const stateApiSource = renderer.slice(stateApiStart, stateApiEnd);
+    assert.ok(stateApiStart >= 0 && stateApiEnd > stateApiStart);
+    assert.ok(stateApiSource.indexOf("module?.kTt") < stateApiSource.indexOf("module?.qut"));
+    assert.match(renderer, /internal_subagent/);
+    assert.match(renderer, /const persistedAtomStateKey = "electron-persisted-atom-state"/);
+    assert.match(renderer, /getCodexGlobalState\(persistedAtomStateKey\)/);
+    assert.match(renderer, /pruneInternalSubagentUnreadState\(stateValue\[unreadThreadIdsByHostStateKey\]\)/);
+    assert.match(renderer, /if \(pruned\.changed\) \{\s*await setCodexGlobalState\(persistedAtomStateKey, \{/s);
+    assert.match(renderer, /\[unreadThreadIdsByHostStateKey\]: pruned\.value/);
+    assert.match(renderer, /internalSubagentUnreadPrunePollMs\s*=\s*1_000/);
+    assert.match(renderer, /internalSubagentUnreadPruneRetryPending/);
+    assert.match(renderer, /if \(internalSubagentUnreadPruneRetryPending\) scheduleInternalSubagentUnreadPrune\(true\)/);
+    assert.match(renderer, /function classifyExistingSidebarRows\(\)/);
+    assert.match(renderer, /classifyExistingSidebarRows\(\);/);
+    assert.match(renderer, /attributeFilter: \["data-app-action-sidebar-thread-id", "href"\]/);
+    assert.match(renderer, /normalizedCodexThreadUuid\(value\)/);
+    assert.match(renderer, /replace\(\/\^local:\/i, ""\)/);
+    assert.match(renderer, /if \(!Array\.isArray\(threadIds\)\) continue;/);
+    assert.match(renderer, /threadIds\.filter\(\(threadId\) => !internalIdSet\.has\(codexThreadStateKey\(threadId\)\)\)/);
+    assert.match(renderer, /if \(filtered\.length === threadIds\.length\) continue;/);
+  });
+
+  it("classifies added sidebar rows in the observer microtask before the delayed scan", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+
+    const observerStart = renderer.indexOf("new MutationObserver((mutations) => {");
+    const classify = renderer.indexOf("classifyAddedSidebarRows(mutations);", observerStart);
+    const schedule = renderer.indexOf("scheduleScan(mutations);", classify);
+    assert.ok(observerStart >= 0);
+    assert.ok(classify > observerStart);
+    assert.ok(schedule > classify);
+    assert.match(renderer, /function classifyAddedSidebarRows\(mutations\)/);
+    assert.match(renderer, /syncInternalSubagentRowVisibility\(row\)/);
+    assert.match(renderer, /data-codex-internal-subagent-row/);
+    assert.match(renderer, /setTimeout\(runScheduledScan, 200\)/);
+  });
+
+  it("keeps unknown unread state shapes and normal hosts and IDs unchanged", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+
+    assert.match(renderer, /return \{ value: stateValue, changed: false \};/);
+    assert.match(renderer, /if \(!stateValue \|\| typeof stateValue !== "object" \|\| Array\.isArray\(stateValue\)\)/);
+    assert.match(renderer, /if \(!Array\.isArray\(threadIds\)\) continue;/);
+    assert.match(renderer, /nextValue = \{ \.\.\.stateValue \}/);
+    assert.match(renderer, /nextValue\[hostId\] = filtered/);
   });
 });
