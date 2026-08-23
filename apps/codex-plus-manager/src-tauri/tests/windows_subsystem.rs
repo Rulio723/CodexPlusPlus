@@ -525,6 +525,45 @@ fn administrator_runtime_is_staged_with_fixed_executable_roles() {
 }
 
 #[test]
+fn installer_store_powershell_detection_handles_alias_and_real_package_fixture() {
+    let installer = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .and_then(std::path::Path::parent)
+            .unwrap()
+            .join("scripts/installer/windows/CodexPlusPlus.nsi"),
+    )
+    .expect("read Windows installer");
+
+    let fixture = tempfile::tempdir().expect("create Store PowerShell fixture");
+    let alias = fixture
+        .path()
+        .join("Microsoft")
+        .join("WindowsApps")
+        .join("pwsh.exe");
+    std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+    std::fs::write(&alias, []).unwrap();
+    let package = fixture
+        .path()
+        .join("Program Files")
+        .join("WindowsApps")
+        .join("Microsoft.PowerShell_7.6.4.0_x64__8wekyb3d8bbwe")
+        .join("pwsh.exe");
+    std::fs::create_dir_all(package.parent().unwrap()).unwrap();
+    std::fs::write(&package, b"store-pwsh-fixture").unwrap();
+
+    assert_eq!(std::fs::metadata(&alias).unwrap().len(), 0);
+    assert!(package.is_file());
+    assert!(installer.contains("Function CheckPowerShell7StoreAppx"));
+    assert!(installer.contains("Get-AppxPackage"));
+    assert!(installer.contains("Microsoft.PowerShell_"));
+    assert!(installer.contains("8wekyb3d8bbwe"));
+    assert!(installer.contains("PowerShell7StorePath"));
+    assert!(installer.contains("AppExecutionAlias"));
+}
+
+#[test]
 fn windows_entrypoints_register_codexplusplus_url_protocol() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let windows_install = manifest_dir

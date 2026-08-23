@@ -74,6 +74,8 @@ mod platform {
     const OFFICIAL_PACKAGE_NAME: &str = "OpenAI.Codex";
     const OFFICIAL_PACKAGE_FAMILY: &str = "OpenAI.Codex_2p2nqsd0c76g0";
     const OFFICIAL_PUBLISHER_ID: &str = "2p2nqsd0c76g0";
+    const POWERSHELL_STORE_PACKAGE_NAME: &str = "Microsoft.PowerShell";
+    const POWERSHELL_STORE_PUBLISHER_ID: &str = "8wekyb3d8bbwe";
     const TERMINAL_SHELL_MODE_FILE: &str = "shell-mode.txt";
     const OFFICIAL_RUNTIME_COMPANION_NAMES: [&str; 4] = [
         "codex-code-mode-host.exe",
@@ -919,24 +921,28 @@ mod platform {
             .join("WindowsPowerShell")
             .join("v1.0")
             .join("powershell.exe");
-        select_terminal_shell(
-            preference,
-            system_powershell7_candidates(),
-            windows_powershell,
+        let powershell7_candidates = match preference {
+            Some(TerminalShellPreference::WindowsPowerShell) => Vec::new(),
+            _ => system_powershell7_candidates(),
+        };
+        select_terminal_shell(preference, powershell7_candidates, windows_powershell).with_context(
+            || match preference {
+                Some(TerminalShellPreference::PowerShell7) => {
+                    "PowerShell 7 was selected during installation but is unavailable"
+                }
+                Some(TerminalShellPreference::WindowsPowerShell) => {
+                    "Windows PowerShell 5.1 was selected during installation but is unavailable"
+                }
+                None => "PowerShell 7 and Windows PowerShell 5.1 were not found",
+            },
         )
-        .with_context(|| match preference {
-            Some(TerminalShellPreference::PowerShell7) => {
-                "PowerShell 7 was selected during installation but is unavailable"
-            }
-            Some(TerminalShellPreference::WindowsPowerShell) => {
-                "Windows PowerShell 5.1 was selected during installation but is unavailable"
-            }
-            None => "PowerShell 7 and Windows PowerShell 5.1 were not found",
-        })
     }
 
     fn system_powershell7_candidates() -> Vec<PathBuf> {
         let mut candidates = Vec::new();
+        if let Ok(Some(store)) = discover_store_powershell7_path() {
+            candidates.push(store);
+        }
         for variable in ["ProgramFiles", "ProgramW6432"] {
             if let Some(root) = std::env::var_os(variable) {
                 let root = PathBuf::from(root);
@@ -958,6 +964,116 @@ mod platform {
                 .extend(std::env::split_paths(&path).map(|directory| directory.join("pwsh.exe")));
         }
         candidates
+    }
+
+    fn discover_store_powershell7_path() -> anyhow::Result<Option<PathBuf>> {
+        let system_directory = trusted_system_directory()?;
+        let powershell = system_directory
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        let trusted_appx_module = system_directory
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("Modules")
+            .join("Appx")
+            .join("Appx.psd1");
+        let module = trusted_appx_module.to_string_lossy().replace('\'', "''");
+        let script = format!(
+            "$ErrorActionPreference='Stop'; Import-Module -Name '{module}' -Force -ErrorAction Stop; $p=Appx\\Get-AppxPackage -Name {POWERSHELL_STORE_PACKAGE_NAME} | Where-Object {{ $_.Architecture.ToString() -match 'X64|X86|Arm64' }} | Sort-Object Version -Descending | Select-Object -First 1; if($null -eq $p){{exit 3}}; $root=[IO.Path]::GetFullPath([string]$p.InstallLocation); @($p.Name,$p.PackageFullName,$p.Version.ToString(),$p.Architecture.ToString(),$root) -join \"`t\""
+        );
+        let output = std::process::Command::new(&powershell)
+            .creation_flags(CREATE_NO_WINDOW)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                &script,
+            ])
+            .output()
+            .context("query Microsoft.PowerShell Store package")?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let stdout = String::from_utf8(output.stdout)
+            .context("Microsoft.PowerShell Store query was not UTF-8")?;
+        let fields = stdout.trim().split('\t').collect::<Vec<_>>();
+        ensure!(
+            fields.len() == 5,
+            "Microsoft.PowerShell Store query returned invalid data"
+        );
+        validate_store_powershell7_record(
+            fields[0],
+            fields[1],
+            fields[2],
+            fields[3],
+            Path::new(fields[4]),
+        )
+        .map(Some)
+    }
+
+    fn validate_store_powershell7_record(
+        name: &str,
+        package_full_name: &str,
+        version: &str,
+        architecture: &str,
+        install_location: &Path,
+    ) -> anyhow::Result<PathBuf> {
+        ensure!(
+            name == POWERSHELL_STORE_PACKAGE_NAME,
+            "PowerShell Store package identity is invalid"
+        );
+        let version_parts = version.split('.').collect::<Vec<_>>();
+        ensure!(
+            version_parts.len() == 4
+                && version_parts
+                    .iter()
+                    .all(|part| !part.is_empty() && part.parse::<u32>().is_ok())
+                && version_parts[0] == "7",
+            "PowerShell Store package version is not PowerShell 7"
+        );
+        let architecture = match architecture.to_ascii_lowercase().as_str() {
+            "x64" => "x64",
+            "x86" => "x86",
+            "arm64" => "arm64",
+            _ => anyhow::bail!("PowerShell Store package architecture is invalid"),
+        };
+        let expected_full_name = format!(
+            "{POWERSHELL_STORE_PACKAGE_NAME}_{version}_{architecture}__{POWERSHELL_STORE_PUBLISHER_ID}"
+        );
+        ensure!(
+            package_full_name == expected_full_name,
+            "PowerShell Store package full name is invalid"
+        );
+        ensure!(
+            install_location.is_absolute(),
+            "PowerShell Store install location is not absolute"
+        );
+        ensure!(
+            install_location
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value == package_full_name),
+            "PowerShell Store install location does not match package full name"
+        );
+        ensure!(
+            install_location
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("WindowsApps")),
+            "PowerShell Store install location is not under WindowsApps"
+        );
+        let executable = install_location.join("pwsh.exe");
+        ensure!(
+            executable.is_file(),
+            "PowerShell Store package does not contain pwsh.exe"
+        );
+        ensure_no_reparse_components(install_location, &executable)?;
+        Ok(executable)
     }
 
     fn first_existing_terminal_shell(
@@ -1973,6 +2089,45 @@ mod platform {
             assert_eq!(candidates.len(), 2);
             assert!(candidates[0].to_string_lossy().contains("7.10.1.0"));
             assert!(candidates[1].to_string_lossy().contains("7.5.4.0"));
+        }
+
+        #[test]
+        fn store_powershell_alias_fixture_resolves_the_real_package_binary() {
+            let temp = tempfile::tempdir().unwrap();
+            let alias = temp
+                .path()
+                .join("Users")
+                .join("test")
+                .join("AppData")
+                .join("Local")
+                .join("Microsoft")
+                .join("WindowsApps")
+                .join("pwsh.exe");
+            std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+            std::fs::write(&alias, []).unwrap();
+
+            let package_root = temp
+                .path()
+                .join("Program Files")
+                .join("WindowsApps")
+                .join("Microsoft.PowerShell_7.6.4.0_x64__8wekyb3d8bbwe");
+            let package = package_root.join("pwsh.exe");
+            std::fs::create_dir_all(&package_root).unwrap();
+            std::fs::write(&package, b"store-pwsh-fixture").unwrap();
+
+            assert_eq!(std::fs::metadata(&alias).unwrap().len(), 0);
+            assert_eq!(
+                validate_store_powershell7_record(
+                    "Microsoft.PowerShell",
+                    "Microsoft.PowerShell_7.6.4.0_x64__8wekyb3d8bbwe",
+                    "7.6.4.0",
+                    "X64",
+                    &package_root,
+                )
+                .unwrap(),
+                package
+            );
+            assert_ne!(alias, package);
         }
 
         #[test]

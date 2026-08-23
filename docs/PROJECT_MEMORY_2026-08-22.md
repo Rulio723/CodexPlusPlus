@@ -158,3 +158,20 @@ admin-terminal/pwsh-windows-powershell.exe
 ```
 
 两者都是同一安全传输 shim 的选择变体，不包含 PowerShell runtime；真正的 shell 来自本机安装。
+
+## 8. Microsoft Store PowerShell 7 检测（2026-08-23）
+
+PowerShell 7 的 Microsoft Store 安装可能同时创建
+`%LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe` App Execution Alias。该文件可能为
+0 字节 reparse alias，且没有 FileVersion；它不能作为 PowerShell 7 检测结果或执行路径。
+
+安装器和 broker 必须通过固定路径的 Windows PowerShell 5.1 查询
+`Appx\Get-AppxPackage -Name Microsoft.PowerShell`，并严格验证：
+
+- 包名为 `Microsoft.PowerShell`；
+- 版本主号为 7；
+- 包全名符合 `Microsoft.PowerShell_<version>_<arch>__8wekyb3d8bbwe`；
+- 安装目录是绝对路径并位于 `WindowsApps`；
+- 目录内存在真实 `pwsh.exe`，且不是 reparse alias。
+
+查询通过后，broker 使用真实 Store 包路径，不直接执行 PATH 中的同名 alias；MSI、ZIP、每用户安装与 PATH 检测仍保留为后续候选来源。
