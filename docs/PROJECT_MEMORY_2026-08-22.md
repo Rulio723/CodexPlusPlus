@@ -175,3 +175,9 @@ PowerShell 7 的 Microsoft Store 安装可能同时创建
 - 目录内存在真实 `pwsh.exe`，且不是 reparse alias。
 
 查询通过后，broker 使用真实 Store 包路径，不直接执行 PATH 中的同名 alias；MSI、ZIP、每用户安装与 PATH 检测仍保留为后续候选来源。
+
+NSIS 侧的 Store 查询命令连同固定启动参数必须小于 `NSIS_MAX_STRLEN`
+（当前标准构建为 1024 字符）。不得将超过该边界的长 `EncodedCommand`
+直接交给 `nsExec`；超长值会在执行前被截断，造成 Store PowerShell 7 被误报为未安装。
+安装器取得 Appx 包内路径后，仍必须调用 `CheckPowerShell7Candidate` 验证真实
+`pwsh.exe` 的文件版本主号为 7。

@@ -561,6 +561,22 @@ fn installer_store_powershell_detection_handles_alias_and_real_package_fixture()
     assert!(installer.contains("8wekyb3d8bbwe"));
     assert!(installer.contains("PowerShell7StorePath"));
     assert!(installer.contains("AppExecutionAlias"));
+    let encoded_query = installer
+        .split("!define POWERSHELL7_STORE_QUERY \"")
+        .nth(1)
+        .and_then(|value| value.split('"').next())
+        .expect("extract encoded Store PowerShell query");
+    assert!(
+        encoded_query.len() < 800,
+        "encoded Store query must fit inside NSIS_MAX_STRLEN with command arguments"
+    );
+    let store_function = installer
+        .split("Function CheckPowerShell7StoreAppx")
+        .nth(1)
+        .and_then(|value| value.split("FunctionEnd").next())
+        .expect("extract Store PowerShell detection function");
+    assert!(store_function.contains("Call CheckPowerShell7Candidate"));
+    assert!(!store_function.contains("StrCpy $PowerShell7Installed 1"));
 }
 
 #[test]
