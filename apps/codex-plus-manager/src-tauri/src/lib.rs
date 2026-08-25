@@ -123,6 +123,16 @@ pub fn run() {
             commands::install_market_script,
             commands::set_user_script_enabled,
             commands::delete_user_script,
+            commands::refresh_skill_catalog,
+            commands::list_installed_skills,
+            commands::install_skill,
+            commands::update_skill,
+            commands::set_skill_enabled,
+            commands::uninstall_skill,
+            commands::restore_skill_backup,
+            commands::delete_skill_backup,
+            commands::upsert_skill_repo,
+            commands::delete_skill_repo,
             commands::open_external_url,
             commands::install_entrypoints,
             commands::uninstall_entrypoints,
@@ -156,6 +166,10 @@ pub fn run() {
             commands::sync_live_context_entries,
             commands::upsert_context_entry,
             commands::delete_context_entry,
+            commands::parse_mcp_entry,
+            commands::build_mcp_entry,
+            commands::preview_mcp_servers_json,
+            commands::import_mcp_servers_json,
             commands::extract_relay_common_config,
             commands::test_relay_profile,
             commands::diagnose_relay_profile,
@@ -176,7 +190,8 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Opened { urls } = event {
                 for url in urls {
-                    if handle_session_share_url(url.as_str()) || handle_dream_skin_url(url.as_str()) {
+                    if handle_session_share_url(url.as_str()) || handle_dream_skin_url(url.as_str())
+                    {
                         show_main_window(app_handle);
                     }
                 }
