@@ -5121,7 +5121,7 @@ function EnhanceScreen({
             <FeatureGroup title={t("插件与模型")} detail={t("管理插件市场、模型列表和服务档位相关增强。")}>
               <FeatureToggle title={t("插件市场解锁")} detail={t("API Key 模式下扩展插件市场请求，尽量显示完整插件列表；官方/混合模式通常不需要。")} checked={form.codexAppPluginMarketplaceUnlock} disabled={!masterEnabled || !patchMode} onChange={(value) => setEnhanceFlag("codexAppPluginMarketplaceUnlock", value)} />
               <FeatureToggle title={t("模型白名单解锁")} detail={t("从环境变量和 config.toml 的 /v1/models 拉取模型并补进模型列表。")} checked={form.codexAppModelWhitelistUnlock} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppModelWhitelistUnlock", value)} />
-              <FeatureToggle title={t("Fast 按钮")} detail={t("显示服务模式切换按钮；Fast 仅支持 gpt-5.4 / gpt-5.5，其他模型按 Standard 发送。")} checked={form.codexAppServiceTierControls} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppServiceTierControls", value)} />
+              <FeatureToggle title={t("Fast 按钮")} detail={t("显示服务模式切换按钮；Fast 仅支持 gpt-5.4 / gpt-5.5 / gpt-5.6-sol / gpt-5.6-terra / gpt-5.6-luna，其他模型按 Standard 发送。")} checked={form.codexAppServiceTierControls} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppServiceTierControls", value)} />
               <div className="feature-action-row">
                 <div>
                   <strong>{t("官方远端插件缓存")}</strong>
@@ -8352,103 +8352,103 @@ function RelayProfileEditor({
           }}
           value={profile.model}
         />
-        {showApiFields ? (
-          <section className="relay-config-section relay-field-model-list">
-            <div className="relay-config-section-head">
-              <div>
-                <strong>{t("模型列表")}</strong>
-                <span>
-                  {t("每行一个模型；上下文窗口可填")} <code>1M</code>{t("、")}<code>200K</code> {t("或")} <code>1000000</code>{t("，留空表示使用 Codex 默认长度。")}
-                </span>
-              </div>
-              <div className="relay-model-list-tools">
+        {/* 模型列表始终显示：官方模式下也要能配每模型的上下文窗口（1M），
+            以前被 showApiFields 门控住了。*/}
+        <section className="relay-config-section relay-field-model-list">
+          <div className="relay-config-section-head">
+            <div>
+              <strong>{t("模型列表")}</strong>
+              <span>
+                {t("每行一个模型；上下文窗口可填")} <code>1M</code>{t("、")}<code>200K</code> {t("或")} <code>1000000</code>{t("，留空表示使用 Codex 默认长度。")}
+              </span>
+            </div>
+            <div className="relay-model-list-tools">
+              <Button
+                onClick={() => setModelWindowRows([...modelWindowRows, { model: "", window: "", imageHandling: "" }])}
+                size="sm"
+                type="button"
+                variant="secondary"
+              >
+                <Plus className="h-4 w-4" />
+                {t("添加模型")}
+              </Button>
+              <Button
+                onClick={async () => {
+                  const serializedRows = serializeModelWindowRows(modelWindowRows);
+                  const models = await actions.fetchRelayProfileModels({
+                    ...profile,
+                    modelList: serializedRows.modelList,
+                    modelWindows: serializedRows.modelWindows,
+                  });
+                  if (models?.length) {
+                    addModelWindowRows(models.map((model) => ({ model, window: "", imageHandling: "" })));
+                  }
+                }}
+                size="sm"
+                type="button"
+                variant="secondary"
+              >
+                <Download className="h-4 w-4" />
+                {t("从上游获取")}
+              </Button>
+              <Button
+                disabled={!modelWindowRows.some((row) => row.model.trim())}
+                onClick={() => setModelWindowRows([{ model: "", window: "", imageHandling: "send-as-is" }])}
+                size="sm"
+                title={t("清空模型")}
+                type="button"
+                variant="outline"
+              >
+                <Trash2 className="h-4 w-4" />
+                {t("清空模型")}
+              </Button>
+            </div>
+          </div>
+          <div className="relay-model-row-editor">
+            <div className="relay-model-row relay-model-row-head">
+              <span>{t("模型名称")}</span>
+              <span>{t("上下文窗口")}</span>
+              <span>{t("图片处理方式")}</span>
+            </div>
+            {modelWindowRows.map((row, index) => (
+              <div className="relay-model-row" key={index}>
+                <Input
+                  value={row.model}
+                  onChange={(event) => updateModelWindowRow(index, { model: event.currentTarget.value })}
+                  placeholder="deepseek/deepseek-v4-flash"
+                />
+                <Input
+                  value={row.window}
+                  onChange={(event) => updateModelWindowRow(index, { window: event.currentTarget.value })}
+                  placeholder="1M"
+                />
+                <AppSelect
+                  className="text-xs"
+                  value={row.imageHandling}
+                  disabled={vlmUnsupportedProtocol}
+                  onChange={(value) => updateModelWindowRow(index, { imageHandling: value })}
+                  options={[
+                    { value: "", label: t("纯文本模型请配置此项"), disabled: true },
+                    { value: "send-as-is", label: t("原样发送图片"), title: t("多模态模型直接接收图片,不经过任何处理") },
+                    { value: "strip", label: t("移除图片"), title: t("删掉图片只发文字,避免纯文本模型报错(模型看不到图)") },
+                    { value: "vlm", label: t("视觉辅助分析"), title: t("图片先由视觉辅助模型(Qwen)转成文字描述,纯文本模型也能\"看图\"") },
+                  ]}
+                  title={vlmUnsupportedProtocol ? t("VLM 仅支持 Chat Completions 协议和聚合模式") : t("多模态模型（支持图片输入的模型）请保持 send-as-is。")}
+                />
                 <Button
-                  onClick={() => setModelWindowRows([...modelWindowRows, { model: "", window: "", imageHandling: "" }])}
-                  size="sm"
+                  aria-label={t("删除模型")}
+                  onClick={() => removeModelWindowRow(index)}
+                  size="icon"
+                  title={t("删除模型")}
                   type="button"
-                  variant="secondary"
-                >
-                  <Plus className="h-4 w-4" />
-                  {t("添加模型")}
-                </Button>
-                <Button
-                  onClick={async () => {
-                    const serializedRows = serializeModelWindowRows(modelWindowRows);
-                    const models = await actions.fetchRelayProfileModels({
-                      ...profile,
-                      modelList: serializedRows.modelList,
-                      modelWindows: serializedRows.modelWindows,
-                    });
-                    if (models?.length) {
-                      addModelWindowRows(models.map((model) => ({ model, window: "", imageHandling: "" })));
-                    }
-                  }}
-                  size="sm"
-                  type="button"
-                  variant="secondary"
-                >
-                  <Download className="h-4 w-4" />
-                  {t("从上游获取")}
-                </Button>
-                <Button
-                  disabled={!modelWindowRows.some((row) => row.model.trim())}
-                  onClick={() => setModelWindowRows([{ model: "", window: "", imageHandling: "send-as-is" }])}
-                  size="sm"
-                  title={t("清空模型")}
-                  type="button"
-                  variant="outline"
+                  variant="ghost"
                 >
                   <Trash2 className="h-4 w-4" />
-                  {t("清空模型")}
                 </Button>
               </div>
-            </div>
-            <div className="relay-model-row-editor">
-              <div className="relay-model-row relay-model-row-head">
-                <span>{t("模型名称")}</span>
-                <span>{t("上下文窗口")}</span>
-                <span>{t("图片处理方式")}</span>
-              </div>
-              {modelWindowRows.map((row, index) => (
-                <div className="relay-model-row" key={index}>
-                  <Input
-                    value={row.model}
-                    onChange={(event) => updateModelWindowRow(index, { model: event.currentTarget.value })}
-                    placeholder="deepseek/deepseek-v4-flash"
-                  />
-                  <Input
-                    value={row.window}
-                    onChange={(event) => updateModelWindowRow(index, { window: event.currentTarget.value })}
-                    placeholder="1M"
-                  />
-                  <AppSelect
-                    className="text-xs"
-                    value={row.imageHandling}
-                    disabled={vlmUnsupportedProtocol}
-                    onChange={(value) => updateModelWindowRow(index, { imageHandling: value })}
-                    options={[
-                      { value: "", label: t("纯文本模型请配置此项"), disabled: true },
-                      { value: "send-as-is", label: t("原样发送图片"), title: t("多模态模型直接接收图片,不经过任何处理") },
-                      { value: "strip", label: t("移除图片"), title: t("删掉图片只发文字,避免纯文本模型报错(模型看不到图)") },
-                      { value: "vlm", label: t("视觉辅助分析"), title: t("图片先由视觉辅助模型(Qwen)转成文字描述,纯文本模型也能\"看图\"") },
-                    ]}
-                    title={vlmUnsupportedProtocol ? t("VLM 仅支持 Chat Completions 协议和聚合模式") : t("多模态模型（支持图片输入的模型）请保持 send-as-is。")}
-                  />
-                  <Button
-                    aria-label={t("删除模型")}
-                    onClick={() => removeModelWindowRow(index)}
-                    size="icon"
-                    title={t("删除模型")}
-                    type="button"
-                    variant="ghost"
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </Button>
-                </div>
-              ))}
-            </div>
-          </section>
-        ) : null}
+            ))}
+          </div>
+        </section>
         <label className="switch-row compact relay-switch-row relay-field-goals">
           <input
             checked={goalsFeatureState.enabled}
