@@ -108,6 +108,8 @@ import {
 } from "./administrator-mode";
 import { officialAccountsAfterProviderSwitch } from "./official-accounts";
 import { relayAuthForLiveDraft, shouldBackfillRelayProfileBeforeSwitch } from "./relay-live-files";
+import { MCP_PRESETS, mcpPresetById } from "./mcp-presets";
+import { resolveProviderName } from "./provider-name";
 import { resolveProviderSyncCompletion } from "./provider-sync-flow";
 import { resolveLaunchStatus } from "./launch-status";
 import {
@@ -323,8 +325,9 @@ export type RelayProfile = {
   configContents: string;
   authContents: string;
   useCommonConfig: boolean;
-  contextSelection: RelayContextSelection;
-  contextSelectionInitialized: boolean;
+  /** 兼容历史 settings；normalize 后会丢弃，绝不再参与上下文筛选。 */
+  contextSelection?: LegacyRelayContextSelection;
+  contextSelectionInitialized?: boolean;
   contextWindow: string;
   autoCompactLimit: string;
   modelList: string;
@@ -362,12 +365,6 @@ type AggregateRelayProfile = {
   members: AggregateRelayMember[];
 };
 
-type RelayContextSelection = {
-  mcpServers: string[];
-  skills: string[];
-  plugins: string[];
-};
-
 type ContextKind = "mcp" | "skill" | "plugin";
 
 type CodexContextEntry = {
@@ -384,6 +381,52 @@ type CodexContextEntries = {
   skills: CodexContextEntry[];
   plugins: CodexContextEntry[];
 };
+
+type LegacyRelayContextSelection = {
+  mcpServers: string[];
+  skills: string[];
+  plugins: string[];
+};
+
+type McpTransport = "stdio" | "http";
+type McpKeyValue = { key: string; value: string };
+
+/** 与 Rust 侧 mcp_config::McpServerForm 一一对应。 */
+type McpServerForm = {
+  transport: McpTransport;
+  command: string;
+  args: string[];
+  env: McpKeyValue[];
+  cwd: string;
+  url: string;
+  httpHeaders: McpKeyValue[];
+  bearerToken: string;
+  startupTimeoutSec: string;
+  enabled: boolean;
+  /** 表单不认识的键（oauth、scopes 等）原样保留。 */
+  extraToml: string;
+};
+
+const emptyMcpForm = (): McpServerForm => ({
+  transport: "stdio",
+  command: "",
+  args: [],
+  env: [],
+  cwd: "",
+  url: "",
+  httpHeaders: [],
+  bearerToken: "",
+  startupTimeoutSec: "",
+  enabled: true,
+  extraToml: "",
+});
+
+type McpFormResult = CommandResult<{ form: McpServerForm }>;
+type McpTomlResult = CommandResult<{ tomlBody: string }>;
+type McpImportPreviewResult = CommandResult<{
+  entries: Array<{ id: string; tomlBody: string }>;
+  warnings: string[];
+}>;
 
 type InstalledSkill = {
   id: string;
@@ -411,12 +454,6 @@ type RelayMode = "official" | "mixedApi" | "pureApi" | "aggregate";
 type RelaySessionProvider = "custom" | "openai";
 const CHAT_UPSTREAM_BASE_URL_KEY = "codex_plus_chat_base_url";
 const SCRIPT_MARKET_REPOSITORY_URL = "https://github.com/BigPizzaV3/CodexPlusPlusScriptMarket";
-
-const emptyContextSelection = (): RelayContextSelection => ({
-  mcpServers: [],
-  skills: [],
-  plugins: [],
-});
 
 type UserScriptInventory = {
   enabled?: boolean;
@@ -1075,8 +1112,6 @@ const defaultSettings: BackendSettings = {
       configContents: "",
       authContents: "",
       useCommonConfig: true,
-      contextSelection: emptyContextSelection(),
-      contextSelectionInitialized: true,
       contextWindow: "",
       autoCompactLimit: "",
       modelList: "",
@@ -3025,6 +3060,49 @@ export function App() {
     return normalized;
   };
 
+  // TOML ↔ 表单转换由 Rust 执行，以保留表单未知的 MCP 高级字段。
+  const parseMcpEntry = async (tomlBody: string): Promise<McpServerForm | null> => {
+    const result = await run(() => call<McpFormResult>("parse_mcp_entry", { tomlBody }));
+    if (!result) return null;
+    if (!isSuccessStatus(result.status)) {
+      showResultNotice(t("MCP 配置"), result);
+      return null;
+    }
+    return result.form;
+  };
+
+  const buildMcpEntry = async (form: McpServerForm): Promise<string | null> => {
+    const result = await run(() => call<McpTomlResult>("build_mcp_entry", { form }));
+    if (!result) return null;
+    if (!isSuccessStatus(result.status)) {
+      showResultNotice(t("MCP 配置"), result);
+      return null;
+    }
+    return result.tomlBody;
+  };
+
+  const previewMcpServersJson = async (json: string) => {
+    const result = await run(() => call<McpImportPreviewResult>("preview_mcp_servers_json", { json }));
+    if (result && !isSuccessStatus(result.status)) showResultNotice(t("MCP 导入"), result);
+    return result;
+  };
+
+  const importMcpServersJson = async (next: BackendSettings, json: string) => {
+    const result = await run(() =>
+      call<ContextEntriesResult>("import_mcp_servers_json", { request: { settings: next, json } }),
+    );
+    if (!result) return null;
+    let normalized = normalizeSettings(result.settings);
+    const saveResult = await run(() => call<SettingsResult>("save_settings", { settings: normalized }));
+    if (saveResult) {
+      setSettings(saveResult);
+      normalized = normalizeSettings(saveResult.settings);
+    }
+    setSettingsForm(normalized);
+    showResultNotice(t("MCP 导入"), result);
+    return isSuccessStatus(result.status) ? normalized : null;
+  };
+
   const deleteContextEntry = async (next: BackendSettings, kind: ContextKind, id: string) => {
     const result = await run(() =>
       call<ContextEntriesResult>("delete_context_entry", {
@@ -3588,6 +3666,10 @@ export function App() {
       clearRelayInjection,
       saveRelayFile,
       upsertContextEntry,
+      parseMcpEntry,
+      buildMcpEntry,
+      previewMcpServersJson,
+      importMcpServersJson,
       deleteContextEntry,
       extractRelayCommonConfig,
       testRelayProfile,
@@ -4033,6 +4115,10 @@ type Actions = {
     id: string,
     tomlBody: string,
   ) => Promise<BackendSettings | null>;
+  parseMcpEntry: (tomlBody: string) => Promise<McpServerForm | null>;
+  buildMcpEntry: (form: McpServerForm) => Promise<string | null>;
+  previewMcpServersJson: (json: string) => Promise<McpImportPreviewResult | null>;
+  importMcpServersJson: (settings: BackendSettings, json: string) => Promise<BackendSettings | null>;
   deleteContextEntry: (settings: BackendSettings, kind: ContextKind, id: string) => Promise<BackendSettings | null>;
   extractRelayCommonConfig: (configContents: string) => Promise<ExtractRelayCommonConfigResult | null>;
   testRelayProfile: (profile: RelayProfile) => Promise<void>;
@@ -7469,7 +7555,6 @@ function RelayProfileDetail({
         <RelayProfileEditor profile={draft} form={form} isNew={isNew} onProfileChange={setDraft} onSwitch={switchDraft} actions={actions} modelWindowRows={modelWindowRows} setModelWindowRows={setModelWindowRows} />
       {isAggregateRelayProfile(draft) ? null : (
       <RelayFileEditors
-        contextProfile={profile}
         profile={draft}
         form={form}
         isActive={isActive}
@@ -8231,15 +8316,24 @@ function RelayContextManager({
   const entries = contextEntriesWithLiveEntries(form, liveEntries);
   const [activeKind, setActiveKind] = useState<ContextKind>("mcp");
   const [editor, setEditor] = useState<{ kind: ContextKind; entry?: CodexContextEntry } | null>(null);
+  const [importOpen, setImportOpen] = useState(false);
   const visibleEntries = contextEntriesByKind(entries, activeKind);
   const label = contextKindLabel(activeKind);
   const installedSkills = skillInventory?.skills ?? [];
   const visibleCount = activeKind === "skill" ? installedSkills.length : visibleEntries.length;
 
+  const syncContextEntries = async (next: BackendSettings) => {
+    const syncResult = await actions.syncLiveContextEntries(next, true);
+    if (!syncResult || !isSuccessStatus(syncResult.status)) return false;
+    await actions.refreshRelayFiles();
+    return true;
+  };
+
   const saveEntry = async (kind: ContextKind, id: string, tomlBody: string) => {
     const next = await actions.upsertContextEntry(form, kind, id, tomlBody);
     if (!next) return;
     onFormChange(next);
+    if (!(await syncContextEntries(next))) return;
     setEditor(null);
   };
 
@@ -8248,16 +8342,22 @@ function RelayContextManager({
     const next = await actions.upsertContextEntry(form, entry.kind, entry.id, nextBody);
     if (!next) return;
     onFormChange(next);
-    const syncResult = await actions.syncLiveContextEntries(next, true);
-    if (syncResult && isSuccessStatus(syncResult.status)) {
-      void actions.refreshRelayFiles();
-    }
+    await syncContextEntries(next);
   };
 
   const deleteEntry = async (entry: CodexContextEntry) => {
     const next = await actions.deleteContextEntry(form, entry.kind, entry.id);
     if (!next) return;
     onFormChange(next);
+    await syncContextEntries(next);
+  };
+
+  const importJson = async (json: string) => {
+    const next = await actions.importMcpServersJson(form, json);
+    if (!next) return;
+    onFormChange(next);
+    if (!(await syncContextEntries(next))) return;
+    setImportOpen(false);
   };
 
   return (
@@ -8265,7 +8365,7 @@ function RelayContextManager({
       <div className="relay-context-head">
         <div>
           <strong>{t("Codex 工具与插件")}</strong>
-          <span>{t("MCP 与插件配置随供应商同步；Skills 直接读取 Codex 的 SKILL.md 安装目录。")}</span>
+          <span>{t("MCP 与插件作为全局配置独立管理；真实 Skills 直接读取 Codex 的 SKILL.md 安装目录。")}</span>
         </div>
         <div className="relay-context-head-actions">
           {activeKind === "skill" ? (
@@ -8280,10 +8380,18 @@ function RelayContextManager({
               </Button>
             </>
           ) : (
-            <Button onClick={() => setEditor({ kind: activeKind })} size="sm" variant="secondary">
-              <Plus className="h-4 w-4" />
-              {t("新增")}{label}
-            </Button>
+            <>
+              {activeKind === "mcp" ? (
+                <Button onClick={() => { setEditor(null); setImportOpen(true); }} size="sm" variant="secondary">
+                  <Download className="h-4 w-4" />
+                  {t("导入 JSON")}
+                </Button>
+              ) : null}
+              <Button onClick={() => { setImportOpen(false); setEditor({ kind: activeKind }); }} size="sm" variant="secondary">
+                <Plus className="h-4 w-4" />
+                {t("新增")}{label}
+              </Button>
+            </>
           )}
         </div>
       </div>
@@ -8292,10 +8400,7 @@ function RelayContextManager({
           <button
             className={activeKind === option.kind ? "active" : ""}
             key={option.kind}
-            onClick={() => {
-              setActiveKind(option.kind);
-              setEditor(null);
-            }}
+            onClick={() => { setActiveKind(option.kind); setEditor(null); setImportOpen(false); }}
             type="button"
           >
             <span>{option.label}</span>
@@ -8312,56 +8417,25 @@ function RelayContextManager({
         <SkillManager inventory={skillInventory} actions={actions} />
       ) : (
         <div className="relay-context-list">
-          {visibleEntries.length ? (
-            visibleEntries.map((entry) => (
-              <div className="relay-context-row" key={`${entry.kind}-${entry.id}`}>
-                <strong className="context-title">{entry.title || entry.id}</strong>
-                <div className="relay-context-actions">
-                  <button
-                    aria-checked={entry.enabled}
-                    aria-label={`contextEnabledSwitch-${entry.kind}-${entry.id}`}
-                    className={`context-enabled-switch ${entry.enabled ? "active" : ""}`}
-                    onClick={() => void toggleContextEntryEnabled(entry)}
-                    role="switch"
-                    title={entry.enabled ? t("禁用此扩展项") : t("启用此扩展项")}
-                    type="button"
-                  >
-                    <span className="context-switch-track" aria-hidden="true">
-                      <span className="context-switch-thumb" />
-                    </span>
-                  </button>
-                  <Button onClick={() => setEditor({ kind: entry.kind, entry })} size="icon" title={t("编辑扩展项")} variant="ghost">
-                    <Edit3 className="h-4 w-4" />
-                  </Button>
-                  <Button
-                    className="relay-context-delete"
-                    onClick={() => void deleteEntry(entry)}
-                    size="icon"
-                    title={t("删除扩展项")}
-                    variant="ghost"
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </Button>
-                </div>
+          {visibleEntries.length ? visibleEntries.map((entry) => (
+            <div className="relay-context-row" key={`${entry.kind}-${entry.id}`}>
+              <strong className="context-title">{entry.title || entry.id}</strong>
+              <div className="relay-context-actions">
+                <button aria-checked={entry.enabled} aria-label={`contextEnabledSwitch-${entry.kind}-${entry.id}`} className={`context-enabled-switch ${entry.enabled ? "active" : ""}`} onClick={() => void toggleContextEntryEnabled(entry)} role="switch" title={entry.enabled ? t("禁用此扩展项") : t("启用此扩展项")} type="button">
+                  <span className="context-switch-track" aria-hidden="true"><span className="context-switch-thumb" /></span>
+                </button>
+                <Button onClick={() => { setImportOpen(false); setEditor({ kind: entry.kind, entry }); }} size="icon" title={t("编辑扩展项")} variant="ghost"><Edit3 className="h-4 w-4" /></Button>
+                <Button className="relay-context-delete" onClick={() => void deleteEntry(entry)} size="icon" title={t("删除扩展项")} variant="ghost"><Trash2 className="h-4 w-4" /></Button>
               </div>
-            ))
-          ) : (
-            <div className="empty">{t("暂无")}{label}{t("，可以从通用配置文件或这里新增。")}</div>
-          )}
+            </div>
+          )) : <div className="empty">{t("暂无")}{label}{t("，可以从通用配置文件或这里新增。")}</div>}
         </div>
       )}
-      {editor && activeKind !== "skill" ? (
-        <ContextEntryEditor
-          entry={editor.entry}
-          kind={editor.kind}
-          onCancel={() => setEditor(null)}
-          onSave={(kind, id, tomlBody) => void saveEntry(kind, id, tomlBody)}
-        />
-      ) : null}
+      {importOpen ? <McpJsonImporter actions={actions} onCancel={() => setImportOpen(false)} onImport={importJson} /> : null}
+      {editor && activeKind !== "skill" ? <ContextEntryEditor actions={actions} entry={editor.entry} kind={editor.kind} onCancel={() => setEditor(null)} onSave={(kind, id, tomlBody) => void saveEntry(kind, id, tomlBody)} /> : null}
     </div>
   );
 }
-
 function SkillManager({ inventory, actions }: { inventory: SkillInventoryResult | null; actions: Actions }) {
   const [query, setQuery] = useState("");
   const [sourceFilter, setSourceFilter] = useState<"all" | "user" | "system" | "plugin">("all");
@@ -8484,37 +8558,200 @@ function skillSourceLabel(skill: InstalledSkill): string {
   return skill.enabled ? t("用户安装") : t("用户安装 · 已禁用");
 }
 
+function McpJsonImporter({
+  actions,
+  onCancel,
+  onImport,
+}: {
+  actions: Actions;
+  onCancel: () => void;
+  onImport: (json: string) => void;
+}) {
+  const [json, setJson] = useState("");
+  const [preview, setPreview] = useState<McpImportPreviewResult | null>(null);
+
+  const runPreview = async () => {
+    const result = await actions.previewMcpServersJson(json);
+    setPreview(result && isSuccessStatus(result.status) ? result : null);
+  };
+
+  return (
+    <div aria-modal="true" className="modal-backdrop" role="dialog">
+      <div className="modal-card context-modal">
+        <div className="modal-head">
+          <div>
+            <h2>{t("导入 MCP JSON")}</h2>
+            <p className="modal-message">
+              {t("支持 mcpServers / servers 包裹，也支持直接粘贴单个服务器配置。")}
+            </p>
+          </div>
+          <button aria-label={t("关闭窗口")} className="toast-close" onClick={onCancel} type="button">×</button>
+        </div>
+      <Field label={t("MCP 配置 JSON")}>
+        <Textarea
+          className="context-editor-textarea"
+          value={json}
+          onChange={(event) => {
+            setJson(event.currentTarget.value);
+            // 内容变了，旧预览就作废，免得用户对着过期结果点导入
+            setPreview(null);
+          }}
+          placeholder={'{\n  "mcpServers": {\n    "context7": {\n      "command": "npx",\n      "args": ["-y", "@upstash/context7-mcp"]\n    }\n  }\n}'}
+          spellCheck={false}
+        />
+      </Field>
+      {preview ? (
+        <div className="relay-context-summary">
+          <div>{tf("将导入 {0} 个：{1}", [preview.entries.length, preview.entries.map((item) => item.id).join("、")])}</div>
+          {preview.warnings.map((warning) => (
+            <div key={warning}>⚠ {warning}</div>
+          ))}
+        </div>
+      ) : null}
+      <Toolbar>
+        <Button disabled={!json.trim()} onClick={() => void runPreview()} size="sm" variant="secondary">
+          {t("预览")}
+        </Button>
+        <Button disabled={!preview} onClick={() => onImport(json)} size="sm">
+          <Download className="h-4 w-4" />
+          {t("确认导入")}
+        </Button>
+        <Button onClick={onCancel} size="sm" variant="secondary">{t("取消")}</Button>
+      </Toolbar>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * MCP / 插件条目编辑器。
+ *
+ * MCP 走结构化表单：codex 的字段名有坑（headers 其实叫 http_headers，type 根本
+ * 不读），让用户手写 TOML 很容易踩。表单不认识的高级键（oauth、scopes 等）由
+ * Rust 侧收进 extraToml 原样带着，不会因为在表单里点一下就丢掉。
+ *
+ * 插件仍是裸 TOML：[plugins."x@y"] 实际只有 enabled 一个键，没必要做表单。
+ */
 function ContextEntryEditor({
   kind,
   entry,
   onCancel,
   onSave,
+  actions,
 }: {
   kind: ContextKind;
   entry?: CodexContextEntry;
   onCancel: () => void;
   onSave: (kind: ContextKind, id: string, tomlBody: string) => void;
+  actions: Actions;
 }) {
   const [draftKind, setDraftKind] = useState<ContextKind>(entry?.kind ?? kind);
   const [id, setId] = useState(entry?.id ?? "");
   const [tomlBody, setTomlBody] = useState(entry?.tomlBody ?? "");
+  const [form, setForm] = useState<McpServerForm>(emptyMcpForm());
+  const [rawMode, setRawMode] = useState(false);
+  const [formReady, setFormReady] = useState(false);
   const canSave = id.trim().length > 0;
+  const useForm = draftKind === "mcp";
+
+  // 打开已有 MCP 条目时把 TOML 拆进表单。解析失败（手写坏了）就退回裸 TOML，
+  // 总比把用户的内容丢掉强。
+  useEffect(() => {
+    let cancelled = false;
+    const initial = entry?.tomlBody ?? "";
+    if (!useForm || !initial.trim()) {
+      setFormReady(true);
+      return;
+    }
+    setFormReady(false);
+    void actions.parseMcpEntry(initial).then((parsed) => {
+      if (cancelled) return;
+      if (parsed) setForm(parsed);
+      else setRawMode(true);
+      setFormReady(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [entry, useForm, actions]);
+
+  const updateForm = (patch: Partial<McpServerForm>) => setForm((current) => ({ ...current, ...patch }));
+
+  // 选中预设就把 id 和配置一起填好；用户随后仍可自由改。已有条目不给选，
+  // 免得一次误触把手写的配置盖掉。
+  const applyPreset = async (presetId: string) => {
+    const preset = mcpPresetById(presetId);
+    if (!preset) return;
+    const body = preset.tomlBody({ windows: isWindowsPlatform });
+    setId(preset.id);
+    setTomlBody(body);
+    const parsed = await actions.parseMcpEntry(body);
+    if (parsed) setForm(parsed);
+  };
+
+  // 展开高级区：表单 → TOML；收起：TOML → 表单。以当前所处模式为准保存。
+  const toggleRawMode = async () => {
+    if (!rawMode) {
+      const built = await actions.buildMcpEntry(form);
+      if (built === null) return;
+      setTomlBody(built);
+      setRawMode(true);
+      return;
+    }
+    const parsed = await actions.parseMcpEntry(tomlBody);
+    if (!parsed) return;
+    setForm(parsed);
+    setRawMode(false);
+  };
+
+  const save = async () => {
+    if (!useForm || rawMode) {
+      onSave(draftKind, id.trim(), tomlBody);
+      return;
+    }
+    const built = await actions.buildMcpEntry(form);
+    if (built === null) return;
+    onSave(draftKind, id.trim(), built);
+  };
+
+  const title = entry ? t("编辑扩展项") : tf("新增{0}", [contextKindLabel(draftKind)]);
 
   return (
-    <div className="context-editor">
+    <div aria-modal="true" className="modal-backdrop" role="dialog">
+      <div className="modal-card context-modal">
+        <div className="modal-head">
+          <div>
+            <h2>{title}</h2>
+            <p className="modal-message">
+              {useForm
+                ? t("按字段填写即可；表单没覆盖的高级配置会原样保留。")
+                : t("只填写表头下面的内容。")}
+            </p>
+          </div>
+          <button aria-label={t("关闭窗口")} className="toast-close" onClick={onCancel} type="button">×</button>
+        </div>
+      <div className="context-editor">
       <div className="context-editor-fields">
         <Field label={t("类型")}>
-          <select
-            className="field-select"
+          <AppSelect
             disabled={!!entry}
             value={draftKind}
-            onChange={(event) => setDraftKind(event.currentTarget.value as ContextKind)}
-          >
-            {contextKindOptions.map((option) => (
-              <option key={option.kind} value={option.kind}>{option.label}</option>
-            ))}
-          </select>
+            onChange={(value) => setDraftKind(value)}
+            options={contextKindOptions.map((option) => ({ value: option.kind, label: option.label }))}
+          />
         </Field>
+        {!entry && useForm ? (
+          <Field label={t("从预设填充")}>
+            <AppSelect
+              value=""
+              onChange={(value) => void applyPreset(value)}
+              options={[
+                { value: "", label: t("不使用预设") },
+                ...MCP_PRESETS.map((preset) => ({ value: preset.id, label: preset.name })),
+              ]}
+            />
+          </Field>
+        ) : null}
         <Field label="ID">
           <Input
             disabled={!!entry}
@@ -8524,26 +8761,245 @@ function ContextEntryEditor({
           />
         </Field>
       </div>
-      <Field label={t("TOML 配置体")}>
-        <Textarea
-          className="context-editor-textarea"
-          value={tomlBody}
-          onChange={(event) => setTomlBody(event.currentTarget.value)}
-          placeholder={t("只填写表头下面的内容，例如：\ncommand = \"npx\"\nargs = [\"-y\", \"@upstash/context7-mcp\"]")}
-          spellCheck={false}
-        />
-      </Field>
+      {!entry && useForm && mcpPresetById(id) ? (
+        <div className="relay-context-summary">{mcpPresetById(id)?.description}</div>
+      ) : null}
+
+      {useForm && !rawMode && formReady ? (
+        <McpServerFormFields form={form} onChange={updateForm} />
+      ) : null}
+
+      {useForm ? (
+        <button className="context-advanced-toggle" onClick={() => void toggleRawMode()} type="button">
+          {rawMode ? "▾" : "▸"} {t("高级：直接编辑 TOML")}
+        </button>
+      ) : null}
+
+      {!useForm || rawMode ? (
+        <Field label={t("TOML 配置体")}>
+          <Textarea
+            className="context-editor-textarea"
+            value={tomlBody}
+            onChange={(event) => setTomlBody(event.currentTarget.value)}
+            placeholder={t("只填写表头下面的内容，例如：\ncommand = \"npx\"\nargs = [\"-y\", \"@upstash/context7-mcp\"]")}
+            spellCheck={false}
+          />
+        </Field>
+      ) : null}
+
       <Toolbar>
-        <Button disabled={!canSave} onClick={() => onSave(draftKind, id.trim(), tomlBody)} size="sm">
+        <Button disabled={!canSave} onClick={() => void save()} size="sm">
           <Save className="h-4 w-4" />
           {t("保存扩展项")}
         </Button>
         <Button onClick={onCancel} size="sm" variant="secondary">{t("取消")}</Button>
       </Toolbar>
+      </div>
+      </div>
     </div>
   );
 }
 
+/** stdio 和 HTTP 两套字段，按传输方式切换显示。 */
+function McpServerFormFields({
+  form,
+  onChange,
+}: {
+  form: McpServerForm;
+  onChange: (patch: Partial<McpServerForm>) => void;
+}) {
+  return (
+    <>
+      <Field label={t("传输方式")}>
+        <div className="script-market-view-toggle" role="group" aria-label={t("传输方式")}>
+          {([
+            { value: "stdio" as const, label: t("本地命令 (stdio)") },
+            { value: "http" as const, label: t("远程 HTTP") },
+          ]).map((option) => (
+            <Button
+              aria-pressed={form.transport === option.value}
+              key={option.value}
+              onClick={() => onChange({ transport: option.value })}
+              size="sm"
+              variant={form.transport === option.value ? "secondary" : "ghost"}
+            >
+              {option.label}
+            </Button>
+          ))}
+        </div>
+      </Field>
+
+      {form.transport === "stdio" ? (
+        <>
+          <Field label={t("命令")}>
+            <Input
+              value={form.command}
+              onChange={(event) => onChange({ command: event.currentTarget.value })}
+              placeholder={isWindowsPlatform ? "cmd" : "npx"}
+            />
+          </Field>
+          <McpStringListField
+            label={t("参数")}
+            values={form.args}
+            onChange={(args) => onChange({ args })}
+            addLabel={t("添加参数")}
+            placeholder={t("例如 -y")}
+          />
+          <McpPairListField
+            label={t("环境变量")}
+            pairs={form.env}
+            onChange={(env) => onChange({ env })}
+            addLabel={t("添加环境变量")}
+          />
+          <Field label={t("工作目录")}>
+            <Input
+              value={form.cwd}
+              onChange={(event) => onChange({ cwd: event.currentTarget.value })}
+              placeholder={t("留空则用默认目录")}
+            />
+          </Field>
+        </>
+      ) : (
+        <>
+          <Field label="URL">
+            <Input
+              value={form.url}
+              onChange={(event) => onChange({ url: event.currentTarget.value })}
+              placeholder="https://example.com/mcp"
+            />
+          </Field>
+          <McpPairListField
+            label={t("请求头")}
+            pairs={form.httpHeaders}
+            onChange={(httpHeaders) => onChange({ httpHeaders })}
+            addLabel={t("添加请求头")}
+          />
+          <Field label={t("Bearer Token")}>
+            <Input
+              value={form.bearerToken}
+              onChange={(event) => onChange({ bearerToken: event.currentTarget.value })}
+              placeholder={t("留空则不写入")}
+            />
+          </Field>
+        </>
+      )}
+
+      <Field label={t("启动超时（秒）")}>
+        <Input
+          value={form.startupTimeoutSec}
+          onChange={(event) => onChange({ startupTimeoutSec: event.currentTarget.value })}
+          placeholder={t("留空则用 codex 默认值")}
+        />
+      </Field>
+      {form.extraToml.trim() ? (
+        <div className="relay-context-summary">
+          {t("此条目还有表单未覆盖的高级配置，保存时会原样保留。展开下方高级区可查看。")}
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+function McpStringListField({
+  label,
+  values,
+  onChange,
+  addLabel,
+  placeholder,
+}: {
+  label: string;
+  values: string[];
+  onChange: (values: string[]) => void;
+  addLabel: string;
+  placeholder?: string;
+}) {
+  return (
+    <Field label={label}>
+      <div className="mcp-list-field">
+        {values.map((value, index) => (
+          <div className="mcp-list-row" key={index}>
+            <Input
+              value={value}
+              onChange={(event) => {
+                const next = [...values];
+                next[index] = event.currentTarget.value;
+                onChange(next);
+              }}
+              placeholder={placeholder}
+            />
+            <Button
+              onClick={() => onChange(values.filter((_, position) => position !== index))}
+              size="icon"
+              title={t("删除这一项")}
+              variant="ghost"
+            >
+              <Trash2 className="h-4 w-4" />
+            </Button>
+          </div>
+        ))}
+        <Button onClick={() => onChange([...values, ""])} size="sm" variant="secondary">
+          <Plus className="h-4 w-4" />
+          {addLabel}
+        </Button>
+      </div>
+    </Field>
+  );
+}
+
+function McpPairListField({
+  label,
+  pairs,
+  onChange,
+  addLabel,
+}: {
+  label: string;
+  pairs: McpKeyValue[];
+  onChange: (pairs: McpKeyValue[]) => void;
+  addLabel: string;
+}) {
+  const update = (index: number, patch: Partial<McpKeyValue>) => {
+    const next = [...pairs];
+    next[index] = { ...next[index], ...patch };
+    onChange(next);
+  };
+  return (
+    <Field label={label}>
+      <div className="mcp-list-field">
+        {pairs.map((pair, index) => (
+          <div className="mcp-list-row mcp-pair-row" key={index}>
+            <Input
+              value={pair.key}
+              onChange={(event) => update(index, { key: event.currentTarget.value })}
+              placeholder="KEY"
+            />
+            <Input
+              value={pair.value}
+              onChange={(event) => update(index, { value: event.currentTarget.value })}
+              placeholder="VALUE"
+            />
+            <Button
+              onClick={() => onChange(pairs.filter((_, position) => position !== index))}
+              size="icon"
+              title={t("删除这一项")}
+              variant="ghost"
+            >
+              <Trash2 className="h-4 w-4" />
+            </Button>
+          </div>
+        ))}
+        <Button onClick={() => onChange([...pairs, { key: "", value: "" }])} size="sm" variant="secondary">
+          <Plus className="h-4 w-4" />
+          {addLabel}
+        </Button>
+      </div>
+    </Field>
+  );
+}
+
+/**
+ * 带语法着色和行号的编辑器：透明 textarea 叠在着色后的 <pre> 上。
+ * 两层共用同一套字体与内边距，所以字形位置天然对齐；不换行，横向溢出交给外层滚动。
+ */
 function SyncedTextarea({
   value,
   onValueChange,
@@ -8586,7 +9042,6 @@ function SyncedTextarea({
 }
 
 function RelayFileEditors({
-  contextProfile,
   profile,
   form,
   isActive,
@@ -8595,7 +9050,6 @@ function RelayFileEditors({
   onProfileChange,
   actions,
 }: {
-  contextProfile: RelayProfile;
   profile: RelayProfile;
   form: BackendSettings;
   isActive: boolean;
@@ -8604,8 +9058,8 @@ function RelayFileEditors({
   onProfileChange: (value: RelayProfile) => void;
   actions: Actions;
 }) {
-  const configPreview = effectiveRelayConfigPreview(profile, form, contextProfile);
-  const entries = contextEntriesForProfile(form, contextProfile);
+  const configPreview = effectiveRelayConfigPreview(profile, form);
+  const entries = contextEntriesFromSettings(form);
   return (
     <div className="relay-file-grid">
       <div className="relay-file-panel">
@@ -9503,10 +9957,6 @@ function withLiveEntryState(entry: CodexContextEntry, live?: CodexContextEntry):
   return live ? { ...entry, enabled: live.enabled } : entry;
 }
 
-function contextEntriesForProfile(settings: BackendSettings, profile: RelayProfile): CodexContextEntries {
-  return filterContextEntriesBySelection(contextEntriesFromSettings(settings), profile.contextSelection);
-}
-
 function contextEntriesFromConfig(configContents: string): CodexContextEntries {
   return {
     mcpServers: parseContextEntries(configContents, "mcp", "mcp_servers"),
@@ -9669,21 +10119,8 @@ function contextEntriesByKind(entries: CodexContextEntries, kind: ContextKind): 
   return dedupeContextEntryList(entries.plugins);
 }
 
-function filterContextEntriesBySelection(entries: CodexContextEntries, selection: RelayContextSelection): CodexContextEntries {
-  const selected = {
-    mcp: new Set(selection.mcpServers.map((id) => id.trim()).filter(Boolean)),
-    skill: new Set(selection.skills.map((id) => id.trim()).filter(Boolean)),
-    plugin: new Set(selection.plugins.map((id) => id.trim()).filter(Boolean)),
-  };
-  return {
-    mcpServers: entries.mcpServers.filter((entry) => selected.mcp.has(entry.id)),
-    skills: entries.skills.filter((entry) => selected.skill.has(entry.id)),
-    plugins: entries.plugins.filter((entry) => selected.plugin.has(entry.id)),
-  };
-}
-
-function effectiveRelayConfigPreview(profile: RelayProfile, settings: BackendSettings, contextProfile = profile): string {
-  const entries = contextEntriesForProfile(settings, contextProfile);
+function effectiveRelayConfigPreview(profile: RelayProfile, settings: BackendSettings): string {
+  const entries = contextEntriesFromSettings(settings);
   const isolatedConfig = stripContextEntriesFromConfig(profile.configContents, entries);
   const configWithLimits = applyContextLimitPreview(isolatedConfig, profile);
   const profileAndCommon = mergeFeaturesTableForPreview(configWithLimits, settings.relayCommonConfigContents || "");
@@ -9991,45 +10428,6 @@ function tomlKey(key: string): string {
   return /^[A-Za-z0-9_-]+$/.test(key) ? key : `"${tomlString(key)}"`;
 }
 
-function contextSelectionIds(selection: RelayContextSelection, kind: ContextKind): string[] {
-  if (kind === "mcp") return selection.mcpServers;
-  if (kind === "skill") return selection.skills;
-  return selection.plugins;
-}
-
-function setContextSelectionId(selection: RelayContextSelection, kind: ContextKind, id: string, checked: boolean): RelayContextSelection {
-  const next = {
-    mcpServers: [...selection.mcpServers],
-    skills: [...selection.skills],
-    plugins: [...selection.plugins],
-  };
-  const list = contextSelectionIds(next, kind);
-  const normalizedId = id.trim();
-  const exists = list.includes(normalizedId);
-  if (checked && normalizedId && !exists) list.push(normalizedId);
-  if (!checked && exists) list.splice(list.indexOf(normalizedId), 1);
-  return next;
-}
-
-function removeContextSelectionFromSettings(settings: BackendSettings, kind: ContextKind, id: string): BackendSettings {
-  return {
-    ...settings,
-    relayProfiles: settings.relayProfiles.map((profile) => ({
-      ...profile,
-      contextSelection: setContextSelectionId(profile.contextSelection, kind, id, false),
-    })),
-  };
-}
-
-function contextSelectionForAllEntries(settings: BackendSettings): RelayContextSelection {
-  const entries = contextEntriesFromSettings(settings);
-  return {
-    mcpServers: entries.mcpServers.map((entry) => entry.id),
-    skills: entries.skills.map((entry) => entry.id),
-    plugins: entries.plugins.map((entry) => entry.id),
-  };
-}
-
 function relayProfileEditorStatus(profile: RelayProfile, form: BackendSettings, isNew: boolean) {
   if (isNew) return t("新建供应商需要先保存到列表");
   if (!form.relayProfilesEnabled) return t("供应商配置总开关已关闭；当前只保存配置，不写入 Codex live 文件");
@@ -10109,15 +10507,10 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
     settings.relayContextConfigContents || "",
     splitCommon.context,
   ]);
-  const defaultContextSelection = contextSelectionForAllEntries({
-    ...settings,
-    relayCommonConfigContents,
-    relayContextConfigContents,
-  });
   const profiles =
     settings.relayProfiles?.length
       ? settings.relayProfiles.map((profile) =>
-          normalizeRelayProfile(hydrateAggregateRelayProfile(profile, backendAggregates.get(profile.id)), defaultContextSelection),
+          normalizeRelayProfile(hydrateAggregateRelayProfile(profile, backendAggregates.get(profile.id))),
         )
       : [
           {
@@ -10137,8 +10530,6 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
             configContents: "",
             authContents: "",
             useCommonConfig: true,
-            contextSelection: defaultContextSelection,
-            contextSelectionInitialized: true,
             contextWindow: "",
             autoCompactLimit: "",
             modelList: "",
@@ -10207,7 +10598,13 @@ function inputToCodexExtraArgs(value: string) {
   return value === "" ? [] : value.split(/\r?\n/);
 }
 
-function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = emptyContextSelection()): RelayProfile {
+function normalizeRelayProfile(profile: RelayProfile): RelayProfile {
+  // 历史版本曾在每个供应商写入 contextSelection；读取时忽略并在下次保存时移除。
+  const { contextSelection: _legacyContextSelection, contextSelectionInitialized: _legacyContextSelectionInitialized, ...stableProfile } = profile as RelayProfile & {
+    contextSelection?: unknown;
+    contextSelectionInitialized?: unknown;
+  };
+  profile = stableProfile;
   const legacyMixedApi = profile.relayMode === "mixedApi";
   if (profile.relayMode === "aggregate" || profile.aggregate) {
     return normalizeAggregateRelayProfile(
@@ -10227,10 +10624,6 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
         configContents: "",
         authContents: "",
         useCommonConfig: profile.useCommonConfig !== false,
-        contextSelection: profile.contextSelectionInitialized
-          ? normalizeContextSelection(profile.contextSelection)
-          : normalizeContextSelection(undefined, defaultContextSelection),
-        contextSelectionInitialized: true,
         contextWindow: "",
         autoCompactLimit: "",
         modelList: "",
@@ -10266,10 +10659,6 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
     configContents: relayMode === "official" && !officialMixApiKey ? "" : profile.configContents || "",
     authContents: relayMode === "official" && !officialMixApiKey ? buildOfficialRelayAuthJson(profile.authContents || "") : profile.authContents || "",
     useCommonConfig: profile.useCommonConfig !== false,
-    contextSelection: profile.contextSelectionInitialized
-      ? normalizeContextSelection(profile.contextSelection)
-      : normalizeContextSelection(undefined, defaultContextSelection),
-    contextSelectionInitialized: true,
     contextWindow: profile.contextWindow || "",
     autoCompactLimit: profile.autoCompactLimit || "",
     modelList: profile.modelList || "",
@@ -10341,24 +10730,6 @@ function relaySessionProviderFromConfig(contents: string): RelaySessionProvider 
 function relaySessionProvider(profile: Pick<RelayProfile, "configContents" | "sessionProvider">): RelaySessionProvider {
   const fromConfig = relaySessionProviderFromConfig(profile.configContents);
   return fromConfig === "openai" || profile.sessionProvider === "openai" ? "openai" : "custom";
-}
-
-function normalizeContextSelection(
-  selection?: Partial<RelayContextSelection>,
-  fallback: RelayContextSelection = emptyContextSelection(),
-): RelayContextSelection {
-  if (!selection) {
-    return {
-      mcpServers: [...fallback.mcpServers],
-      skills: [...fallback.skills],
-      plugins: [...fallback.plugins],
-    };
-  }
-  return {
-    mcpServers: Array.isArray(selection?.mcpServers) ? selection.mcpServers.map(String) : [],
-    skills: Array.isArray(selection?.skills) ? selection.skills.map(String) : [],
-    plugins: Array.isArray(selection?.plugins) ? selection.plugins.map(String) : [],
-  };
 }
 
 function relayModeLabel(mode: RelayMode): string {
@@ -10887,7 +11258,7 @@ function ensureCodexProviderDefaults(
 ): string {
   let next = contents;
   const section = `model_providers.${provider}`;
-  next = setTomlSectionStringKey(next, section, "name", provider);
+  next = setTomlSectionStringKey(next, section, "name", resolveProviderName(next, provider));
   next = setTomlSectionStringKey(next, section, "wire_api", "responses");
   return options.requiresOpenAiAuth === false ? next : setTomlSectionBoolKey(next, section, "requires_openai_auth", true);
 }
@@ -11100,7 +11471,6 @@ function updateRelayProfile(settings: BackendSettings, id: string, patch: Partia
 
 function createRelayProfile(settings: BackendSettings): RelayProfile {
   const id = `relay-${Date.now().toString(36)}`;
-  const contextSelection = contextSelectionForAllEntries(settings);
   const next = {
     id,
     name: tf("供应商 {0}", [settings.relayProfiles.length + 1]),
@@ -11118,8 +11488,6 @@ function createRelayProfile(settings: BackendSettings): RelayProfile {
     configContents: "",
     authContents: "",
     useCommonConfig: true,
-    contextSelection,
-    contextSelectionInitialized: true,
     contextWindow: "",
     autoCompactLimit: "",
     modelList: "",
@@ -11139,7 +11507,6 @@ function createRelayProfile(settings: BackendSettings): RelayProfile {
 
 function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
   const id = `aggregate-${Date.now().toString(36)}`;
-  const contextSelection = contextSelectionForAllEntries(settings);
   const candidates = aggregateMemberCandidates(settings, id);
   return normalizeAggregateRelayProfile(
     {
@@ -11159,8 +11526,6 @@ function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
       configContents: "",
       authContents: "",
       useCommonConfig: true,
-      contextSelection,
-      contextSelectionInitialized: true,
       contextWindow: "",
       autoCompactLimit: "",
       modelList: "",
