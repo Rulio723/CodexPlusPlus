@@ -376,6 +376,8 @@ type CodexContextEntry = {
   enabled: boolean;
 };
 
+type ContextEntryIdentity = Pick<CodexContextEntry, "kind" | "id">;
+
 type CodexContextEntries = {
   mcpServers: CodexContextEntry[];
   skills: CodexContextEntry[];
@@ -2339,8 +2341,14 @@ export function App() {
     }
   };
 
-  const syncLiveContextEntries = async (next: BackendSettings, silent = false) => {
-    const result = await run(() => call<LiveContextEntriesResult>("sync_live_context_entries", { request: { settings: next } }));
+  const syncLiveContextEntries = async (
+    next: BackendSettings,
+    silent = false,
+    removedEntries: ContextEntryIdentity[] = [],
+  ) => {
+    const result = await run(() => call<LiveContextEntriesResult>("sync_live_context_entries", {
+      request: { settings: next, removedEntries },
+    }));
     if (result) {
       setLiveContextEntries(result.entries);
       if (!silent || !isSuccessStatus(result.status)) showResultNotice(t("工具与插件"), result, { silentSuccess: true });
@@ -4078,7 +4086,11 @@ type Actions = {
   refreshCcsProviders: (silent?: boolean) => Promise<CcsProvidersResult | null>;
   importCcsProviders: () => Promise<void>;
   refreshLiveContextEntries: () => Promise<LiveContextEntriesResult | null>;
-  syncLiveContextEntries: (settings: BackendSettings, silent?: boolean) => Promise<LiveContextEntriesResult | null>;
+  syncLiveContextEntries: (
+    settings: BackendSettings,
+    silent?: boolean,
+    removedEntries?: ContextEntryIdentity[],
+  ) => Promise<LiveContextEntriesResult | null>;
   refreshSkills: (silent?: boolean) => Promise<SkillInventoryResult | null>;
   importSkill: (mode: "folder" | "file") => Promise<void>;
   setInstalledSkillEnabled: (skill: InstalledSkill, enabled: boolean) => Promise<void>;
@@ -8322,8 +8334,8 @@ function RelayContextManager({
   const installedSkills = skillInventory?.skills ?? [];
   const visibleCount = activeKind === "skill" ? installedSkills.length : visibleEntries.length;
 
-  const syncContextEntries = async (next: BackendSettings) => {
-    const syncResult = await actions.syncLiveContextEntries(next, true);
+  const syncContextEntries = async (next: BackendSettings, removedEntries: ContextEntryIdentity[] = []) => {
+    const syncResult = await actions.syncLiveContextEntries(next, true, removedEntries);
     if (!syncResult || !isSuccessStatus(syncResult.status)) return false;
     await actions.refreshRelayFiles();
     return true;
@@ -8349,7 +8361,7 @@ function RelayContextManager({
     const next = await actions.deleteContextEntry(form, entry.kind, entry.id);
     if (!next) return;
     onFormChange(next);
-    await syncContextEntries(next);
+    await syncContextEntries(next, [{ kind: entry.kind, id: entry.id }]);
   };
 
   const importJson = async (json: string) => {

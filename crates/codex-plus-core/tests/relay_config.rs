@@ -1,7 +1,7 @@
 use codex_plus_core::codex_sqlite::codex_session_db_path_from_home;
 use codex_plus_core::relay_config::{
-    apply_pure_api_config_to_home, apply_relay_config_file_to_home, apply_relay_config_to_home,
-    apply_relay_files_to_home, apply_relay_files_to_home_with_common,
+    ContextEntryIdentity, apply_pure_api_config_to_home, apply_relay_config_file_to_home,
+    apply_relay_config_to_home, apply_relay_files_to_home, apply_relay_files_to_home_with_common,
     apply_relay_profile_files_to_home_with_context, apply_relay_profile_to_home_with_switch_rules,
     backfill_relay_profile_from_home, backfill_relay_profile_from_home_with_common,
     chatgpt_auth_status_from_home, cleanup_unsupported_approval_policies_in_home,
@@ -11,7 +11,8 @@ use codex_plus_core::relay_config::{
     prepare_common_config_for_apply, relay_config_status_from_home, relay_profile_api_key,
     rewrite_managed_local_proxy_urls_to_port, sanitize_common_config_contents,
     set_codex_goals_feature_in_home, strip_common_config_from_config,
-    sync_live_config_context_entries, upsert_context_entry_in_common_config,
+    sync_live_config_context_entries, sync_live_config_context_entries_with_removed,
+    upsert_context_entry_in_common_config,
 };
 use codex_plus_core::settings::{RelayMode, RelayModelRoute, RelayProfile, RelayProtocol};
 
@@ -3599,6 +3600,32 @@ command = "old"
     let updated = sync_live_config_context_entries(live, context).unwrap();
 
     assert!(updated.contains("[mcp_servers.manual]"));
+    assert!(!updated.contains("[mcp_servers.managed]"));
+}
+
+#[test]
+fn sync_live_config_context_entries_removes_explicitly_deleted_entry_from_live() {
+    let live = r#"model = "gpt-5"
+
+[mcp_servers.manual]
+command = "manual"
+
+[mcp_servers.managed]
+command = "old"
+"#;
+
+    let updated = sync_live_config_context_entries_with_removed(
+        live,
+        "",
+        &[ContextEntryIdentity {
+            kind: "mcp".to_string(),
+            id: "managed".to_string(),
+        }],
+    )
+    .unwrap();
+
+    assert!(updated.contains("[mcp_servers.manual]"));
+    assert!(updated.contains(r#"command = "manual""#));
     assert!(!updated.contains("[mcp_servers.managed]"));
 }
 

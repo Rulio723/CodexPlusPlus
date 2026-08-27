@@ -465,6 +465,14 @@ pub struct ContextSettingsRequest {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ContextLiveSyncRequest {
+    pub settings: BackendSettings,
+    #[serde(default)]
+    pub removed_entries: Vec<codex_plus_core::relay_config::ContextEntryIdentity>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ContextEntryRequest {
     pub settings: BackendSettings,
     pub kind: String,
@@ -4956,7 +4964,7 @@ pub fn import_mcp_servers_json(request: McpImportRequest) -> CommandResult<Conte
 
 #[tauri::command]
 pub fn sync_live_context_entries(
-    request: ContextSettingsRequest,
+    request: ContextLiveSyncRequest,
 ) -> CommandResult<LiveContextEntriesPayload> {
     let home = codex_plus_core::relay_config::default_codex_home_dir();
     let config_path = home.join("config.toml");
@@ -4971,20 +4979,22 @@ pub fn sync_live_context_entries(
             );
         }
     };
-    let updated_config = match codex_plus_core::relay_config::sync_live_config_context_entries(
-        &current_config,
-        &request.settings.relay_context_config_contents,
-    ) {
-        Ok(config) => config,
-        Err(error) => {
-            return failed(
-                &format!("同步 live MCP&插件失败：{error}"),
-                LiveContextEntriesPayload {
-                    entries: empty_context_entries(),
-                },
-            );
-        }
-    };
+    let updated_config =
+        match codex_plus_core::relay_config::sync_live_config_context_entries_with_removed(
+            &current_config,
+            &request.settings.relay_context_config_contents,
+            &request.removed_entries,
+        ) {
+            Ok(config) => config,
+            Err(error) => {
+                return failed(
+                    &format!("同步 live MCP&插件失败：{error}"),
+                    LiveContextEntriesPayload {
+                        entries: empty_context_entries(),
+                    },
+                );
+            }
+        };
     if let Some(parent) = config_path.parent() {
         if let Err(error) = std::fs::create_dir_all(parent) {
             return failed(

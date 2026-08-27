@@ -1087,13 +1087,41 @@ pub fn prepare_common_config_for_apply(common_config: &str) -> anyhow::Result<St
     Ok(normalize_optional_toml(filtered))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextEntryIdentity {
+    pub kind: String,
+    pub id: String,
+}
+
 pub fn sync_live_config_context_entries(
     live_config: &str,
     context_config: &str,
 ) -> anyhow::Result<String> {
+    sync_live_config_context_entries_with_removed(live_config, context_config, &[])
+}
+
+/// Syncs the global context configuration into a live config while applying explicit
+/// deletion tombstones. A deleted entry is no longer present in `context_config`, so
+/// its identity must travel with this one live-sync operation; otherwise it would be
+/// indistinguishable from an unrelated manual live entry that should be preserved.
+pub fn sync_live_config_context_entries_with_removed(
+    live_config: &str,
+    context_config: &str,
+    removed_entries: &[ContextEntryIdentity],
+) -> anyhow::Result<String> {
     let normalized_live = normalize_duplicate_toml_text(live_config);
     let normalized_context = normalize_duplicate_toml_text(context_config);
     let mut live_doc = parse_toml_document(&normalized_live)?;
+    for entry in removed_entries {
+        let table_name = context_table_name(&entry.kind)?;
+        if let Some(table) = live_doc[table_name].as_table_mut() {
+            table.remove(entry.id.trim());
+            if table.is_empty() {
+                live_doc.as_table_mut().remove(table_name);
+            }
+        }
+    }
     if normalized_context.trim().is_empty() {
         return Ok(normalize_optional_toml(live_doc));
     }

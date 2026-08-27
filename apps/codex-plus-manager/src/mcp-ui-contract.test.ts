@@ -14,7 +14,9 @@ test("MCP 表单、预览与导入均通过注册的 Tauri 命令，并在导入
   assert.ok(managerStart >= 0 && managerEnd > managerStart);
   const manager = app.slice(managerStart, managerEnd);
   assert.match(manager, /<McpJsonImporter/);
-  assert.match(manager, /syncLiveContextEntries\(next, true\)/);
+  assert.match(manager, /syncLiveContextEntries\(next, true, removedEntries\)/);
+  assert.match(manager, /syncContextEntries\(next, \[\{ kind: entry\.kind, id: entry\.id \}\]\)/);
+  assert.match(app, /request: \{ settings: next, removedEntries \}/);
 });
 
 test("供应商默认 name 使用 config 中已有的展示名", async () => {

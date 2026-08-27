@@ -749,9 +749,8 @@ fn relay_context_management_is_global_not_supplier_scoped() {
     assert!(app_tsx.contains("read_live_context_entries"));
     assert!(app_tsx.contains("sync_live_context_entries"));
     assert!(app_tsx.contains("refreshLiveContextEntries"));
-    assert!(app_tsx.contains("syncLiveContextEntries(next, true)"));
-    assert!(app_tsx.contains("const syncLiveContextEntries = async (next: BackendSettings"));
-    assert!(app_tsx.contains("actions.syncLiveContextEntries(next, true)"));
+    assert!(app_tsx.contains("const syncLiveContextEntries = async (\n    next: BackendSettings,"));
+    assert!(app_tsx.contains("actions.syncLiveContextEntries(next, true, removedEntries)"));
     // 由 syncLiveContextEntries 统一处理全局 live 同步。
     assert!(app_tsx.contains("function contextEntriesWithLiveEntries"));
     assert!(app_tsx.contains("liveByKind"));
