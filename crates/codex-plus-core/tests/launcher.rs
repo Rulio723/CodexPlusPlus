@@ -1250,11 +1250,11 @@ async fn fixed_protocol_proxy_port_waits_for_the_previous_helper_to_release_it()
     assert_eq!(
         events
             .iter()
-            .filter(|event| event.as_str() == "start-helper-busy:57321")
+            .filter(|event| event.as_str() == "start-helper-busy:58123")
             .count(),
         3
     );
-    assert!(events.contains(&"start-helper:57321".to_string()));
+    assert!(events.contains(&"start-helper:58123".to_string()));
     assert!(events.contains(&"launch:9229".to_string()));
 }
 
@@ -1283,7 +1283,7 @@ async fn a_permanently_busy_protocol_proxy_port_reports_what_the_user_should_do(
     .unwrap_err();
 
     let message = format!("{error:#}");
-    assert!(message.contains("57321"), "unexpected message: {message}");
+    assert!(message.contains("58123"), "unexpected message: {message}");
     assert!(
         message.contains("base_url"),
         "unexpected message: {message}"
