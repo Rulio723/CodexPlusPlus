@@ -302,6 +302,8 @@ export type RelayProfile = {
   relayMode: RelayMode;
   sessionProvider?: RelaySessionProvider;
   officialMixApiKey: boolean;
+  /** Upstream pure-API proxy mode: omit Authorization when enabled. */
+  noAuth?: boolean;
   hideOfficialUsageAlert: boolean;
   testModel: string;
   configContents: string;
