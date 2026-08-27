@@ -9335,7 +9335,7 @@ function mergeLiveContextEntries(entries: CodexContextEntry[], liveEntries: Map<
 }
 
 function withLiveEntryState(entry: CodexContextEntry, live?: CodexContextEntry): CodexContextEntry {
-  return live ? { ...entry, enabled: live.enabled } : { ...entry, enabled: false };
+  return live ? { ...entry, enabled: live.enabled } : entry;
 }
 
 function contextEntriesForProfile(settings: BackendSettings, profile: RelayProfile): CodexContextEntries {

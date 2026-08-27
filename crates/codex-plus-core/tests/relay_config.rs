@@ -8,18 +8,12 @@ use codex_plus_core::relay_config::{
     clear_relay_config_to_home, clear_relay_config_to_home_with_auth,
     delete_context_entry_from_common_config, extract_common_config_from_config,
     list_context_entries_from_common_config, normalize_relay_profile_for_storage,
-    relay_config_status_from_home, relay_profile_api_key, rewrite_managed_local_proxy_urls_to_port,
-    sanitize_common_config_contents, set_codex_goals_feature_in_home,
-    strip_common_config_from_config, sync_live_config_context_entries,
-    upsert_context_entry_in_common_config,
-};
-use codex_plus_core::settings::{
-    RelayContextSelection, RelayMode, RelayModelRoute, RelayProfile, RelayProtocol,
     prepare_common_config_for_apply, relay_config_status_from_home, relay_profile_api_key,
-    sanitize_common_config_contents, set_codex_goals_feature_in_home,
-    strip_common_config_from_config, sync_live_config_context_entries,
-    upsert_context_entry_in_common_config,
+    rewrite_managed_local_proxy_urls_to_port, sanitize_common_config_contents,
+    set_codex_goals_feature_in_home, strip_common_config_from_config,
+    sync_live_config_context_entries, upsert_context_entry_in_common_config,
 };
+use codex_plus_core::settings::{RelayMode, RelayModelRoute, RelayProfile, RelayProtocol};
 
 fn write_remote_plugin_marketplace_snapshot(home: &std::path::Path) {
     let root = home.join(".tmp").join("plugins-remote");

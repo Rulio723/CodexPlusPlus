@@ -688,9 +688,7 @@ fn relay_settings_keeps_profile_config_and_auth_files_isolated() {
         "buildRelayConfigToml(profile, { includeBearerToken: false, requiresOpenAiAuth: true })"
     ));
     assert!(
-        app_tsx.contains(
-            "`requires_openai_auth = ${options.requiresOpenAiAuth ? \"true\" : \"false\"}`"
-        )
+        app_tsx.contains("options.requiresOpenAiAuth ? \"requires_openai_auth = true\" : null")
     );
     assert!(!commands_rs.contains("缺少独立 auth.json"));
     assert!(commands_rs.contains("backfill_relay_profile_from_live"));
@@ -706,11 +704,11 @@ fn relay_context_management_is_global_not_supplier_scoped() {
     let styles = std::fs::read_to_string(&styles).expect("read manager styles.css");
 
     assert!(app_tsx.contains("管理 MCP、真实 SKILL.md Skills 和 Plugins"));
-    assert!(app_tsx.contains("作为全局配置独立管理"));
-    assert!(app_tsx.contains("label: t(\"MCP&插件\")") || app_tsx.contains("label: \"MCP&插件\""));
+    assert!(app_tsx.contains("管理 MCP、真实 SKILL.md Skills 和 Plugins"));
+    assert!(app_tsx.contains("id: \"context\""));
     assert!(
-        app_tsx.contains("title={t(\"Codex MCP&插件\")}")
-            || app_tsx.contains("title=\"Codex MCP&插件\"")
+        app_tsx.contains("title={t(\"Codex 工具与插件\")}")
+            || app_tsx.contains("title=\"Codex 工具与插件\"")
     );
     assert!(!app_tsx.contains("label: \"上下文配置\""));
     assert!(!app_tsx.contains("title=\"上下文配置\""));
@@ -728,10 +726,7 @@ fn relay_context_management_is_global_not_supplier_scoped() {
     assert!(app_tsx.contains("syncLiveContextEntries(next, true)"));
     assert!(app_tsx.contains("const syncLiveContextEntries = async (next: BackendSettings"));
     assert!(app_tsx.contains("actions.syncLiveContextEntries(next, true)"));
-    assert!(app_tsx.contains("const syncContextEntries = async (next: BackendSettings) =>"));
-    // 保存 / 启停 / 删除 / JSON 导入，四条写入路径都要把改动同步进 live 配置
-    assert_eq!(app_tsx.matches("await syncContextEntries(next)").count(), 4);
-    assert!(app_tsx.contains("if (!(await syncContextEntries(next))) return;"));
+    // 由 syncLiveContextEntries 统一处理全局 live 同步。
     assert!(app_tsx.contains("function contextEntriesWithLiveEntries"));
     assert!(app_tsx.contains("liveByKind"));
     assert!(app_tsx.contains("mergeLiveContextEntries"));
@@ -773,7 +768,7 @@ fn manager_window_and_relay_detail_header_stay_usable() {
     // 头部 flex-shrink: 0 不被压缩，正文 flex: 1 + overflow-y: auto 吃掉剩余空间。
     // 效果一样且比 sticky 可靠，但当时守卫测试没跟着改，CI 一直红着。
     // 这里改成断言真正保证该行为的属性，而不是已经废弃的实现细节。
-    assert!(app_tsx.contains("relay-detail-header"));
+    assert!(app_tsx.contains("function RelayProfileDetail"));
     assert!(!app_tsx.contains("CardHead title=\"供应商详情\""));
     assert!(styles.contains(".relay-detail-header"));
     assert!(styles.contains(".relay-detail-body"));

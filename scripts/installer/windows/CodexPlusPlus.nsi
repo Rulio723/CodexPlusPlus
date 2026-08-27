@@ -9,6 +9,12 @@ ${StrTok}
   !define VERSION "0.0.0"
 !endif
 !define ROOT "..\..\.."
+!ifndef STAGE_ROOT
+  !define STAGE_ROOT "${ROOT}\dist\windows\app"
+!endif
+!ifndef OUTPUT_FILE
+  !define OUTPUT_FILE "${ROOT}\dist\windows\CodexPlusPlus-${VERSION}-windows-x64-setup.exe"
+!endif
 !include "x64.nsh"
 !include "secure-recovery-acl.nsh"
 
@@ -39,7 +45,7 @@ Var AdminTerminalShell
 !define POWERSHELL7_STORE_QUERY "JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAJABFAHIAcgBvAHIAQQBjAHQAaQBvAG4AUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAJABwAD0AQQBwAHAAeABcAEcAZQB0AC0AQQBwAHAAeABQAGEAYwBrAGEAZwBlACAALQBOAGEAbQBlACAATQBpAGMAcgBvAHMAbwBmAHQALgBQAG8AdwBlAHIAUwBoAGUAbABsAHwAUwBvAHIAdAAtAE8AYgBqAGUAYwB0ACAAVgBlAHIAcwBpAG8AbgAgAC0ARABlAHMAYwBlAG4AZABpAG4AZwB8AFMAZQBsAGUAYwB0AC0ATwBiAGoAZQBjAHQAIAAtAEYAaQByAHMAdAAgADEAOwBpAGYAKAAkAG4AdQBsAGwALQBuAGUAJABwACkAewBbAEMAbwBuAHMAbwBsAGUAXQA6ADoAVwByAGkAdABlACgAKABKAG8AaQBuAC0AUABhAHQAaAAgACQAcAAuAEkAbgBzAHQAYQBsAGwATABvAGMAYQB0AGkAbwBuACAAJwBwAHcAcwBoAC4AZQB4AGUAJwApACkAfQA="
 
 Name "Codex++"
-OutFile "${ROOT}\dist\windows\CodexPlusPlus-${VERSION}-windows-x64-setup.exe"
+OutFile "${OUTPUT_FILE}"
 InstallDir "$LOCALAPPDATA\Programs\Codex++"
 InstallDirRegKey HKCU "Software\Codex++" "InstallDir"
 RequestExecutionLevel user
@@ -547,7 +553,7 @@ Section "Install"
   Call SelectAdministratorPowerShell
   Call CreateSecureRecoveryDirectory
   SetOutPath "$AdminRecoveryDir"
-  File /oname=codex-plus-recovery.exe "${ROOT}\dist\windows\app\codex-plus-plus.exe"
+  File /oname=codex-plus-recovery.exe "${STAGE_ROOT}\codex-plus-plus.exe"
   Call ProtectSecureRecoveryFile
 
   Call TryRecoverAdminMode
@@ -558,18 +564,18 @@ install_recovery_already_done:
   Call CleanupSecureRecoveryDirectory
 
   SetOutPath "$INSTDIR"
-  File "${ROOT}\dist\windows\app\codex-plus-plus.exe"
-  File "${ROOT}\dist\windows\app\codex-plus-plus-manager.exe"
-  File "${ROOT}\dist\windows\app\codex-plus-admin-shim.exe"
+  File "${STAGE_ROOT}\codex-plus-plus.exe"
+  File "${STAGE_ROOT}\codex-plus-plus-manager.exe"
+  File "${STAGE_ROOT}\codex-plus-admin-shim.exe"
   SetOutPath "$INSTDIR\admin-terminal"
   StrCmp $AdminTerminalShell "powershell7" install_terminal_powershell7 install_terminal_windows_powershell
 
 install_terminal_powershell7:
-  File /oname=pwsh.exe "${ROOT}\dist\windows\app\admin-terminal\pwsh-powershell7.exe"
+  File /oname=pwsh.exe "${STAGE_ROOT}\admin-terminal\pwsh-powershell7.exe"
   Goto install_terminal_shim_done
 
 install_terminal_windows_powershell:
-  File /oname=pwsh.exe "${ROOT}\dist\windows\app\admin-terminal\pwsh-windows-powershell.exe"
+  File /oname=pwsh.exe "${STAGE_ROOT}\admin-terminal\pwsh-windows-powershell.exe"
 
 install_terminal_shim_done:
   ClearErrors
@@ -619,7 +625,7 @@ Section "Uninstall"
   StrCpy $UninstallAdminRecoveryTrySucceeded 0
   Call un.CreateSecureRecoveryDirectory
   SetOutPath "$AdminRecoveryDir"
-  File /oname=codex-plus-recovery.exe "${ROOT}\dist\windows\app\codex-plus-plus.exe"
+  File /oname=codex-plus-recovery.exe "${STAGE_ROOT}\codex-plus-plus.exe"
   Call un.ProtectSecureRecoveryFile
 
   Call un.TryRecoverAdminMode
