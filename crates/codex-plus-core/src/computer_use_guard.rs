@@ -64,6 +64,13 @@ const SKY_0617_HELPER_SHA256: &[&str] =
     &["db8f4486d527c91b80266faf77fdc38266b1d3960efbba35d0a6aab4caaf6aee"];
 const SKY_0617_HELPER_TRANSPORT_SHA256: &str =
     "9ba7f5f8d6512f3e42e6957d50660b0a02c9819628c004edd65bfe61b1a3538f";
+const SKY_0623_HELPER_TRANSPORT_LAUNCH_TEMPLATE: &str = "const i=s(e(this,w,\"f\"),e(this,v,\"f\"),{env:null==e(this,g,\"f\")?void 0:Object.assign(Object.assign({},J().env),e(this,g,\"f\")),stdio:[\"pipe\",\"pipe\",\"pipe\"],windowsHide:!0});";
+const SKY_0623_HELPER_TRANSPORT_LAUNCH_SHA256: &str =
+    "bb8eff52685a27e472e469f686cf9ffcf921a3d7fcc1cfaf52f3202cd829f064";
+const SKY_0623_HELPER_SHA256: &[&str] =
+    &["7ecd12681ae7625069795c7a43df928a0a248b095bf3a855417997617ac8213f"];
+const SKY_0623_HELPER_TRANSPORT_SHA256: &str =
+    "c87c03894ec14ee592a864ae954004e143c70ec50ccfc1e77867725cae6fb9d7";
 
 #[cfg(test)]
 const HELPER_TRANSPORT_LAUNCH_TEMPLATE: &str = LEGACY_HELPER_TRANSPORT_LAUNCH_TEMPLATE;
@@ -135,6 +142,15 @@ const SUPPORTED_COMPUTER_USE_CONTRACTS: &[SupportedComputerUseContract] = &[
         launch_template_sha256: SKY_0617_HELPER_TRANSPORT_LAUNCH_SHA256,
         process_expression: "J()",
         environment_expression: "e(this,k,\"f\")",
+    },
+    SupportedComputerUseContract {
+        sky_version: "0.6.23-202608251207-pr-1350514-1bc5ee2d44ce",
+        helper_sha256: SKY_0623_HELPER_SHA256,
+        transport_sha256: SKY_0623_HELPER_TRANSPORT_SHA256,
+        launch_template: SKY_0623_HELPER_TRANSPORT_LAUNCH_TEMPLATE,
+        launch_template_sha256: SKY_0623_HELPER_TRANSPORT_LAUNCH_SHA256,
+        process_expression: "J()",
+        environment_expression: "e(this,g,\"f\")",
     },
 ];
 const ADMIN_HELPER_TRANSPORT_BACKUP: &str = "helper_transport.js.bak-codex-plus-admin";
@@ -2532,6 +2548,8 @@ mod tests {
 "#;
     const HELPER_TRANSPORT_0617_FIXTURE: &str = r#"import{spawn as s}from"node:child_process";function J(){return globalThis.process}const e=()=>{};const w=0,v=0,k=0;function launch(){const i=s(e(this,w,"f"),e(this,v,"f"),{env:null==e(this,k,"f")?void 0:Object.assign(Object.assign({},J().env),e(this,k,"f")),stdio:["pipe","pipe","pipe"],windowsHide:!0});return i}
 "#;
+    const HELPER_TRANSPORT_0623_FIXTURE: &str = r#"import{spawn as s}from"node:child_process";function J(){return globalThis.process}const e=()=>{};const w=0,v=0,g=0;function launch(){const i=s(e(this,w,"f"),e(this,v,"f"),{env:null==e(this,g,"f")?void 0:Object.assign(Object.assign({},J().env),e(this,g,"f")),stdio:["pipe","pipe","pipe"],windowsHide:!0});return i}
+"#;
 
     #[cfg(windows)]
     #[test]
@@ -2587,6 +2605,15 @@ mod tests {
         assert_eq!(
             supported_transport_sha256("0.6.17-202608171537-pr-1300023-7efba775c041"),
             Some("9ba7f5f8d6512f3e42e6957d50660b0a02c9819628c004edd65bfe61b1a3538f")
+        );
+        assert_eq!(
+            supported_helper_sha256s("0.6.23-202608251207-pr-1350514-1bc5ee2d44ce")
+                .and_then(|hashes| hashes.first().copied()),
+            Some("7ecd12681ae7625069795c7a43df928a0a248b095bf3a855417997617ac8213f")
+        );
+        assert_eq!(
+            supported_transport_sha256("0.6.23-202608251207-pr-1350514-1bc5ee2d44ce"),
+            Some("c87c03894ec14ee592a864ae954004e143c70ec50ccfc1e77867725cae6fb9d7")
         );
         assert_eq!(supported_helper_sha256s("0.5.3"), None);
         assert_eq!(supported_transport_sha256("0.5.3"), None);
@@ -2662,6 +2689,10 @@ mod tests {
             eprintln!("SKIP: official packaged Computer Use runtime is unavailable");
             return;
         }
+        let source_package: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(source_sky.join("package.json")).unwrap())
+                .unwrap();
+        let source_sky_version = source_package["version"].as_str().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
         let sky =
@@ -2687,6 +2718,7 @@ notify = ["C:\\missing-runtime\\codex-computer-use.exe", "turn-ended"]
         let resolved = resolve_admin_computer_use_artifacts(&home)
             .expect("ignore stale pure-API notify path and resolve a supported runtime");
 
+        assert_eq!(resolved.sky_version, source_sky_version);
         assert!(resolved.helper_exe.is_file());
         assert_ne!(
             resolved.helper_exe,
@@ -3068,6 +3100,40 @@ notify = ["C:\\missing-runtime\\codex-computer-use.exe", "turn-ended"]
 
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("helper_transport-0.6.17.mjs");
+        std::fs::write(&script, patched).unwrap();
+        let status = std::process::Command::new("node")
+            .arg("--check")
+            .arg(&script)
+            .status()
+            .expect("Node.js is required for helper hook syntax verification");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn computer_use_guard_admin_hook_supports_sky_0623_g_options_slot() {
+        const SKY_0623: &str = "0.6.23-202608251207-pr-1350514-1bc5ee2d44ce";
+        let descriptor = Path::new(r"C:\Users\me\.codex\admin-computer-use.json");
+        let patched =
+            patch_admin_helper_transport(HELPER_TRANSPORT_0623_FIXTURE, SKY_0623, descriptor)
+                .expect("Sky 0.6.23 transport must patch");
+        assert!(patched.contains(
+            "codex-plus-admin-computer-use:contract=0.6.23-202608251207-pr-1350514-1bc5ee2d44ce"
+        ));
+        assert!(patched.contains("J().getBuiltinModule"));
+        assert!(patched.contains("null==e(this,g,\"f\")"));
+        assert!(patched.contains("Object.assign({},J().env),e(this,g,\"f\")"));
+        assert!(!patched.contains("e(this,k,\"f\")"));
+        assert_eq!(
+            patch_admin_helper_transport(&patched, SKY_0623, descriptor).unwrap(),
+            patched
+        );
+        assert_eq!(
+            remove_admin_helper_transport_patch(&patched).unwrap(),
+            HELPER_TRANSPORT_0623_FIXTURE
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("helper_transport-0.6.23.mjs");
         std::fs::write(&script, patched).unwrap();
         let status = std::process::Command::new("node")
             .arg("--check")
