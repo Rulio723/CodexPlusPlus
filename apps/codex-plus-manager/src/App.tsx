@@ -21,6 +21,8 @@ import {
   ArrowLeft,
   ArrowRight,
   Bell,
+  BookOpen,
+  Bot,
   CheckCircle2,
   Camera,
   ChevronDown,
@@ -88,6 +90,7 @@ import { isGitHubRepositoryHomepage } from "./github-repository";
 import {
   findRelayModelRouteIssue,
   modelRouteSaveRequiresRestart,
+  NO_AUTH_PROXY_BEARER_TOKEN,
   normalizeRelayModelRoutes,
   PROTOCOL_PROXY_BASE_URL,
   type RelayModelRoute,
@@ -107,6 +110,17 @@ import { officialAccountsAfterProviderSwitch } from "./official-accounts";
 import { relayAuthForLiveDraft, shouldBackfillRelayProfileBeforeSwitch } from "./relay-live-files";
 import { resolveProviderSyncCompletion } from "./provider-sync-flow";
 import { resolveLaunchStatus } from "./launch-status";
+import {
+  GrokConfigScreen,
+  type GrokConfigResult,
+  type SaveGrokConfigRequest,
+  type SaveGrokConfigResult,
+} from "./grok-config";
+import {
+  RemoteSkillsScreen,
+  type SkillRepo,
+  type SkillsResult,
+} from "./remote-skills";
 import {
   defaultDreamSkinTheme,
   defaultDreamSkinColors,
@@ -303,7 +317,7 @@ export type RelayProfile = {
   sessionProvider?: RelaySessionProvider;
   officialMixApiKey: boolean;
   /** Upstream pure-API proxy mode: omit Authorization when enabled. */
-  noAuth?: boolean;
+  noAuth: boolean;
   hideOfficialUsageAlert: boolean;
   testModel: string;
   configContents: string;
@@ -941,14 +955,16 @@ type StartupResult = CommandResult<{
   showUpdate: boolean;
 }>;
 
-type Route = "overview" | "relay" | "relayEnvironment" | "sessions" | "context" | "weixin" | "enhance" | "dreamSkin" | "zedRemote" | "userScripts" | "recommendations" | "maintenance" | "about" | "settings";
+type Route = "overview" | "relay" | "grok" | "relayEnvironment" | "sessions" | "context" | "skills" | "weixin" | "enhance" | "dreamSkin" | "zedRemote" | "userScripts" | "recommendations" | "maintenance" | "about" | "settings";
 type Theme = "dark" | "light";
 
 const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string }> = [
   { id: "overview", label: t("概览"), icon: LayoutDashboard },
   { id: "relay", label: t("供应商配置"), icon: KeyRound },
+  { id: "grok", label: t("Grok 配置"), icon: Bot },
   { id: "sessions", label: t("会话管理"), icon: MessageCircle },
   { id: "context", label: t("工具与插件"), icon: Network },
+  { id: "skills", label: t("Skills 技能"), icon: BookOpen },
   { id: "weixin", label: t("微信连接"), icon: ScanLine },
   { id: "enhance", label: t("Codex增强"), icon: Hammer },
   { id: "dreamSkin", label: t("皮肤管理"), icon: Palette },
@@ -963,7 +979,7 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
 const navigationSections: Array<{ label: string; routes: Route[]; placement?: "bottom" }> = [
   {
     label: t("工作区"),
-    routes: ["overview", "relay", "sessions", "context"],
+    routes: ["overview", "relay", "grok", "sessions", "context", "skills"],
   },
   {
     label: t("扩展"),
@@ -1053,6 +1069,7 @@ const defaultSettings: BackendSettings = {
       protocol: "responses",
       relayMode: "official",
       officialMixApiKey: false,
+      noAuth: false,
       hideOfficialUsageAlert: false,
       testModel: "",
       configContents: "",
@@ -1103,6 +1120,7 @@ export function App() {
   const [weixinStatus, setWeixinStatus] = useState<WeixinConnectStatusResult | null>(null);
   const [weixinQr, setWeixinQr] = useState<WeixinQrResult | null>(null);
   const [relay, setRelay] = useState<RelayResult | null>(null);
+  const [grokConfig, setGrokConfig] = useState<GrokConfigResult | null>(null);
   const [relayFiles, setRelayFiles] = useState<RelayFilesResult | null>(null);
   const [envConflicts, setEnvConflicts] = useState<EnvConflictsResult | null>(null);
   const [relayEnvironment, setRelayEnvironment] = useState<RelayEnvironmentResult | null>(null);
@@ -1139,6 +1157,8 @@ export function App() {
     message: t("尚未运行安装包更新。"),
   });
   const [scriptMarket, setScriptMarket] = useState<ScriptMarketResult | null>(null);
+  const [remoteSkills, setRemoteSkills] = useState<SkillsResult | null>(null);
+  const [remoteSkillBusyId, setRemoteSkillBusyId] = useState<string | null>(null);
   const [launchForm, setLaunchForm] = useState({
     appPath: "",
     debugPort: "9229",
@@ -1322,6 +1342,86 @@ export function App() {
       showResultNotice(t("本地脚本"), result);
       await refreshUserScriptInventory();
     }
+  };
+
+  // 远程仓库 Skills 与本地 SKILL.md 管理器使用不同命令命名空间，避免同名 handler 混用。
+  const listInstalledRemoteSkills = async () => {
+    const result = await run(() => call<SkillsResult>("list_installed_skills"));
+    if (result) setRemoteSkills(result);
+  };
+
+  const refreshRemoteSkillCatalog = async (silent = false) => {
+    const result = await run(() => call<SkillsResult>("refresh_skill_catalog"));
+    if (result) {
+      setRemoteSkills(result);
+      if (!silent || !isSuccessStatus(result.status)) showResultNotice(t("Skills"), result, { silentSuccess: true });
+    }
+  };
+
+  const runRemoteSkillAction = async (busyId: string, command: string, args: Record<string, unknown>) => {
+    setRemoteSkillBusyId(busyId);
+    try {
+      const result = await run(() => call<SkillsResult>(command, args));
+      if (result) {
+        setRemoteSkills(result);
+        showResultNotice(t("Skills"), result);
+      }
+    } finally {
+      setRemoteSkillBusyId(null);
+    }
+  };
+
+  const installRemoteSkill = (repoKey: string, id: string) => runRemoteSkillAction(id, "install_skill", { repoKey, id });
+  const updateRemoteSkill = (repoKey: string, id: string) => runRemoteSkillAction(id, "update_skill", { repoKey, id });
+  const setRemoteSkillEnabled = (id: string, enabled: boolean) =>
+    runRemoteSkillAction(id, "set_remote_skill_enabled", { id, enabled });
+  const uninstallRemoteSkill = async (id: string) => {
+    if (!window.confirm(tf("卸载 Skill「{0}」？源目录会先备份，可以再恢复回来。", [id]))) return;
+    await runRemoteSkillAction(id, "uninstall_remote_skill", { id });
+  };
+  const restoreRemoteSkillBackup = (backupId: string) => runRemoteSkillAction(backupId, "restore_skill_backup", { backupId });
+  const deleteRemoteSkillBackup = async (backupId: string) => {
+    if (!window.confirm(tf("删除备份「{0}」？此操作不可撤销。", [backupId]))) return;
+    await runRemoteSkillAction(backupId, "delete_skill_backup", { backupId });
+  };
+  const upsertRemoteSkillRepo = async (repo: SkillRepo) => {
+    const result = await run(() => call<SkillsResult>("upsert_skill_repo", { repo }));
+    if (result) {
+      setRemoteSkills(result);
+      showResultNotice(t("Skills 仓库源"), result);
+    }
+    return result;
+  };
+  const deleteRemoteSkillRepo = async (key: string) => {
+    if (!window.confirm(tf("删除仓库源「{0}」？已装的 Skill 不受影响，只是不再更新。", [key]))) return;
+    const result = await run(() => call<SkillsResult>("delete_skill_repo", { key }));
+    if (result) {
+      setRemoteSkills(result);
+      showResultNotice(t("Skills 仓库源"), result);
+    }
+  };
+
+  const refreshGrokConfig = async (silent = false) => {
+    const result = await run(() => call<GrokConfigResult>("load_grok_config"));
+    if (!result) return null;
+    if (isSuccessStatus(result.status)) {
+      setGrokConfig(result);
+      if (!silent) showResultNotice(t("Grok 配置"), result, { silentSuccess: true });
+    } else {
+      showResultNotice(t("Grok 配置"), result);
+    }
+    return result;
+  };
+
+  const saveGrokConfig = async (request: SaveGrokConfigRequest) => {
+    const result = await run(() => call<SaveGrokConfigResult>("save_grok_config", { request }));
+    if (!result) return null;
+    showResultNotice(t("Grok 配置"), result);
+    if (isSuccessStatus(result.status)) {
+      setGrokConfig(result);
+      return result;
+    }
+    return null;
   };
 
   const refreshRelay = async (silent = false) => {
@@ -2261,6 +2361,7 @@ export function App() {
       await refreshCcsProviders(true);
       await refreshOfficialAccounts(true);
     }
+    if (next === "grok") await refreshGrokConfig(true);
     if (next === "relayEnvironment") await refreshRelayEnvironment(true);
     if (next === "sessions") {
       await refreshSettings(true);
@@ -2276,6 +2377,10 @@ export function App() {
       await refreshRelayFiles(true);
       await refreshLiveContextEntries(true);
       await refreshSkills(true);
+    }
+    if (next === "skills") {
+      await listInstalledRemoteSkills();
+      void refreshRemoteSkillCatalog(true);
     }
     if (next === "weixin") {
       await refreshSettings(true);
@@ -3453,6 +3558,16 @@ export function App() {
       installMarketScript,
       setUserScriptEnabled,
       deleteUserScript,
+      refreshRemoteSkillCatalog,
+      installRemoteSkill,
+      updateRemoteSkill,
+      setRemoteSkillEnabled,
+      uninstallRemoteSkill,
+      restoreRemoteSkillBackup,
+      deleteRemoteSkillBackup,
+      upsertRemoteSkillRepo,
+      deleteRemoteSkillRepo,
+      remoteSkillBusyId,
       refreshLocalSessions,
       importLocalSession,
       importSessionUrl,
@@ -3611,6 +3726,13 @@ export function App() {
               actions={actions}
             />
           ) : null}
+          {route === "grok" ? (
+            <GrokConfigScreen
+              config={grokConfig}
+              onRefresh={() => refreshGrokConfig(false)}
+              onSave={saveGrokConfig}
+            />
+          ) : null}
           {route === "relayEnvironment" ? (
             <RelayEnvironmentScreen result={relayEnvironment} actions={actions} />
           ) : null}
@@ -3634,6 +3756,23 @@ export function App() {
               relayFiles={relayFiles}
               onFormChange={setSettingsForm}
               actions={actions}
+            />
+          ) : null}
+          {route === "skills" ? (
+            <RemoteSkillsScreen
+              skills={remoteSkills}
+              actions={{
+                refreshSkillCatalog: refreshRemoteSkillCatalog,
+                installSkill: installRemoteSkill,
+                updateSkill: updateRemoteSkill,
+                setSkillEnabled: setRemoteSkillEnabled,
+                uninstallSkill: uninstallRemoteSkill,
+                restoreSkillBackup: restoreRemoteSkillBackup,
+                deleteSkillBackup: deleteRemoteSkillBackup,
+                upsertSkillRepo: upsertRemoteSkillRepo,
+                deleteSkillRepo: deleteRemoteSkillRepo,
+                skillBusyId: remoteSkillBusyId,
+              }}
             />
           ) : null}
           {route === "weixin" ? (
@@ -7503,13 +7642,36 @@ function RelayProfileEditor({
             value={profile.relayMode}
             onChange={(event) => {
               const relayMode = event.currentTarget.value as RelayMode;
-              updateDraft(relayMode === "official" ? { relayMode, officialMixApiKey: false } : { relayMode });
+              updateDraft({
+                relayMode,
+                officialMixApiKey: relayMode === "official" ? false : profile.officialMixApiKey,
+                noAuth: relayMode === "pureApi" ? profile.noAuth : false,
+              });
             }}
           >
             <option value="official">{t("官方登录")}</option>
             <option value="pureApi">{t("纯 API")}</option>
           </select>
         </Field>
+        {profile.relayMode === "pureApi" ? (
+          <label className="switch-row compact relay-switch-row relay-field-no-auth">
+            <input
+              checked={profile.noAuth}
+              onChange={(event) => updateDraft({
+                noAuth: event.currentTarget.checked,
+                apiKey: event.currentTarget.checked ? "" : profile.apiKey,
+                sub2apiEnabled: event.currentTarget.checked ? false : profile.sub2apiEnabled,
+                sub2apiMultiplier: event.currentTarget.checked ? "" : profile.sub2apiMultiplier,
+              })}
+              type="checkbox"
+            />
+            <span className="switch-copy">
+              <strong>{t("上游无需认证")}</strong>
+              <small>{t("通过本地协议代理转发请求，且不会向上游发送 Authorization。")}</small>
+            </span>
+            <ToggleVisual />
+          </label>
+        ) : null}
         <Field className="relay-field-config-model" label={t("配置模型")}>
           <Input
             value={profile.model}
@@ -7627,10 +7789,11 @@ function RelayProfileEditor({
             </Field>
             <Field className="relay-field-key" label="Key">
               <Input
+                disabled={profile.noAuth}
                 type="password"
                 value={profile.apiKey}
                 onChange={(event) => updateDraft({ apiKey: event.currentTarget.value })}
-                placeholder={t("输入中转服务的 API Key")}
+                placeholder={profile.noAuth ? t("无需认证时不发送 Authorization") : t("输入中转服务的 API Key")}
               />
             </Field>
             <Field className="relay-field-protocol" label={t("上游协议")}>
@@ -9271,9 +9434,11 @@ function routeSubtitle(route: Route) {
   const subtitles: Record<Route, string> = {
     overview: t("检查问题、启动与快速修复"),
     relay: t("管理 API 供应商、协议、Key 与配置文件"),
+    grok: t("管理 Grok CLI 的模型与 API 端点"),
     relayEnvironment: t("排查可能干扰中转站配置的本机环境"),
     sessions: t("查看、删除和修复 Codex 本地会话"),
     context: t("管理 MCP、真实 Skills 和 Plugins"),
+    skills: t("从远程仓库安装、更新和管理 Skills"),
     weixin: t("通过个人微信连接本机 Codex 会话"),
     enhance: t("会话删除、导出、项目移动和脚本能力"),
     dreamSkin: t("Codex-Dream-Skin 风格主题和换图"),
@@ -9966,6 +10131,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
             relayMode: "official" as RelayMode,
             sessionProvider: "custom" as RelaySessionProvider,
             officialMixApiKey: false,
+            noAuth: false,
             hideOfficialUsageAlert: false,
             testModel: "",
             configContents: "",
@@ -10055,6 +10221,7 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
         relayMode: "aggregate",
         sessionProvider: normalizeRelaySessionProvider(profile.sessionProvider),
         officialMixApiKey: false,
+        noAuth: false,
         hideOfficialUsageAlert: false,
         testModel: profile.testModel || "",
         configContents: "",
@@ -10082,16 +10249,18 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
   }
   const relayMode = normalizeRelayMode(profile.relayMode);
   const officialMixApiKey = profile.officialMixApiKey === true || legacyMixedApi;
+  const noAuth = relayMode === "pureApi" && profile.noAuth === true;
   let normalized: RelayProfile = {
     ...profile,
     model: profile.model || "",
     baseUrl: profile.baseUrl || defaultSettings.relayBaseUrl,
     upstreamBaseUrl: profile.upstreamBaseUrl || profile.baseUrl || "",
-    apiKey: profile.apiKey || "",
+    apiKey: noAuth ? "" : profile.apiKey || "",
     protocol: profile.protocol === "chatCompletions" ? "chatCompletions" : "responses",
     relayMode,
     sessionProvider: relaySessionProvider(profile),
     officialMixApiKey,
+    noAuth,
     hideOfficialUsageAlert: profile.hideOfficialUsageAlert === true,
     testModel: profile.testModel || "",
     configContents: relayMode === "official" && !officialMixApiKey ? "" : profile.configContents || "",
@@ -10112,8 +10281,8 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
     officialCodexFingerprint: profile.officialCodexFingerprint === true,
     modelRoutes: relayMode === "official" && !officialMixApiKey ? [] : normalizeRelayModelRoutes(profile.modelRoutes),
     userAgent: profile.userAgent || "",
-    sub2apiEnabled: profile.sub2apiEnabled === true,
-    sub2apiMultiplier: profile.sub2apiEnabled === true ? profile.sub2apiMultiplier || "" : "",
+    sub2apiEnabled: noAuth ? false : profile.sub2apiEnabled === true,
+    sub2apiMultiplier: !noAuth && profile.sub2apiEnabled === true ? profile.sub2apiMultiplier || "" : "",
     aggregate: null,
   };
   return relayProfileUsesLiveFiles(normalized) ? deriveRelayProfileFromFiles(normalized) : normalized;
@@ -10227,7 +10396,9 @@ function relayProfileConfigBrief(profile: RelayProfile): string {
     return tf("{0} · {1} 个成员", [aggregateStrategyLabel(aggregate.strategy), aggregate.members.length]);
   }
   if (profile.relayMode === "official") return profile.officialMixApiKey ? t("混入 API Key") : t("不写 API 文件");
-  return profile.baseUrl || t("未填写 URL");
+  return profile.noAuth
+    ? `${profile.baseUrl || t("未填写 URL")} · ${t("无需认证")}`
+    : profile.baseUrl || t("未填写 URL");
 }
 
 function relayProfileLatencyTarget(profile: RelayProfile): string {
@@ -10261,7 +10432,9 @@ function relayProfileModeHelp(profile: RelayProfile): string {
     return t("此供应商会切回官方登录模式，使用 ChatGPT 官方账号，不写入 API Key。");
   }
   if (profile.relayMode === "pureApi") {
-    return t("此供应商会同时写入 config.toml 和 auth.json；API Key 也会注入到 provider bearer token。");
+    return profile.noAuth
+      ? t("此供应商会通过本地协议代理连接上游，Codex 侧保持认证模式，但不会向上游发送 Authorization。")
+      : t("此供应商会同时写入 config.toml 和 auth.json；API Key 也会注入到 provider bearer token。");
   }
   return t("此供应商会保留官方登录模式，并把请求混入当前 API Key；Codex增强仍使用兼容模式。");
 }
@@ -10284,9 +10457,9 @@ function relayProfileReadinessText(profile: RelayProfile, relay: RelayResult | n
       : t("当前未登录官方账号；切到官方登录模式后仍需要先在 Codex/ChatGPT 登录。");
   }
   const hasFiles = profile.configContents.trim() && profile.authContents.trim();
-  if (!hasFiles) return t("当前供应商还没有完整 config.toml / API Key 存档。");
-  if (relay && !relay.configured) return t("纯 API 配置未完整写入：请检查此供应商是否有 OPENAI_API_KEY，且 config.toml 是否包含 model_provider / provider / base_url。");
-  return t("纯 API 就绪：会同时写入 config.toml 和 auth.json。");
+  if (!hasFiles) return t("当前供应商还没有完整 config.toml / auth.json 存档。");
+  if (relay && !relay.configured) return t("纯 API 配置未完整写入：请检查 config.toml 是否包含 model_provider / provider / base_url，以及认证设置是否匹配上游。");
+  return profile.noAuth ? t("纯 API 就绪：上游请求不发送 Authorization。") : t("纯 API 就绪：会同时写入 config.toml 和 auth.json。");
 }
 
 function relayProfileSwitchCommand(profile: RelayProfile): "clear_relay_injection" | "apply_relay_injection" | "apply_pure_api_injection" {
@@ -10313,15 +10486,17 @@ function withGeneratedRelayFiles(profile: RelayProfile): RelayProfile {
   return {
     ...profile,
     configContents: buildRelayConfigToml(profile, { includeBearerToken: false, requiresOpenAiAuth: true }),
-    authContents: buildRelayAuthJson(profile),
+    authContents: profile.noAuth ? removeAuthOpenAiApiKey(profile.authContents) : buildRelayAuthJson(profile),
   };
 }
 
 function buildRelayConfigToml(
-  profile: Pick<RelayProfile, "model" | "baseUrl" | "upstreamBaseUrl" | "apiKey" | "protocol" | "sessionProvider">,
+  profile: Pick<RelayProfile, "model" | "baseUrl" | "upstreamBaseUrl" | "apiKey" | "protocol" | "sessionProvider" | "noAuth">,
   options: { includeBearerToken: boolean; requiresOpenAiAuth?: boolean },
 ): string {
-  const baseUrl = profile.protocol === "chatCompletions" ? PROTOCOL_PROXY_BASE_URL : profile.baseUrl.trim();
+  const baseUrl = profile.protocol === "chatCompletions" || profile.noAuth
+    ? PROTOCOL_PROXY_BASE_URL
+    : profile.baseUrl.trim();
   const apiKey = profile.apiKey.trim();
   const sessionProvider = normalizeRelaySessionProvider(profile.sessionProvider);
   const rootLines = [
@@ -10337,13 +10512,29 @@ function buildRelayConfigToml(
     'wire_api = "responses"',
     options.requiresOpenAiAuth ? "requires_openai_auth = true" : null,
     `base_url = "${tomlString(baseUrl)}"`,
-    options.includeBearerToken && apiKey ? `experimental_bearer_token = "${tomlString(apiKey)}"` : null,
+    profile.noAuth
+      ? `experimental_bearer_token = "${NO_AUTH_PROXY_BEARER_TOKEN}"`
+      : options.includeBearerToken && apiKey ? `experimental_bearer_token = "${tomlString(apiKey)}"` : null,
     "",
   ].filter((line): line is string => line !== null).join("\n");
 }
 
 function buildRelayAuthJson(profile: Pick<RelayProfile, "apiKey">): string {
   return `${JSON.stringify({ OPENAI_API_KEY: profile.apiKey.trim() }, null, 2)}\n`;
+}
+
+function removeAuthOpenAiApiKey(contents: string): string {
+  let parsed: Record<string, unknown> = {};
+  try {
+    const candidate = JSON.parse(contents || "{}");
+    if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
+      parsed = candidate as Record<string, unknown>;
+    }
+  } catch {
+    // 空或非 JSON 的本地 auth 存档没有可移除的 API Key。
+  }
+  delete parsed.OPENAI_API_KEY;
+  return Object.keys(parsed).length ? `${JSON.stringify(parsed, null, 2)}\n` : "";
 }
 
 function buildOfficialRelayAuthJson(contents: string): string {
@@ -10371,6 +10562,7 @@ function deriveRelayProfileFromFiles(profile: RelayProfile): RelayProfile {
   const upstreamBaseUrl = profile.upstreamBaseUrl || chatUpstreamBaseUrl || (configBaseUrl && !isProxyConfig ? configBaseUrl : profile.baseUrl || "");
   const configApiKey = codexExperimentalBearerTokenFromConfig(configContents);
   const configModel = codexModelFromConfig(configContents);
+  const noAuth = profile.relayMode === "pureApi" && profile.noAuth === true;
   // 如果用户输入了带后缀的模型名，优先保留在界面的「配置模型」字段中；
   // config.toml 里实际写的是剥离后缀的 slug（由 applyRelayProfilePatchToFiles 处理）。
   const model = /\[.+\]$/.test(profile.model.trim()) ? profile.model.trim() : configModel;
@@ -10380,9 +10572,12 @@ function deriveRelayProfileFromFiles(profile: RelayProfile): RelayProfile {
     sessionProvider: relaySessionProviderFromConfig(configContents),
     baseUrl: upstreamBaseUrl,
     upstreamBaseUrl,
-    apiKey: profile.relayMode === "official"
-      ? configApiKey || profile.apiKey || ""
-      : codexApiKeyFromAuth(authContents) || configApiKey || "",
+    apiKey: noAuth
+      ? ""
+      : profile.relayMode === "official"
+        ? configApiKey || profile.apiKey || ""
+        : codexApiKeyFromAuth(authContents) || configApiKey || "",
+    noAuth,
     contextWindow: codexTopLevelIntFromConfig(configContents, "model_context_window"),
     autoCompactLimit: codexTopLevelIntFromConfig(configContents, "model_auto_compact_token_limit"),
     configContents,
@@ -10398,6 +10593,12 @@ function applyRelayProfilePatchToFiles(
   let next: RelayProfile = { ...profile, ...patch };
   if (isAggregateRelayProfile(next)) {
     return normalizeAggregateRelayProfile(next, null);
+  }
+  next.noAuth = next.relayMode === "pureApi" && next.noAuth === true;
+  if (next.noAuth) {
+    next.apiKey = "";
+    next.sub2apiEnabled = false;
+    next.sub2apiMultiplier = "";
   }
   const shouldHaveFiles =
     next.relayMode !== "official" || next.officialMixApiKey || next.configContents.trim() || next.authContents.trim();
@@ -10420,7 +10621,10 @@ function applyRelayProfilePatchToFiles(
     next.configContents = setRootTomlStringKey(next.configContents, "model", slug);
   }
   if ("apiKey" in patch) {
-    if (next.relayMode === "pureApi") {
+    if (next.noAuth) {
+      next.authContents = removeAuthOpenAiApiKey(next.authContents);
+      next.configContents = setCodexExperimentalBearerToken(next.configContents, NO_AUTH_PROXY_BEARER_TOKEN);
+    } else if (next.relayMode === "pureApi") {
       next.authContents = setAuthOpenAiApiKey(next.authContents, patch.apiKey || "");
       next.configContents = removeCodexExperimentalBearerToken(next.configContents);
     } else {
@@ -10433,12 +10637,21 @@ function applyRelayProfilePatchToFiles(
   if ("upstreamBaseUrl" in patch) {
     next.baseUrl = patch.upstreamBaseUrl || "";
   }
-  if ("baseUrl" in patch || "upstreamBaseUrl" in patch || "protocol" in patch || "modelRoutes" in patch) {
-    const baseUrlForConfig = next.protocol === "chatCompletions" || normalizeRelayModelRoutes(next.modelRoutes).length > 0
+  if ("noAuth" in patch || "relayMode" in patch) {
+    const sessionProvider = rootTomlStringValue(next.configContents, "model_provider") || "custom";
+    const provider = sessionProvider === "openai" ? "custom" : sessionProvider;
+    next.configContents = setTomlSectionBoolKey(next.configContents, `model_providers.${provider}`, "requires_openai_auth", true);
+    if (next.noAuth) {
+      next.configContents = setCodexExperimentalBearerToken(next.configContents, NO_AUTH_PROXY_BEARER_TOKEN);
+      next.authContents = removeAuthOpenAiApiKey(next.authContents);
+    }
+  }
+  if ("baseUrl" in patch || "upstreamBaseUrl" in patch || "protocol" in patch || "modelRoutes" in patch || "noAuth" in patch) {
+    const baseUrlForConfig = next.protocol === "chatCompletions" || next.noAuth || normalizeRelayModelRoutes(next.modelRoutes).length > 0
       ? PROTOCOL_PROXY_BASE_URL
       : next.upstreamBaseUrl || next.baseUrl;
     next.configContents = setCodexProviderStringKey(next.configContents, "base_url", baseUrlForConfig, {
-      requiresOpenAiAuth: next.relayMode !== "pureApi",
+      requiresOpenAiAuth: next.relayMode !== "pureApi" || next.noAuth,
     });
     next.configContents = removeRootTomlKey(next.configContents, CHAT_UPSTREAM_BASE_URL_KEY);
   }
@@ -10899,6 +11112,7 @@ function createRelayProfile(settings: BackendSettings): RelayProfile {
     relayMode: "official" as RelayMode,
     sessionProvider: "custom" as RelaySessionProvider,
     officialMixApiKey: false,
+    noAuth: false,
     hideOfficialUsageAlert: false,
     testModel: "",
     configContents: "",
@@ -10939,6 +11153,7 @@ function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
       relayMode: "aggregate",
       sessionProvider: "custom",
       officialMixApiKey: false,
+      noAuth: false,
       hideOfficialUsageAlert: false,
       testModel: "",
       configContents: "",
@@ -11081,6 +11296,7 @@ function normalizeAggregateRelayProfile(profile: RelayProfile, settings: Backend
     relayMode: "aggregate",
     sessionProvider: normalizeRelaySessionProvider(profile.sessionProvider),
     officialMixApiKey: false,
+    noAuth: false,
     hideOfficialUsageAlert: false,
     configContents: "",
     authContents: "",
@@ -11115,7 +11331,8 @@ function aggregateMemberCandidates(settings: BackendSettings, aggregateId: strin
 }
 
 function isApiRelayProfile(profile: RelayProfile): boolean {
-  return Boolean(profile.baseUrl.trim() && profile.apiKey.trim());
+  const usesNoAuth = profile.relayMode === "pureApi" && profile.noAuth;
+  return Boolean(profile.baseUrl.trim() && (profile.apiKey.trim() || usesNoAuth));
 }
 
 function clampAggregateWeight(value: number): number {

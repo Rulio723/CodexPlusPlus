@@ -51,6 +51,32 @@ fn manager_main_window_uses_default_window_icon_explicitly() {
 }
 
 #[test]
+fn skill_handlers_keep_remote_catalog_and_local_skill_manager_commands_distinct() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let lib_rs =
+        std::fs::read_to_string(manifest_dir.join("src/lib.rs")).expect("read manager lib.rs");
+    let app_tsx = std::fs::read_to_string(manifest_dir.parent().unwrap().join("src/App.tsx"))
+        .expect("read manager App.tsx");
+
+    for command in [
+        "commands::set_remote_skill_enabled,",
+        "commands::uninstall_remote_skill,",
+        "commands::set_skill_enabled,",
+        "commands::uninstall_skill,",
+    ] {
+        assert_eq!(
+            lib_rs.matches(command).count(),
+            1,
+            "{command} must be registered exactly once",
+        );
+    }
+    assert!(app_tsx.contains("\"set_remote_skill_enabled\""));
+    assert!(app_tsx.contains("\"uninstall_remote_skill\""));
+    assert!(app_tsx.contains("\"set_skill_enabled\""));
+    assert!(app_tsx.contains("\"uninstall_skill\""));
+}
+
+#[test]
 fn manager_close_minimizes_to_tray_without_confirmation() {
     let lib_rs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
         .expect("read manager lib.rs");
@@ -488,7 +514,7 @@ fn administrator_runtime_is_staged_with_fixed_executable_roles() {
     assert!(launcher.contains("current_exe"));
     assert!(launcher.contains(".join(\"codex-plus-admin-shim.exe\")"));
 
-    assert!(installer.contains("File \"${ROOT}\\dist\\windows\\app\\codex-plus-admin-shim.exe\""));
+    assert!(installer.contains("File \"${STAGE_ROOT}\\codex-plus-admin-shim.exe\""));
     assert!(installer.contains("Delete \"$INSTDIR\\codex-plus-admin-shim.exe\""));
     assert_eq!(
         installer
@@ -504,13 +530,13 @@ fn administrator_runtime_is_staged_with_fixed_executable_roles() {
     assert_eq!(
         installer_executables,
         [
-            "File /oname=codex-plus-recovery.exe \"${ROOT}\\dist\\windows\\app\\codex-plus-plus.exe\"",
-            "File \"${ROOT}\\dist\\windows\\app\\codex-plus-plus.exe\"",
-            "File \"${ROOT}\\dist\\windows\\app\\codex-plus-plus-manager.exe\"",
-            "File \"${ROOT}\\dist\\windows\\app\\codex-plus-admin-shim.exe\"",
-            "File /oname=pwsh.exe \"${ROOT}\\dist\\windows\\app\\admin-terminal\\pwsh-powershell7.exe\"",
-            "File /oname=pwsh.exe \"${ROOT}\\dist\\windows\\app\\admin-terminal\\pwsh-windows-powershell.exe\"",
-            "File /oname=codex-plus-recovery.exe \"${ROOT}\\dist\\windows\\app\\codex-plus-plus.exe\"",
+            "File /oname=codex-plus-recovery.exe \"${STAGE_ROOT}\\codex-plus-plus.exe\"",
+            "File \"${STAGE_ROOT}\\codex-plus-plus.exe\"",
+            "File \"${STAGE_ROOT}\\codex-plus-plus-manager.exe\"",
+            "File \"${STAGE_ROOT}\\codex-plus-admin-shim.exe\"",
+            "File /oname=pwsh.exe \"${STAGE_ROOT}\\admin-terminal\\pwsh-powershell7.exe\"",
+            "File /oname=pwsh.exe \"${STAGE_ROOT}\\admin-terminal\\pwsh-windows-powershell.exe\"",
+            "File /oname=codex-plus-recovery.exe \"${STAGE_ROOT}\\codex-plus-plus.exe\"",
         ]
     );
     assert!(installer.contains("Call SelectAdministratorPowerShell"));
