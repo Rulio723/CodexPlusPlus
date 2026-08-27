@@ -108,6 +108,7 @@ import {
 } from "./administrator-mode";
 import { officialAccountsAfterProviderSwitch } from "./official-accounts";
 import { relayAuthForLiveDraft, shouldBackfillRelayProfileBeforeSwitch } from "./relay-live-files";
+import { completeContextDelete } from "./context-delete-transaction";
 import { MCP_PRESETS, mcpPresetById } from "./mcp-presets";
 import { resolveProviderName } from "./provider-name";
 import { resolveProviderSyncCompletion } from "./provider-sync-flow";
@@ -3118,15 +3119,21 @@ export function App() {
       }),
     );
     if (!result) return null;
-    let normalized = normalizeSettings(result.settings);
+    const normalized = normalizeSettings(result.settings);
     const saveResult = await run(() => call<SettingsResult>("save_settings", { settings: normalized }));
-    if (saveResult) {
-      setSettings(saveResult);
-      normalized = normalizeSettings(saveResult.settings);
+    if (!saveResult) {
+      showNotice(t("设置保存"), t("保存上下文删除失败，请检查设置文件后重试。"), "failed");
+      return null;
     }
-    setSettingsForm(normalized);
+    if (!isSuccessStatus(saveResult.status)) {
+      showNotice(t("设置保存"), saveResult.message, saveResult.status);
+      return null;
+    }
+    const saved = normalizeSettings(saveResult.settings);
+    setSettings(saveResult);
+    setSettingsForm(saved);
     if (!isSuccessStatus(result.status)) showResultNotice(t("工具与插件"), result);
-    return normalized;
+    return saved;
   };
 
   const extractRelayCommonConfig = async (configContents: string) => {
@@ -8358,10 +8365,11 @@ function RelayContextManager({
   };
 
   const deleteEntry = async (entry: CodexContextEntry) => {
-    const next = await actions.deleteContextEntry(form, entry.kind, entry.id);
-    if (!next) return;
-    onFormChange(next);
-    await syncContextEntries(next, [{ kind: entry.kind, id: entry.id }]);
+    await completeContextDelete({
+      deleteAndPersist: () => actions.deleteContextEntry(form, entry.kind, entry.id),
+      updateLocal: onFormChange,
+      syncLive: (next) => syncContextEntries(next, [{ kind: entry.kind, id: entry.id }]),
+    });
   };
 
   const importJson = async (json: string) => {
