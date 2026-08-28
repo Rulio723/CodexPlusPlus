@@ -418,7 +418,7 @@ dependencies = [
 
 [[package]]
 name = "codex-plus-admin-shim"
-version = "1.2.55"
+version = "1.2.56"
 dependencies = [
  "anyhow",
  "serde",
@@ -514,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "codex-plus-terminal-shim"
-version = "1.2.55"
+version = "1.2.56"
 dependencies = [
  "anyhow",
  "serde",

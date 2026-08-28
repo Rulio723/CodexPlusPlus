@@ -121,6 +121,7 @@ import {
 } from "./grok-config";
 import {
   RemoteSkillsScreen,
+  normalizeSkillsResult,
   type SkillRepo,
   type SkillsResult,
 } from "./remote-skills";
@@ -1385,13 +1386,13 @@ export function App() {
   // 远程仓库 Skills 与本地 SKILL.md 管理器使用不同命令命名空间，避免同名 handler 混用。
   const listInstalledRemoteSkills = async () => {
     const result = await run(() => call<SkillsResult>("list_installed_skills"));
-    if (result) setRemoteSkills(result);
+    if (result) setRemoteSkills(normalizeSkillsResult(result));
   };
 
   const refreshRemoteSkillCatalog = async (silent = false) => {
     const result = await run(() => call<SkillsResult>("refresh_skill_catalog"));
     if (result) {
-      setRemoteSkills(result);
+      setRemoteSkills(normalizeSkillsResult(result));
       if (!silent || !isSuccessStatus(result.status)) showResultNotice(t("Skills"), result, { silentSuccess: true });
     }
   };
@@ -1401,7 +1402,7 @@ export function App() {
     try {
       const result = await run(() => call<SkillsResult>(command, args));
       if (result) {
-        setRemoteSkills(result);
+        setRemoteSkills(normalizeSkillsResult(result));
         showResultNotice(t("Skills"), result);
       }
     } finally {
@@ -1425,7 +1426,7 @@ export function App() {
   const upsertRemoteSkillRepo = async (repo: SkillRepo) => {
     const result = await run(() => call<SkillsResult>("upsert_skill_repo", { repo }));
     if (result) {
-      setRemoteSkills(result);
+      setRemoteSkills(normalizeSkillsResult(result));
       showResultNotice(t("Skills 仓库源"), result);
     }
     return result;
@@ -1434,7 +1435,7 @@ export function App() {
     if (!window.confirm(tf("删除仓库源「{0}」？已装的 Skill 不受影响，只是不再更新。", [key]))) return;
     const result = await run(() => call<SkillsResult>("delete_skill_repo", { key }));
     if (result) {
-      setRemoteSkills(result);
+      setRemoteSkills(normalizeSkillsResult(result));
       showResultNotice(t("Skills 仓库源"), result);
     }
   };
@@ -2229,7 +2230,7 @@ export function App() {
   const refreshLiveContextEntries = async (silent = false) => {
     const result = await run(() => call<LiveContextEntriesResult>("read_live_context_entries"));
     if (result) {
-      setLiveContextEntries(result.entries);
+      setLiveContextEntries(normalizeContextEntries(result.entries));
       if (!silent || !isSuccessStatus(result.status)) showResultNotice(t("工具与插件"), result, { silentSuccess: true });
     }
     return result;
@@ -2351,7 +2352,7 @@ export function App() {
       request: { settings: next, removedEntries },
     }));
     if (result) {
-      setLiveContextEntries(result.entries);
+      setLiveContextEntries(normalizeContextEntries(result.entries));
       if (!silent || !isSuccessStatus(result.status)) showResultNotice(t("工具与插件"), result, { silentSuccess: true });
     }
     return result;
@@ -9945,9 +9946,19 @@ function contextEntriesFromSettings(settings: BackendSettings): CodexContextEntr
   };
 }
 
+function normalizeContextEntries(entries: Partial<CodexContextEntries> | null | undefined): CodexContextEntries {
+  return {
+    mcpServers: Array.isArray(entries?.mcpServers) ? entries.mcpServers : [],
+    // Rust deliberately does not serialize `skills`: local SKILL.md inventory is a separate UI.
+    skills: Array.isArray(entries?.skills) ? entries.skills : [],
+    plugins: Array.isArray(entries?.plugins) ? entries.plugins : [],
+  };
+}
+
 function contextEntriesWithLiveEntries(settings: BackendSettings, liveEntries: CodexContextEntries | null): CodexContextEntries {
   const commonEntries = contextEntriesFromSettings(settings);
   if (!liveEntries) return commonEntries;
+  liveEntries = normalizeContextEntries(liveEntries);
   const liveByKind: Record<ContextKind, Map<string, CodexContextEntry>> = {
     mcp: new Map(liveEntries.mcpServers.map((entry) => [entry.id, entry])),
     skill: new Map(liveEntries.skills.map((entry) => [entry.id, entry])),

@@ -25,7 +25,21 @@ export type RemoteSkillsActions = {
 };
 const repoKey = (repo: SkillRepo) => `${repo.owner}/${repo.name}@${repo.branch}${repo.subdir ? `:${repo.subdir}` : ""}`;
 
+/** Tauri responses from an older manager may omit newly-added catalog collections. */
+export function normalizeSkillsResult(result: SkillsResult): SkillsResult {
+  return {
+    ...result,
+    skills: Array.isArray(result.skills) ? result.skills : [],
+    repos: Array.isArray(result.repos) ? result.repos : [],
+    backups: Array.isArray(result.backups) ? result.backups : [],
+    repoErrors: Array.isArray(result.repoErrors) ? result.repoErrors : [],
+    skillsDir: typeof result.skillsDir === "string" ? result.skillsDir : "",
+    codexSkillsDir: typeof result.codexSkillsDir === "string" ? result.codexSkillsDir : "",
+  };
+}
+
 export function RemoteSkillsScreen({ skills, actions }: { skills: SkillsResult | null; actions: RemoteSkillsActions }) {
+  skills = skills ? normalizeSkillsResult(skills) : null;
   const [query, setQuery] = useState("");
   const [reposOpen, setReposOpen] = useState(false);
   const [backupsOpen, setBackupsOpen] = useState(false);

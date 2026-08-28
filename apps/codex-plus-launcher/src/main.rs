@@ -316,7 +316,53 @@ fn should_recover_stale_launcher(debug_port: u16) -> bool {
 
 async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<()> {
     let hooks = LauncherHooks::default();
-    let helper_port = hooks.select_helper_port(options.helper_port);
+    activate_existing_codex_app_with_hooks(
+        &hooks,
+        options,
+        codex_plus_core::watcher::find_codex_processes,
+        |process_id| {
+            #[cfg(windows)]
+            {
+                codex_plus_core::windows_activate_process_window(process_id)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = process_id;
+                false
+            }
+        },
+        |outcome| {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "launcher.activate_existing_codex",
+                json!({
+                    "app_dir": outcome.app_dir.to_string_lossy(),
+                    "debug_port": outcome.debug_port,
+                    "helper_port": outcome.helper_port,
+                    "requested_helper_port": outcome.helper_port,
+                    "process_ids": outcome.process_ids,
+                    "activated": outcome.focused_existing_window,
+                    "launch_ok": outcome.packaged_activation_succeeded,
+                    "launch_error": outcome.launch_error,
+                }),
+            );
+        },
+    )
+    .await
+}
+
+async fn activate_existing_codex_app_with_hooks<H, FindProcesses, FocusWindow, RecordOutcome>(
+    hooks: &H,
+    options: &LaunchOptions,
+    find_processes: FindProcesses,
+    mut focus_window: FocusWindow,
+    record_outcome: RecordOutcome,
+) -> anyhow::Result<()>
+where
+    H: LaunchHooks + ?Sized,
+    FindProcesses: FnOnce() -> Vec<u32>,
+    FocusWindow: FnMut(u32) -> bool,
+    RecordOutcome: FnOnce(ExistingInstanceActivationOutcome),
+{
     let settings = hooks.load_settings().await?;
     let app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings)?;
     let has_pending_recovery = hooks.has_pending_remote_control_session_recoveries();
@@ -337,6 +383,12 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
     if settings.administrator_mode_enabled {
         return activate_existing_administrator_session(options, &app_dir).await;
     }
+    if let Err(error) = hooks.ensure_plugin_marketplace_config(&settings).await {
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "launcher.plugin_marketplace_config_failed_nonfatal_existing_app",
+            json!({"message": error.to_string()}),
+        );
+    }
     let launch_result = hooks
         .launch_codex(
             &app_dir,
@@ -345,47 +397,35 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
             &settings.codex_extra_args,
         )
         .await;
-    if settings.enhancements_enabled {
-        hooks.start_helper(helper_port).await?;
-    }
-    let process_ids = codex_plus_core::watcher::find_codex_processes();
-    #[cfg(windows)]
-    let activated = process_ids
-        .iter()
-        .copied()
-        .any(codex_plus_core::windows_activate_process_window);
-    #[cfg(not(windows))]
-    let activated = false;
-    let injection_ready = if settings.enhancements_enabled {
-        hooks
-            .ensure_injection(options.debug_port, helper_port, &app_dir)
-            .await
+    let process_ids = find_processes();
+    let activated = process_ids.iter().copied().any(&mut focus_window);
+    let packaged_activation_succeeded = launch_result.is_ok();
+    let activation_succeeded = packaged_activation_succeeded || activated;
+    record_outcome(ExistingInstanceActivationOutcome {
+        app_dir,
+        debug_port: options.debug_port,
+        helper_port: options.helper_port,
+        process_ids,
+        focused_existing_window: activated,
+        packaged_activation_succeeded,
+        launch_error: launch_result.as_ref().err().map(|error| error.to_string()),
+    });
+    if activation_succeeded {
+        Ok(())
     } else {
-        false
-    };
-    if injection_ready {
-        hooks
-            .start_bridge_watchdog(options.debug_port, helper_port)
-            .await?;
-        hooks.write_status("running").await;
-    } else if settings.enhancements_enabled {
-        hooks.write_status("running_degraded").await;
+        Err(launch_result.expect_err("failed packaged activation must retain its error"))
     }
-    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-        "launcher.activate_existing_codex",
-        json!({
-            "app_dir": app_dir.to_string_lossy(),
-            "debug_port": options.debug_port,
-            "helper_port": helper_port,
-            "requested_helper_port": options.helper_port,
-            "process_ids": process_ids,
-            "activated": activated,
-            "injection_ready": injection_ready,
-            "launch_ok": launch_result.is_ok(),
-            "launch_error": launch_result.as_ref().err().map(|error| error.to_string())
-        }),
-    );
-    launch_result.map(|_| ())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExistingInstanceActivationOutcome {
+    app_dir: PathBuf,
+    debug_port: u16,
+    helper_port: u16,
+    process_ids: Vec<u32>,
+    focused_existing_window: bool,
+    packaged_activation_succeeded: bool,
+    launch_error: Option<String>,
 }
 
 async fn activate_existing_administrator_session(
@@ -1508,6 +1548,243 @@ mod tests {
             true,
             &[42]
         ));
+    }
+
+    #[derive(Clone)]
+    struct ExistingInstanceFakeHooks {
+        calls: Arc<Mutex<Vec<String>>>,
+        marketplace_fails: bool,
+        launch_fails: bool,
+    }
+
+    impl ExistingInstanceFakeHooks {
+        fn new(marketplace_fails: bool, launch_fails: bool) -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                marketplace_fails,
+                launch_fails,
+            }
+        }
+
+        fn record(&self, call: &str) {
+            self.calls
+                .lock()
+                .expect("fake call log")
+                .push(call.to_string());
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("fake call log").clone()
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl LaunchHooks for ExistingInstanceFakeHooks {
+        fn resolve_app_dir(
+            &self,
+            _app_dir: Option<&Path>,
+            _settings: &codex_plus_core::settings::BackendSettings,
+        ) -> anyhow::Result<PathBuf> {
+            self.record("resolve_app_dir");
+            Ok(PathBuf::from("C:/Codex/App"))
+        }
+
+        fn select_debug_port(&self, requested: u16) -> u16 {
+            self.record("select_debug_port");
+            requested
+        }
+
+        fn select_helper_port(&self, requested: u16) -> u16 {
+            self.record("select_helper_port");
+            requested.saturating_add(1)
+        }
+
+        async fn load_settings(
+            &self,
+        ) -> anyhow::Result<codex_plus_core::settings::BackendSettings> {
+            self.record("load_settings");
+            Ok(codex_plus_core::settings::BackendSettings::default())
+        }
+
+        async fn run_provider_sync(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn run_remote_control_session_recovery(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn ensure_plugin_marketplace_config(
+            &self,
+            _settings: &codex_plus_core::settings::BackendSettings,
+        ) -> anyhow::Result<()> {
+            self.record("ensure_plugin_marketplace_config");
+            if self.marketplace_fails {
+                anyhow::bail!("marketplace fixture failure");
+            }
+            Ok(())
+        }
+
+        async fn start_helper(&self, _helper_port: u16) -> anyhow::Result<()> {
+            self.record("start_helper");
+            Ok(())
+        }
+
+        async fn launch_codex(
+            &self,
+            _app_dir: &Path,
+            _debug_port: u16,
+            _settings: &codex_plus_core::settings::BackendSettings,
+            _extra_args: &[String],
+        ) -> anyhow::Result<codex_plus_core::launcher::CodexLaunch> {
+            self.record("launch_codex");
+            if self.launch_fails {
+                anyhow::bail!("packaged activation fixture failure");
+            }
+            Ok(codex_plus_core::launcher::CodexLaunch::PackagedActivation {
+                app_user_model_id: "OpenAI.Codex_fixture".to_string(),
+                arguments: String::new(),
+                process_id: None,
+            })
+        }
+
+        async fn inject(&self, _debug_port: u16, _helper_port: u16) -> anyhow::Result<()> {
+            self.record("inject");
+            Ok(())
+        }
+
+        async fn ensure_injection(
+            &self,
+            _debug_port: u16,
+            _helper_port: u16,
+            _app_dir: &Path,
+        ) -> bool {
+            self.record("ensure_injection");
+            true
+        }
+
+        async fn start_bridge_watchdog(
+            &self,
+            _debug_port: u16,
+            _helper_port: u16,
+        ) -> anyhow::Result<()> {
+            self.record("start_bridge_watchdog");
+            Ok(())
+        }
+
+        async fn write_status(&self, _status: &str) {
+            self.record("write_status");
+        }
+
+        async fn wait_for_codex_exit(
+            &self,
+            _launch: &codex_plus_core::launcher::CodexLaunch,
+            _debug_port: u16,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn shutdown_helper(&self, _helper_port: u16) {}
+
+        async fn terminate_codex(&self, _launch: &codex_plus_core::launcher::CodexLaunch) {}
+    }
+
+    fn assert_existing_instance_side_effects_are_absent(calls: &[String]) {
+        assert_eq!(
+            calls,
+            [
+                "load_settings",
+                "resolve_app_dir",
+                "ensure_plugin_marketplace_config",
+                "launch_codex",
+            ]
+        );
+        for forbidden in [
+            "select_helper_port",
+            "start_helper",
+            "ensure_injection",
+            "start_bridge_watchdog",
+            "write_status",
+        ] {
+            assert!(
+                !calls.iter().any(|call| call == forbidden),
+                "{forbidden} was called"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_instance_activation_uses_owner_runtime_and_ignores_marketplace_failure() {
+        let options = LaunchOptions {
+            debug_port: 9_227,
+            helper_port: 9_228,
+            ..LaunchOptions::default()
+        };
+        let hooks = ExistingInstanceFakeHooks::new(true, false);
+        let outcome = Arc::new(Mutex::new(None));
+        let recorded_outcome = outcome.clone();
+
+        activate_existing_codex_app_with_hooks(
+            &hooks,
+            &options,
+            Vec::new,
+            |_| false,
+            move |value| *recorded_outcome.lock().expect("activation outcome") = Some(value),
+        )
+        .await
+        .expect("marketplace failure must be nonfatal");
+
+        assert_existing_instance_side_effects_are_absent(&hooks.calls());
+        let outcome = outcome
+            .lock()
+            .expect("activation outcome")
+            .clone()
+            .expect("outcome");
+        assert_eq!(outcome.helper_port, options.helper_port);
+        assert!(outcome.packaged_activation_succeeded);
+        assert!(!outcome.focused_existing_window);
+    }
+
+    #[tokio::test]
+    async fn existing_instance_focus_recovers_packaged_activation_failure_without_runtime_side_effects()
+     {
+        let options = LaunchOptions {
+            helper_port: 9_228,
+            ..LaunchOptions::default()
+        };
+        let hooks = ExistingInstanceFakeHooks::new(false, true);
+
+        activate_existing_codex_app_with_hooks(
+            &hooks,
+            &options,
+            || vec![7],
+            |process_id| process_id == 7,
+            |_| {},
+        )
+        .await
+        .expect("focused existing window must recover packaged activation failure");
+
+        assert_existing_instance_side_effects_are_absent(&hooks.calls());
+    }
+
+    #[tokio::test]
+    async fn existing_instance_returns_original_packaged_activation_error_when_focus_fails() {
+        let options = LaunchOptions::default();
+        let hooks = ExistingInstanceFakeHooks::new(false, true);
+
+        let error =
+            activate_existing_codex_app_with_hooks(&hooks, &options, || vec![7], |_| false, |_| {})
+                .await
+                .expect_err(
+                    "failed packaged activation without focus must surface its original error",
+                );
+
+        assert!(
+            error
+                .to_string()
+                .contains("packaged activation fixture failure")
+        );
+        assert_existing_instance_side_effects_are_absent(&hooks.calls());
     }
 
     #[test]

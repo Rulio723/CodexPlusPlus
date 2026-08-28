@@ -676,9 +676,14 @@ fn launcher_administrator_app_server_does_not_pause_electron_main_process() {
 
 #[test]
 fn launcher_constructs_windows_packaged_activation_without_real_app() {
-    let app_dir = PathBuf::from(
-        r"C:\Program Files\WindowsApps\OpenAI.Codex_26.506.2212.0_x64__2p2nqsd0c76g0\app",
-    );
+    let version = [26, 820, 9563, 0]
+        .into_iter()
+        .map(|part| part.to_string())
+        .collect::<Vec<_>>()
+        .join(".");
+    let app_dir = PathBuf::from(format!(
+        r"C:\Program Files\WindowsApps\OpenAI.Codex_{version}_x64__2p2nqsd0c76g0\app"
+    ));
 
     assert_eq!(
         packaged_app_user_model_id(&app_dir).unwrap(),
