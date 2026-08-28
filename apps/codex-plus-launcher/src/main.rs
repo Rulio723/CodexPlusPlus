@@ -86,6 +86,12 @@ impl LauncherRunFailure {
     }
 }
 
+impl From<anyhow::Error> for LauncherRunFailure {
+    fn from(error: anyhow::Error) -> Self {
+        Self::primary(error)
+    }
+}
+
 fn finalize_launcher_invocation(
     options: &LaunchOptions,
     helper_only: bool,
@@ -136,10 +142,8 @@ async fn launcher_main(
         codex_plus_core::admin_mode::recover_stale_admin_mode_for_shutdown(
             &codex_plus_core::codex_home::default_codex_home_dir(),
             &codex_plus_core::paths::default_app_state_dir(),
-        )
-        .map_err(LauncherRunFailure::primary)?;
-        codex_plus_core::watcher::stop_admin_recovery_processes_and_wait()
-            .map_err(LauncherRunFailure::primary)?;
+        )?;
+        codex_plus_core::watcher::stop_admin_recovery_processes_and_wait()?;
         return Ok(LauncherStatusOwnership::Primary);
     }
     if helper_only {
@@ -152,12 +156,8 @@ async fn launcher_main(
         hooks.shutdown_helper(options.helper_port).await;
         return Ok(LauncherStatusOwnership::Primary);
     }
-    prepare_administrator_mode_startup(&options)
-        .await
-        .map_err(LauncherRunFailure::primary)?;
-    let Some(_guard) =
-        acquire_single_instance_guard(options.debug_port).map_err(LauncherRunFailure::primary)?
-    else {
+    prepare_administrator_mode_startup(&options).await?;
+    let Some(_guard) = acquire_single_instance_guard(options.debug_port)? else {
         activate_existing_codex_app(&options)
             .await
             .map_err(LauncherRunFailure::secondary_existing_instance)?;
