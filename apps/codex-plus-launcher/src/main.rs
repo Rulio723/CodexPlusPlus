@@ -6,7 +6,7 @@ use codex_plus_core::launcher::{
 };
 use codex_plus_core::models::{DeleteResult, ExportResult, SessionRef};
 use codex_plus_core::routes::{BridgeContext, BridgeDataService, BridgeRuntimeService};
-use codex_plus_core::status::{AdministratorModeStatus, LaunchStatus};
+use codex_plus_core::status::{AdministratorModeStatus, LaunchStatus, StatusStore};
 use codex_plus_core::user_scripts::UserScriptManager;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -51,35 +51,79 @@ async fn main() -> Result<()> {
     let helper_only = args.iter().any(|arg| arg == "--helper-only");
     let recover_only = args.iter().any(|arg| arg == "--recover-admin-mode");
     let options = parse_launch_options(args.iter());
-    if let Err(error) = launcher_main(args, helper_only, recover_only, options.clone()).await {
-        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-            "launcher.run_failed",
-            serde_json::json!({
-                "message": "startup failed",
-                "component": launcher_failure_component(&error),
-                "error_chain": codex_plus_core::diagnostic_log::sanitized_error_chain(&error)
-            }),
-        );
-        eprintln!("Codex++ launcher startup failed: {error:#}");
-        if !helper_only {
-            let _ = options.status_store.save_latest(&LaunchStatus {
-                status: "failed".to_string(),
-                message: error.to_string(),
-                started_at_ms: current_timestamp_ms(),
-                debug_port: Some(options.debug_port),
-                helper_port: Some(options.helper_port),
-                codex_app: options
-                    .app_dir
-                    .map(|path| path.to_string_lossy().to_string()),
-                administrator_mode: administrator_mode_status_for_failure(
-                    &options.status_store,
-                    &error,
-                ),
-            });
+    finalize_launcher_invocation(
+        &options,
+        helper_only,
+        launcher_main(args, helper_only, recover_only, options.clone()).await,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LauncherStatusOwnership {
+    Primary,
+    SecondaryExistingInstance,
+}
+
+#[derive(Debug)]
+struct LauncherRunFailure {
+    error: anyhow::Error,
+    status_ownership: LauncherStatusOwnership,
+}
+
+impl LauncherRunFailure {
+    fn primary(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            status_ownership: LauncherStatusOwnership::Primary,
         }
-        return Err(error);
     }
-    Ok(())
+
+    fn secondary_existing_instance(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            status_ownership: LauncherStatusOwnership::SecondaryExistingInstance,
+        }
+    }
+}
+
+fn finalize_launcher_invocation(
+    options: &LaunchOptions,
+    helper_only: bool,
+    invocation: std::result::Result<LauncherStatusOwnership, LauncherRunFailure>,
+) -> Result<()> {
+    match invocation {
+        Ok(_) => Ok(()),
+        Err(failure) => {
+            let error = failure.error;
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "launcher.run_failed",
+                serde_json::json!({
+                    "message": "startup failed",
+                    "component": launcher_failure_component(&error),
+                    "error_chain": codex_plus_core::diagnostic_log::sanitized_error_chain(&error)
+                }),
+            );
+            eprintln!("Codex++ launcher startup failed: {error:#}");
+            if !helper_only && failure.status_ownership == LauncherStatusOwnership::Primary {
+                let _ = options.status_store.save_latest(&LaunchStatus {
+                    status: "failed".to_string(),
+                    message: error.to_string(),
+                    started_at_ms: current_timestamp_ms(),
+                    debug_port: Some(options.debug_port),
+                    helper_port: Some(options.helper_port),
+                    codex_app: options
+                        .app_dir
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().to_string()),
+                    administrator_mode: administrator_mode_status_for_failure(
+                        &options.status_store,
+                        &error,
+                    ),
+                });
+            }
+            Err(error)
+        }
+    }
 }
 
 async fn launcher_main(
@@ -87,48 +131,51 @@ async fn launcher_main(
     helper_only: bool,
     recover_only: bool,
     options: LaunchOptions,
-) -> Result<()> {
+) -> std::result::Result<LauncherStatusOwnership, LauncherRunFailure> {
     if recover_only {
         codex_plus_core::admin_mode::recover_stale_admin_mode_for_shutdown(
             &codex_plus_core::codex_home::default_codex_home_dir(),
             &codex_plus_core::paths::default_app_state_dir(),
-        )?;
-        codex_plus_core::watcher::stop_admin_recovery_processes_and_wait()?;
-        return Ok(());
+        )
+        .map_err(LauncherRunFailure::primary)?;
+        codex_plus_core::watcher::stop_admin_recovery_processes_and_wait()
+            .map_err(LauncherRunFailure::primary)?;
+        return Ok(LauncherStatusOwnership::Primary);
     }
     if helper_only {
         let hooks = LauncherHooks::default();
-        hooks.start_helper(options.helper_port).await?;
+        hooks
+            .start_helper(options.helper_port)
+            .await
+            .map_err(LauncherRunFailure::primary)?;
         std::future::pending::<()>().await;
         hooks.shutdown_helper(options.helper_port).await;
-        return Ok(());
+        return Ok(LauncherStatusOwnership::Primary);
     }
-    prepare_administrator_mode_startup(&options).await?;
-    let Some(_guard) = acquire_single_instance_guard(options.debug_port)? else {
-        activate_existing_codex_app(&options).await?;
-        options.status_store.save_latest(&LaunchStatus {
-            status: "running".to_string(),
-            message: "Existing Codex instance activated".to_string(),
-            started_at_ms: current_timestamp_ms(),
-            debug_port: Some(options.debug_port),
-            helper_port: Some(options.helper_port),
-            codex_app: options
-                .app_dir
-                .map(|path| path.to_string_lossy().to_string()),
-            administrator_mode: administrator_mode_status_for_existing_session(
-                &options.status_store,
-            ),
-        })?;
-        return Ok(());
+    prepare_administrator_mode_startup(&options)
+        .await
+        .map_err(LauncherRunFailure::primary)?;
+    let Some(_guard) =
+        acquire_single_instance_guard(options.debug_port).map_err(LauncherRunFailure::primary)?
+    else {
+        activate_existing_codex_app(&options)
+            .await
+            .map_err(LauncherRunFailure::secondary_existing_instance)?;
+        return Ok(LauncherStatusOwnership::SecondaryExistingInstance);
     };
     tokio::spawn(async {
         let _ = notify_manager_when_update_available().await;
     });
-    stop_standard_codex_before_administrator_launch()?;
+    stop_standard_codex_before_administrator_launch().map_err(LauncherRunFailure::primary)?;
     let hooks = LauncherHooks::default();
-    let handle = launch_and_inject_with_hooks(options, &hooks).await?;
-    handle.wait_for_codex_exit().await?;
-    Ok(())
+    let handle = launch_and_inject_with_hooks(options, &hooks)
+        .await
+        .map_err(LauncherRunFailure::primary)?;
+    handle
+        .wait_for_codex_exit()
+        .await
+        .map_err(LauncherRunFailure::primary)?;
+    Ok(LauncherStatusOwnership::Primary)
 }
 
 fn stop_standard_codex_before_administrator_launch() -> anyhow::Result<()> {
@@ -220,22 +267,6 @@ fn administrator_mode_status_for_failure(
         exec_elevated: false,
         computer_use_elevated: false,
         error_component,
-    }
-}
-
-fn administrator_mode_status_for_existing_session(
-    status_store: &codex_plus_core::status::StatusStore,
-) -> AdministratorModeStatus {
-    if !administrator_mode_requested(status_store) {
-        return AdministratorModeStatus::default();
-    }
-
-    AdministratorModeStatus {
-        requested: true,
-        state: "active".to_string(),
-        exec_elevated: true,
-        computer_use_elevated: true,
-        error_component: None,
     }
 }
 
@@ -1480,6 +1511,42 @@ fn default_user_scripts_config_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_STATUS_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn owner_status_fixture() -> (LaunchOptions, PathBuf, Vec<u8>) {
+        let path = std::env::temp_dir().join(format!(
+            "codex-plus-launcher-secondary-status-{}-{}.json",
+            std::process::id(),
+            NEXT_STATUS_FIXTURE_ID.fetch_add(1, Ordering::Relaxed),
+        ));
+        let owner_bytes = br#"{
+  "status": "running-owner-sentinel",
+  "message": "owner-status-must-remain-byte-identical",
+  "started_at_ms": 424242,
+  "debug_port": 9229,
+  "helper_port": 57321,
+  "codex_app": "C:/Owner/Codex.app",
+  "administrator_mode": {
+    "requested": false,
+    "state": "off",
+    "exec_elevated": false,
+    "computer_use_elevated": false,
+    "error_component": null
+  }
+}
+"#
+        .to_vec();
+        std::fs::write(&path, &owner_bytes).expect("write owner status fixture");
+        let mut options = LaunchOptions::default();
+        options.status_store = StatusStore::new(path.clone());
+        (options, path, owner_bytes)
+    }
+
+    fn remove_owner_status_fixture(path: &Path) {
+        std::fs::remove_file(path).expect("remove owned status fixture");
+    }
 
     #[test]
     fn parse_launch_options_accepts_manager_forwarded_ports_and_app_path() {
@@ -1548,6 +1615,77 @@ mod tests {
             true,
             &[42]
         ));
+    }
+
+    #[test]
+    fn secondary_existing_success_preserves_owner_status_bytes() {
+        let (options, path, owner_bytes) = owner_status_fixture();
+
+        finalize_launcher_invocation(
+            &options,
+            false,
+            Ok(LauncherStatusOwnership::SecondaryExistingInstance),
+        )
+        .expect("secondary success must not need status persistence");
+
+        assert_eq!(
+            std::fs::read(&path).expect("read owner status"),
+            owner_bytes
+        );
+        remove_owner_status_fixture(&path);
+    }
+
+    #[test]
+    fn secondary_existing_failure_preserves_owner_status_bytes() {
+        let (options, path, owner_bytes) = owner_status_fixture();
+
+        let error = finalize_launcher_invocation(
+            &options,
+            false,
+            Err(LauncherRunFailure::secondary_existing_instance(
+                anyhow::anyhow!("secondary activation fixture failure"),
+            )),
+        )
+        .expect_err("secondary failure must reach the caller without writing owner status");
+
+        assert!(
+            error
+                .to_string()
+                .contains("secondary activation fixture failure")
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read owner status"),
+            owner_bytes
+        );
+        remove_owner_status_fixture(&path);
+    }
+
+    #[test]
+    fn primary_failure_persists_failed_status() {
+        let (options, path, owner_bytes) = owner_status_fixture();
+
+        let error = finalize_launcher_invocation(
+            &options,
+            false,
+            Err(LauncherRunFailure::primary(anyhow::anyhow!(
+                "primary launch fixture failure"
+            ))),
+        )
+        .expect_err("primary failure must persist its failed status");
+
+        assert!(error.to_string().contains("primary launch fixture failure"));
+        let bytes = std::fs::read(&path).expect("read persisted failed status");
+        assert_ne!(bytes, owner_bytes);
+        assert_eq!(
+            options
+                .status_store
+                .load_latest()
+                .expect("load persisted failed status")
+                .expect("failed status exists")
+                .status,
+            "failed"
+        );
+        remove_owner_status_fixture(&path);
     }
 
     #[derive(Clone)]
