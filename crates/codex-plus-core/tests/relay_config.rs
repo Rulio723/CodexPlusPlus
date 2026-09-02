@@ -6,14 +6,16 @@ use codex_plus_core::relay_config::{
     backfill_relay_profile_from_home, backfill_relay_profile_from_home_with_common,
     chatgpt_auth_status_from_home, cleanup_unsupported_approval_policies_in_home,
     clear_relay_config_to_home, clear_relay_config_to_home_with_auth,
-    delete_context_entry_from_common_config, extract_common_config_from_config,
-    list_context_entries_from_common_config, normalize_relay_profile_for_storage,
-    prepare_common_config_for_apply, relay_config_status_from_home, relay_profile_api_key,
-    sanitize_common_config_contents, set_codex_goals_feature_in_home,
-    strip_common_config_from_config, sync_live_config_context_entries,
-    upsert_context_entry_in_common_config,
+    delete_context_entry_from_common_config, ensure_active_protocol_proxy_config_in_home,
+    extract_common_config_from_config, list_context_entries_from_common_config,
+    normalize_relay_profile_for_storage, prepare_common_config_for_apply,
+    relay_config_status_from_home, relay_profile_api_key, sanitize_common_config_contents,
+    set_codex_goals_feature_in_home, strip_common_config_from_config,
+    sync_live_config_context_entries, upsert_context_entry_in_common_config,
 };
-use codex_plus_core::settings::{RelayMode, RelayModelRoute, RelayProfile, RelayProtocol};
+use codex_plus_core::settings::{
+    BackendSettings, RelayMode, RelayModelRoute, RelayProfile, RelayProtocol,
+};
 
 fn write_remote_plugin_marketplace_snapshot(home: &std::path::Path) {
     let root = home.join(".tmp").join("plugins-remote");
@@ -750,6 +752,193 @@ base_url = "https://responses.example.test/v1"
 }
 
 #[test]
+fn launcher_repairs_only_the_live_model_route_proxy_endpoint() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"model = "gpt-5.6-sol"
+model_provider = "relay-source"
+custom_setting = "preserve-me"
+
+[model_providers.relay-source]
+name = "Source"
+wire_api = "responses"
+base_url = "https://source.example.test/v1"
+experimental_bearer_token = "sk-preserve"
+
+[plugins.example]
+enabled = true
+"#,
+    )
+    .unwrap();
+    let settings = BackendSettings {
+        active_relay_id: "source".to_string(),
+        relay_profiles: vec![
+            RelayProfile {
+                id: "source".to_string(),
+                config_contents: r#"model_provider = "relay-source"
+
+[model_providers.relay-source]
+base_url = "https://source.example.test/v1"
+"#
+                .to_string(),
+                model_routes: vec![RelayModelRoute {
+                    model: "gpt-5.6-luna".to_string(),
+                    target_relay_id: "target".to_string(),
+                    target_model: String::new(),
+                }],
+                ..RelayProfile::default()
+            },
+            RelayProfile {
+                id: "target".to_string(),
+                ..RelayProfile::default()
+            },
+        ],
+        ..BackendSettings::default()
+    };
+
+    assert!(ensure_active_protocol_proxy_config_in_home(temp.path(), &settings).unwrap());
+    let updated = std::fs::read_to_string(&config_path).unwrap();
+    assert!(updated.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
+    assert!(updated.contains(r#"experimental_bearer_token = "sk-preserve""#));
+    assert!(updated.contains(r#"custom_setting = "preserve-me""#));
+    assert!(updated.contains("[plugins.example]"));
+    assert!(!ensure_active_protocol_proxy_config_in_home(temp.path(), &settings).unwrap());
+}
+
+#[test]
+fn launcher_does_not_rewrite_pure_responses_profiles_without_proxy_features() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    let original = r#"model_provider = "custom"
+
+[model_providers.custom]
+base_url = "https://responses.example.test/v1"
+"#;
+    std::fs::write(&config_path, original).unwrap();
+    let settings = BackendSettings {
+        relay_profiles: vec![RelayProfile {
+            base_url: "https://responses.example.test/v1".to_string(),
+            protocol: RelayProtocol::Responses,
+            ..RelayProfile::default()
+        }],
+        ..BackendSettings::default()
+    };
+
+    assert!(!ensure_active_protocol_proxy_config_in_home(temp.path(), &settings).unwrap());
+    assert_eq!(std::fs::read_to_string(config_path).unwrap(), original);
+}
+
+#[test]
+fn launcher_repairs_no_auth_transport_without_rewriting_managed_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"model_provider = "custom"
+
+[model_providers.custom]
+base_url = "https://no-auth.example.test/v1"
+experimental_bearer_token = "codex-plus-no-auth"
+custom_setting = "preserve-me"
+"#,
+    )
+    .unwrap();
+    let settings = BackendSettings {
+        relay_profiles: vec![RelayProfile {
+            relay_mode: RelayMode::PureApi,
+            no_auth: true,
+            base_url: "https://no-auth.example.test/v1".to_string(),
+            protocol: RelayProtocol::Responses,
+            ..RelayProfile::default()
+        }],
+        ..BackendSettings::default()
+    };
+
+    assert!(ensure_active_protocol_proxy_config_in_home(temp.path(), &settings).unwrap());
+    let updated = std::fs::read_to_string(&config_path).unwrap();
+    assert!(updated.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
+    assert!(updated.contains(r#"experimental_bearer_token = "codex-plus-no-auth""#));
+    assert!(updated.contains(r#"custom_setting = "preserve-me""#));
+    assert!(!ensure_active_protocol_proxy_config_in_home(temp.path(), &settings).unwrap());
+}
+
+#[test]
+fn launcher_repairs_route_transport_and_openai_identity_endpoints_together() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"model_provider = "openai"
+
+[model_providers.custom]
+base_url = "https://source.example.test/v1"
+experimental_bearer_token = "sk-preserve"
+"#,
+    )
+    .unwrap();
+    let settings = BackendSettings {
+        active_relay_id: "source".to_string(),
+        relay_profiles: vec![
+            RelayProfile {
+                id: "source".to_string(),
+                config_contents: "model_provider = \"openai\"\n".to_string(),
+                model_routes: vec![RelayModelRoute {
+                    model: "gpt-5.6-luna".to_string(),
+                    target_relay_id: "target".to_string(),
+                    target_model: String::new(),
+                }],
+                ..RelayProfile::default()
+            },
+            RelayProfile {
+                id: "target".to_string(),
+                ..RelayProfile::default()
+            },
+        ],
+        ..BackendSettings::default()
+    };
+
+    assert!(ensure_active_protocol_proxy_config_in_home(temp.path(), &settings).unwrap());
+    let updated = std::fs::read_to_string(config_path).unwrap();
+    assert!(updated.contains(r#"openai_base_url = "http://127.0.0.1:57321/v1""#));
+    assert!(updated.contains("[model_providers.custom]"));
+    assert!(updated.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
+    assert!(updated.contains(r#"experimental_bearer_token = "sk-preserve""#));
+}
+
+#[test]
+fn launcher_official_mix_repairs_only_managed_openai_endpoint() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"model_provider = "custom"
+
+[model_providers.custom]
+base_url = "https://responses.example.test/v1"
+"#,
+    )
+    .unwrap();
+    let settings = BackendSettings {
+        active_relay_id: "official-mix".to_string(),
+        relay_profiles: vec![RelayProfile {
+            id: "official-mix".to_string(),
+            relay_mode: RelayMode::Official,
+            official_mix_api_key: true,
+            protocol: RelayProtocol::Responses,
+            ..RelayProfile::default()
+        }],
+        ..BackendSettings::default()
+    };
+
+    assert!(ensure_active_protocol_proxy_config_in_home(temp.path(), &settings).unwrap());
+    let updated = std::fs::read_to_string(config_path).unwrap();
+    assert!(updated.contains(r#"openai_base_url = "http://127.0.0.1:57321/v1""#));
+    assert!(updated.contains(r#"base_url = "https://responses.example.test/v1""#));
+}
+
+#[test]
 fn apply_aggregate_relay_points_codex_to_local_responses_proxy_without_snapshot() {
     let temp = tempfile::tempdir().unwrap();
     let profile = RelayProfile {
@@ -1106,6 +1295,16 @@ sandbox_workspace_write = ["C:/workspace"]
 composerEnterBehavior = "cmdAlways"
 followUpQueueMode = "queue"
 selected-avatar-id = "avatar-local"
+
+[hooks]
+live_only_setting = "do-not-copy"
+
+[hooks.state."plugin-a@personal:hooks/hooks.json:pre_tool_use:0:0"]
+trusted_hash = "live-a-hash"
+
+[hooks.state."plugin-b@openai-bundled:hooks/hooks.json:user_prompt_submit:1:0"]
+trusted_hash = "live-b-hash"
+enabled = false
 "#,
     )
     .unwrap();
@@ -1120,6 +1319,15 @@ sandbox_workspace_write = []
 [desktop]
 composerEnterBehavior = "enter"
 selected-avatar-id = "avatar-from-profile"
+
+[hooks]
+target_only_setting = "keep-me"
+
+[hooks.state."plugin-a@personal:hooks/hooks.json:pre_tool_use:0:0"]
+trusted_hash = "stale-a-hash"
+
+[hooks.state."profile-only-hook"]
+trusted_hash = "stale-profile-only-hash"
 
 [model_providers.custom]
 name = "custom"
@@ -1153,9 +1361,68 @@ experimental_bearer_token = "sk-a"
         &[toml::Value::String("C:/workspace".to_string())]
     );
     assert_eq!(
+        parsed["hooks"]["state"]["plugin-a@personal:hooks/hooks.json:pre_tool_use:0:0"]
+            ["trusted_hash"]
+            .as_str(),
+        Some("live-a-hash")
+    );
+    assert_eq!(
+        parsed["hooks"]["state"]["plugin-b@openai-bundled:hooks/hooks.json:user_prompt_submit:1:0"]
+            ["trusted_hash"]
+            .as_str(),
+        Some("live-b-hash")
+    );
+    assert_eq!(
+        parsed["hooks"]["state"]["plugin-b@openai-bundled:hooks/hooks.json:user_prompt_submit:1:0"]
+            ["enabled"]
+            .as_bool(),
+        Some(false)
+    );
+    assert!(parsed["hooks"]["state"].get("profile-only-hook").is_none());
+    assert_eq!(
+        parsed["hooks"]["target_only_setting"].as_str(),
+        Some("keep-me")
+    );
+    assert!(parsed["hooks"].get("live_only_setting").is_none());
+    assert_eq!(
         parsed["model_providers"]["custom"]["base_url"].as_str(),
         Some("https://relay-a.example/v1")
     );
+}
+
+#[test]
+fn apply_relay_files_removes_stale_profile_hook_state_when_live_config_has_none() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("config.toml"), "model = \"old\"\n").unwrap();
+
+    apply_relay_files_to_home(
+        temp.path(),
+        r#"model_provider = "custom"
+
+[hooks]
+target_only_setting = "keep-me"
+
+[hooks.state."stale-profile-hook"]
+trusted_hash = "stale-hash"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "https://relay-a.example/v1"
+experimental_bearer_token = "sk-a"
+"#,
+        r#"{"OPENAI_API_KEY":"sk-a"}"#,
+    )
+    .unwrap();
+
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    let parsed: toml::Value = config.parse().unwrap();
+    assert_eq!(
+        parsed["hooks"]["target_only_setting"].as_str(),
+        Some("keep-me")
+    );
+    assert!(parsed["hooks"].get("state").is_none());
 }
 
 #[test]
@@ -4493,6 +4760,8 @@ fn apply_relay_profile_copies_external_lite_catalog_for_standard_responses() {
   "models": [
     {
       "slug": "gpt-5.6-sol",
+      "context_window": 272000,
+      "max_context_window": 272000,
       "supports_search_tool": true,
       "web_search_tool_type": "text_and_image",
       "use_responses_lite": true
@@ -4521,6 +4790,8 @@ experimental_bearer_token = "sk-new"
         ),
         auth_contents: r#"{"OPENAI_API_KEY":"sk-new"}"#.to_string(),
         model_list: "gpt-5.6-sol".to_string(),
+        context_window: "1000000".to_string(),
+        auto_compact_limit: "900000".to_string(),
         ..RelayProfile::default()
     };
 
@@ -4543,6 +4814,15 @@ experimental_bearer_token = "sk-new"
         "text_and_image"
     );
     assert_eq!(copied["models"][0]["use_responses_lite"], false);
+    assert_eq!(copied["models"][0]["context_window"], 1_000_000);
+    assert_eq!(copied["models"][0]["max_context_window"], 1_000_000);
+
+    let config_value: toml::Value = toml::from_str(&config).unwrap();
+    assert_eq!(config_value["model_context_window"].as_integer(), Some(1_000_000));
+    assert_eq!(
+        config_value["model_auto_compact_token_limit"].as_integer(),
+        Some(900_000)
+    );
 
     let original: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(external_catalog).unwrap()).unwrap();

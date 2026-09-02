@@ -1673,8 +1673,90 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(!script.contains("function patchObjectGraphForModels"));
     assert!(!script.contains("window.dispatchEvent = function patchedCodexPlusDispatchEvent"));
     assert!(script.contains("String(name) === \"107580212\""));
+    assert!(script.contains("isDefault: false"));
+    assert!(!script.contains("value.defaultModel = codexPlusModelDescriptor(names[0])"));
+    assert!(!script.contains("value.model = value.defaultModel"));
+    assert!(!script.contains("default_model: value.default_model || names[0]"));
+    assert!(!script.contains("default_model: names[0] || value.default_model"));
     assert!(script.contains("window.addEventListener(\"codex-message-from-view\""));
     assert!(!script.contains("querySelectorAll(\"button, [role='menu']"));
+}
+
+#[test]
+fn model_whitelist_never_claims_the_host_default_model() {
+    let script = assets::injection_script(57321);
+    let start = script
+        .find("function codexPlusModelDescriptor(modelName)")
+        .expect("model descriptor patch should exist");
+    let end = script[start..]
+        .find("\n  function statsigClients()")
+        .map(|offset| start + offset)
+        .expect("model whitelist patch should have a stable end marker");
+    let function_source = &script[start..end];
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let harness_path = temp.path().join("model-default-harness.cjs");
+    std::fs::write(
+        &harness_path,
+        format!(
+            r#"
+const codexModelCatalog = {{
+  default_model: "supplier-default",
+  model: "supplier-default",
+  provider_name: "Supplier",
+  model_provider: "custom",
+}};
+const codexPlusModelMetadata = () => null;
+const modelReasoningEfforts = () => [];
+const applyCodexPlusModelMetadata = () => false;
+const codexPlusModelNames = () => ["supplier-default", "extra-model"];
+{function_source}
+
+const missingDefault = {{ value: {{ available_models: ["native-model"] }} }};
+const patchedMissingDefault = patchStatsigModelDynamicConfig(missingDefault);
+if (Object.prototype.hasOwnProperty.call(patchedMissingDefault.value, "default_model")) process.exit(2);
+if (!patchedMissingDefault.value.available_models.includes("supplier-default")) process.exit(3);
+if (!patchedMissingDefault.value.available_models.includes("extra-model")) process.exit(4);
+
+const existingDefault = {{ value: {{ available_models: ["native-model"], default_model: "thread-model" }} }};
+const patchedExistingDefault = patchStatsigModelDynamicConfig(existingDefault);
+if (patchedExistingDefault.value.default_model !== "thread-model") process.exit(5);
+
+const missingContainerDefault = {{
+  models: [{{ model: "native-model", isDefault: true }}],
+  availableModels: ["native-model"],
+}};
+patchModelContainer(missingContainerDefault);
+if (Object.prototype.hasOwnProperty.call(missingContainerDefault, "defaultModel")) process.exit(6);
+if (Object.prototype.hasOwnProperty.call(missingContainerDefault, "model")) process.exit(7);
+const injectedDefault = missingContainerDefault.models.find((item) => item.model === "supplier-default");
+if (!injectedDefault || injectedDefault.isDefault !== false) process.exit(8);
+
+const hostDefault = {{ model: "native-model" }};
+const hostModel = {{ model: "thread-model" }};
+const existingContainerDefault = {{
+  models: [{{ model: "native-model", isDefault: true }}],
+  availableModels: ["native-model"],
+  defaultModel: hostDefault,
+  model: hostModel,
+}};
+patchModelContainer(existingContainerDefault);
+if (existingContainerDefault.defaultModel !== hostDefault) process.exit(9);
+if (existingContainerDefault.model !== hostModel) process.exit(10);
+"#
+        ),
+    )
+    .expect("model default harness should be written");
+
+    let output = Command::new("node")
+        .arg(&harness_path)
+        .output()
+        .expect("node should run model default harness");
+    assert!(
+        output.status.success(),
+        "node harness failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -1893,6 +1975,27 @@ fn injection_script_applies_fast_service_tier_contract() {
     );
 
     assert_eq!(cases["startConversation"]["serviceTier"], "priority");
+    assert_eq!(
+        cases["explicitProjectStartConversation"]["workspaceKind"],
+        "project"
+    );
+    assert_eq!(
+        cases["explicitProjectStartConversation"]["projectAssignment"]["projectId"],
+        "C:/projects/explicit"
+    );
+    assert_eq!(
+        cases["projectlessStartConversation"]["workspaceKind"],
+        "projectless"
+    );
+    assert_eq!(
+        cases["projectlessStartConversation"]["projectlessOutputDirectory"],
+        "C:/projectless/outputs"
+    );
+    assert!(
+        cases["projectlessStartConversation"]
+            .get("projectAssignment")
+            .is_none()
+    );
     assert_eq!(cases["fetchStartConversation"]["serviceTier"], "priority");
     assert_eq!(
         cases["fetchSendCliRequest"]["params"]["serviceTier"],
@@ -1921,7 +2024,8 @@ fn injection_script_applies_fast_service_tier_contract() {
     assert_eq!(cases["legacyStateApi"], true);
     assert_eq!(cases["currentStateApi"], true);
     assert_eq!(cases["appServerParamsUnchanged"], true);
-    assert_eq!(cases["appServerSentCount"], 6);
+    assert_eq!(cases["appServerProjectlessParamsUnchanged"], true);
+    assert_eq!(cases["appServerSentCount"], 7);
     assert_eq!(
         cases["providerFromMissing"]["modelProvider"],
         "vendor_alpha"
@@ -1970,12 +2074,14 @@ fn injection_script_applies_fast_service_tier_contract() {
     assert_eq!(cases["openAiNormalizationDisabled"], true);
     assert_eq!(cases["refreshedCustomProviderOverride"], "refreshed_vendor");
     assert_eq!(cases["refreshedOpenAiProvider"], "openai");
-    assert_eq!(cases["refreshedPureApiResumeProvider"], "custom");
+    assert_eq!(cases["refreshedPureApiResumeProvider"], "openai");
+    assert_eq!(cases["refreshedPureApiResumeModel"], "gpt-5.6-terra");
     assert_eq!(cases["failedRefreshProviderUnchanged"], "openai");
     assert_eq!(cases["missingActiveProviderUnchanged"], true);
     assert_eq!(cases["missingActiveRecoveryUnscheduled"], true);
     assert_eq!(cases["pureApiThreadStartProvider"], "custom");
-    assert_eq!(cases["pureApiThreadResumeProvider"], "custom");
+    assert_eq!(cases["pureApiThreadResumeUnchanged"], true);
+    assert_eq!(cases["pureApiNativeResumeUnchanged"], true);
     assert_eq!(cases["pureApiTurnStartProvider"], "custom");
     assert_eq!(cases["pureApiTurnWithoutProviderUnchanged"], true);
     assert_eq!(cases["pureApiOtherProviderUnchanged"], true);
@@ -2112,6 +2218,24 @@ const startConversation = api.requestOverride({{
   threadId: "thread-12345678",
   model: "gpt-5.5",
 }});
+const explicitProjectStartConversation = api.requestOverride({{
+  type: "start-conversation",
+  threadId: "thread-explicit-project",
+  model: "gpt-5.5",
+  cwd: "C:/projects/explicit",
+  workspaceRoots: ["C:/projects/explicit"],
+  workspaceKind: "project",
+  projectAssignment: {{ projectKind: "local", projectId: "C:/projects/explicit" }},
+}});
+const projectlessStartConversation = api.requestOverride({{
+  type: "start-conversation",
+  threadId: "thread-projectless",
+  model: "gpt-5.5",
+  cwd: "C:/projectless/work",
+  workspaceRoots: ["C:/projectless/work"],
+  workspaceKind: "projectless",
+  projectlessOutputDirectory: "C:/projectless/outputs",
+}});
 const fetchStartConversationEnvelope = api.requestOverride({{
   type: "fetch",
   url: "vscode://codex/start-conversation",
@@ -2232,6 +2356,12 @@ const nativeAppServerParams = {{
   workspaceKind: "project",
   projectAssignment: {{ projectKind: "local", projectId: "C:/native/work" }},
 }};
+const nativeProjectlessAppServerParams = {{
+  cwd: "C:/native/projectless-work",
+  workspaceRoots: ["C:/native/projectless-work"],
+  workspaceKind: "projectless",
+  projectlessOutputDirectory: "C:/native/projectless-outputs",
+}};
 const appServerCalls = [];
 const appServerClient = {{
   async sendRequest(method, params, options) {{
@@ -2242,6 +2372,11 @@ const appServerClient = {{
 api.patchAppServerClient(appServerClient);
 
 appServerClient.sendRequest("start-conversation", nativeAppServerParams, {{ signal: "native" }}).then(async () => {{
+await appServerClient.sendRequest(
+  "thread/start",
+  nativeProjectlessAppServerParams,
+  {{ signal: "native-projectless" }}
+);
 api.setModelCatalog({{ status: "ok", model: "gpt-5.4", default_model: "gpt-5.4", models: ["gpt-5.4"], service_tier: "fast" }});
 const resolvedConfigTomlTier = await api.resolveInheritedServiceTier();
 api.setModelCatalog({{ status: "ok", model: "gpt-5.4", default_model: "gpt-5.4", models: ["gpt-5.4"] }});
@@ -2258,6 +2393,11 @@ const appServerParamsUnchanged = appServerCalls[0]?.params === nativeAppServerPa
   && appServerCalls[0]?.params?.workspaceKind === "project"
   && appServerCalls[0]?.params?.cwd === "C:/native/work"
   && appServerCalls[0]?.params?.projectAssignment?.projectId === "C:/native/work";
+const appServerProjectlessParamsUnchanged = appServerCalls[1]?.params === nativeProjectlessAppServerParams
+  && appServerCalls[1]?.params?.workspaceKind === "projectless"
+  && appServerCalls[1]?.params?.cwd === "C:/native/projectless-work"
+  && appServerCalls[1]?.params?.projectlessOutputDirectory === "C:/native/projectless-outputs"
+  && !Object.hasOwn(appServerCalls[1]?.params || {{}}, "projectAssignment");
 api.setBackendSettings({{
   relayProfilesEnabled: true,
   activeRelayId: "custom-relay",
@@ -2286,7 +2426,7 @@ const providerWithServiceTierControlsDisabled = api.requestOverride({{
   modelProvider: "openai",
 }});
 await appServerClient.sendRequest("thread/start", {{ cwd: "C:/mobile", modelProvider: "openai" }}, {{ signal: "mobile" }});
-const appServerProviderOverride = appServerCalls[1]?.params?.modelProvider;
+const appServerProviderOverride = appServerCalls[2]?.params?.modelProvider;
 const directThreadStartedId = api.remoteSessionStartedThreadId({{
   method: "thread/started",
   params: {{ thread: {{ id: "thread-mobile-direct" }} }},
@@ -2495,8 +2635,10 @@ window.__codexSessionDeleteBridge = async (path) => {{
 await appServerClient.sendRequest("thread/resume", {{
   threadId: "thread-mobile-pure-api-refresh",
   modelProvider: "openai",
+  model: "gpt-5.6-terra",
 }}, {{ signal: "pure-api-switch" }});
 const refreshedPureApiResumeProvider = appServerCalls.at(-1)?.params?.modelProvider || "";
+const refreshedPureApiResumeModel = appServerCalls.at(-1)?.params?.model || "";
 delete window.__codexSessionDeleteBridge;
 api.setBackendSettings({{
   relayProfilesEnabled: true,
@@ -2530,10 +2672,13 @@ api.setBackendSettings({{
 }});
 const pureApiParams = {{ cwd: "C:/mobile", modelProvider: "openai" }};
 const pureApiThreadStartProvider = api.applyProviderOverride("thread/start", pureApiParams)?.modelProvider;
-const pureApiThreadResumeProvider = api.applyProviderOverride("thread/resume", {{
+const pureApiThreadResumeParams = {{
   threadId: "thread-mobile-pure-api",
   model_provider: "openai",
-}})?.modelProvider;
+}};
+const pureApiThreadResumeUnchanged = api.applyProviderOverride("thread/resume", pureApiThreadResumeParams) === pureApiThreadResumeParams;
+const pureApiNativeResumeParams = {{ threadId: "thread-mobile-native-resume" }};
+const pureApiNativeResumeUnchanged = api.applyProviderOverride("thread/resume", pureApiNativeResumeParams) === pureApiNativeResumeParams;
 const pureApiTurnStartProvider = api.applyProviderOverride("turn/start", {{
   threadId: "thread-mobile-pure-api",
   modelProvider: "openai",
@@ -2567,6 +2712,8 @@ process.stdout.write(JSON.stringify({{
   resolvedUnsetTier,
   inheritedConfigFastBlocked,
   startConversation,
+  explicitProjectStartConversation,
+  projectlessStartConversation,
   fetchStartConversation,
   fetchSendCliRequest,
   solFastAvailability,
@@ -2580,6 +2727,7 @@ process.stdout.write(JSON.stringify({{
   legacyStateApi,
   currentStateApi,
   appServerParamsUnchanged,
+  appServerProjectlessParamsUnchanged,
   appServerSentCount: appServerCalls.length,
   providerFromMissing,
   providerFromOpenAi,
@@ -2609,11 +2757,13 @@ process.stdout.write(JSON.stringify({{
   refreshedCustomProviderOverride,
   refreshedOpenAiProvider,
   refreshedPureApiResumeProvider,
+  refreshedPureApiResumeModel,
   failedRefreshProviderUnchanged,
   missingActiveProviderUnchanged,
   missingActiveRecoveryUnscheduled,
   pureApiThreadStartProvider,
-  pureApiThreadResumeProvider,
+  pureApiThreadResumeUnchanged,
+  pureApiNativeResumeUnchanged,
   pureApiTurnStartProvider,
   pureApiTurnWithoutProviderUnchanged,
   pureApiOtherProviderUnchanged,

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use toml_edit::{DocumentMut, Item, Table, TableLike};
 
-use crate::settings::{RelayProfile, RelayProtocol, RelaySessionProvider};
+use crate::settings::{BackendSettings, RelayProfile, RelayProtocol, RelaySessionProvider};
 
 const RELAY_PROVIDER: &str = "custom";
 /// 我们代管的 config.toml 上下文表。
@@ -295,6 +295,77 @@ pub fn responses_proxy_configured_in_home(home: &Path) -> bool {
             )
             .as_str(),
         )
+}
+
+pub fn ensure_active_protocol_proxy_config_in_home(
+    home: &Path,
+    settings: &BackendSettings,
+) -> anyhow::Result<bool> {
+    let profile = settings.active_relay_profile();
+    let transport_uses_proxy = settings.active_relay_transport_uses_protocol_proxy();
+    let openai_identity_uses_proxy = settings.active_relay_session_provider()
+        == RelaySessionProvider::Openai
+        || (profile.relay_mode == crate::settings::RelayMode::Official
+            && profile.official_mix_api_key);
+    if !transport_uses_proxy && !openai_identity_uses_proxy {
+        return Ok(false);
+    }
+
+    let config_path = home.join("config.toml");
+    let existing = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("读取 {} 失败", config_path.display()))?;
+    let mut doc = parse_toml_document(&existing)?;
+    let managed = managed_openai_base_url();
+    let mut changed = false;
+
+    if transport_uses_proxy {
+        let session_provider_id = active_session_provider_id(&doc);
+        let transport_provider_id = if session_provider_id == "openai" {
+            RELAY_PROVIDER.to_string()
+        } else {
+            active_or_default_provider_id(&doc)
+        };
+        let provider = doc
+            .get_mut("model_providers")
+            .and_then(Item::as_table_mut)
+            .and_then(|providers| providers.get_mut(&transport_provider_id))
+            .and_then(Item::as_table_mut)
+            .ok_or_else(|| {
+                anyhow::anyhow!("活动协议代理需要现有 model_providers.{transport_provider_id} 配置")
+            })?;
+        let current = provider
+            .get("base_url")
+            .and_then(Item::as_str)
+            .map(str::trim);
+        if current != Some(managed.as_str()) {
+            provider["base_url"] = toml_edit::value(managed.as_str());
+            changed = true;
+        }
+    }
+
+    if openai_identity_uses_proxy {
+        let before = doc
+            .get(OPENAI_BASE_URL_KEY)
+            .and_then(Item::as_str)
+            .map(str::trim)
+            .map(ToString::to_string);
+        update_remote_control_openai_base_url(&mut doc, true);
+        let after = doc
+            .get(OPENAI_BASE_URL_KEY)
+            .and_then(Item::as_str)
+            .map(str::trim)
+            .map(ToString::to_string);
+        changed |= before != after;
+    }
+
+    if !changed {
+        return Ok(false);
+    }
+    crate::settings::atomic_write(
+        &config_path,
+        ensure_trailing_newline(doc.to_string()).as_bytes(),
+    )?;
+    Ok(true)
 }
 
 pub fn apply_relay_config_to_home(
@@ -1192,7 +1263,7 @@ fn write_codex_live_atomic(
 
     let config_text = match config_text {
         Some(config_text) => {
-            let config_text = preserve_live_desktop_settings(home, config_text)?;
+            let config_text = preserve_live_app_settings(home, config_text)?;
             Some(preserve_live_marketplace_configs(home, &config_text)?)
         }
         None => None,
@@ -1431,7 +1502,84 @@ pub fn normalize_config_text(contents: &str) -> String {
     normalize_duplicate_toml_text(contents)
 }
 
+/// 把可能含重复表头/重复根键的文本，折叠成一份合法、去重的 TOML。
+///
+/// 历史实现是逐行文本去重：按表头整行字符串匹配，撞见第二次出现的 `[header]`
+/// 就把该表体整段丢弃。这在语义上是错的——`[mcp_servers.node_repl]`（带正确的
+/// `.env` 子表）和其后一个裸的 `[mcp_servers]`（空表头，来自历史脚本/手改残留）
+/// 是两个不同的表头字符串，行级去重完全看不到它们其实是同一棵 TOML 树上的父子
+/// 关系；反过来，若两次出现的是同一个表头但各自只写了部分字段，行级去重会把后一
+/// 份连同它独有的字段整段丢弃，而不是把两份合并。真实故障（Codex `config.toml`
+/// 反复复现 `invalid transport`）就是这条路径把裸 env 变量和 `.env` 子表的残留
+/// 一起原样保留进了最终文件。
+///
+/// 改成按顶层表头切块 + 用已有的 `merge_toml_table_like` 做语义合并：每块单独
+/// 解析成 `DocumentMut`（块内容本身必须是合法 TOML），后出现的块合并进先出现的
+/// 同名表（标量后写覆盖前写，子表递归合并、不清空），根键重复时也是后写覆盖。
+/// 任何一块解析失败就说明输入本身已经坏到不是逐块可解析的程度，退回历史的逐行
+/// 丢弃策略，不让这次修复反而让原本能跑的输入报错。
 fn normalize_duplicate_toml_text(contents: &str) -> String {
+    match merge_duplicate_toml_blocks(contents) {
+        Some(merged) => normalize_optional_toml(merged),
+        None => normalize_duplicate_toml_text_line_fallback(contents),
+    }
+}
+
+/// 按不带前导空白的 `[table]` / `[[array_table]]` 行、以及根级重复键，切成若干
+/// 独立可解析的 TOML 片段，再逐块 parse 后语义合并。
+///
+/// 只按表头切块不够：`model = "a"\nmodel = "b"\n` 两行根键都落在同一个块里，
+/// 直接喂给 `DocumentMut::parse` 会因为 TOML 语法本身不允许根级重复键而整体
+/// 解析失败。所以还要在「当前块的根级部分已经出现过这个 key」时，先切出一个
+/// 新块，让后一次赋值单独成块参与合并（合并语义是后写覆盖前写）。
+fn merge_duplicate_toml_blocks(contents: &str) -> Option<DocumentMut> {
+    let mut blocks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_in_root = true;
+    let mut current_root_keys: HashSet<String> = HashSet::new();
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        let is_new_table_header = trimmed.starts_with('[') && trimmed.ends_with(']');
+
+        if is_new_table_header {
+            if !current.trim().is_empty() {
+                blocks.push(std::mem::take(&mut current));
+            }
+            current_in_root = false;
+            current_root_keys.clear();
+        } else if current_in_root && !trimmed.is_empty() && !trimmed.starts_with('#') {
+            if let Some((key, _)) = trimmed.split_once('=') {
+                let key = key.trim().to_string();
+                if !key.is_empty() && !current_root_keys.insert(key) {
+                    // 同一个根键在当前块里再次出现：先把当前块切出去，
+                    // 让这一行作为新块的第一行，参与合并时以「后写」身份覆盖前值。
+                    if !current.trim().is_empty() {
+                        blocks.push(std::mem::take(&mut current));
+                    }
+                    current_root_keys.clear();
+                }
+            }
+        }
+
+        current.push_str(line);
+        current.push('\n');
+    }
+    if !current.trim().is_empty() {
+        blocks.push(current);
+    }
+
+    let mut merged = DocumentMut::new();
+    for block in blocks {
+        let block_doc: DocumentMut = block.parse().ok()?;
+        merge_toml_table_like(merged.as_table_mut(), block_doc.as_table());
+    }
+    Some(merged)
+}
+
+/// 逐块合并失败时的保底路径：原历史实现，逐行文本去重（丢弃后出现的重复表头/
+/// 根键），保证至少不比修复前更差。
+fn normalize_duplicate_toml_text_line_fallback(contents: &str) -> String {
     let mut seen_root_keys = HashSet::new();
     let mut seen_headers = HashSet::new();
     let mut kept = Vec::new();
@@ -1558,7 +1706,7 @@ fn normalize_config_text_for_write(config_text: &str) -> String {
     config_text.trim_start_matches('\u{feff}').to_string()
 }
 
-fn preserve_live_desktop_settings(home: &Path, config_text: &str) -> anyhow::Result<String> {
+fn preserve_live_app_settings(home: &Path, config_text: &str) -> anyhow::Result<String> {
     let normalized = normalize_config_text_for_write(config_text);
     let mut target_doc = parse_toml_document(&normalized)?;
     remove_unsupported_approval_policies(&mut target_doc);
@@ -1580,6 +1728,7 @@ fn preserve_live_desktop_settings(home: &Path, config_text: &str) -> anyhow::Res
         }
     }
     remove_unsupported_approval_policies(&mut target_doc);
+    preserve_live_hook_state(&mut target_doc, &live_doc);
     let context_usage_configured = target_doc
         .get("desktop")
         .and_then(Item::as_table)
@@ -1594,6 +1743,41 @@ fn preserve_live_desktop_settings(home: &Path, config_text: &str) -> anyhow::Res
         }
     }
     Ok(normalize_optional_toml(target_doc))
+}
+
+fn preserve_live_hook_state(target_doc: &mut DocumentMut, live_doc: &DocumentMut) {
+    let live_state = live_doc
+        .get("hooks")
+        .and_then(Item::as_table_like)
+        .and_then(|hooks| hooks.get("state"))
+        .cloned();
+
+    if let Some(live_state) = live_state {
+        if target_doc
+            .get("hooks")
+            .and_then(Item::as_table_like)
+            .is_none()
+        {
+            target_doc["hooks"] = toml_edit::table();
+        }
+        let hooks = target_doc["hooks"]
+            .as_table_like_mut()
+            .expect("hooks was initialized as a table");
+        hooks.insert("state", live_state);
+    } else if let Some(hooks) = target_doc
+        .get_mut("hooks")
+        .and_then(Item::as_table_like_mut)
+    {
+        hooks.remove("state");
+    }
+
+    let remove_empty_hooks = target_doc
+        .get("hooks")
+        .and_then(Item::as_table_like)
+        .is_some_and(|hooks| hooks.is_empty());
+    if remove_empty_hooks {
+        target_doc.as_table_mut().remove("hooks");
+    }
 }
 
 fn remove_unsupported_approval_policies(doc: &mut DocumentMut) -> bool {
@@ -1683,6 +1867,18 @@ fn apply_model_catalog_to_config(
     // Catalog capabilities must follow the effective config, not stale profile URLs.
     let official_deepseek_responses =
         uses_official_deepseek_responses_for_config(profile, &config_text);
+    let (model_list, model_windows): (String, std::collections::HashMap<String, String>) =
+        if profile.model_windows.trim().is_empty() && profile.model_list.contains('[') {
+            crate::model_suffix::migrate_model_list_with_suffixes(&profile.model_list)
+        } else {
+            (
+                profile.model_list.clone(),
+                serde_json::from_str(&profile.model_windows).unwrap_or_default(),
+            )
+        };
+    let entries =
+        crate::model_suffix::collect_catalog_entries(&model_list, &model_windows, &profile.model);
+    let fallback = parse_optional_positive_u64(&profile.context_window, "上下文大小")?;
     // 用户已手写 model_catalog_json 指针时保留，不覆盖（保 preserves_user_model_catalog_json 测试）
     // 仅当现有指针指向本 profile 自己生成的 catalog 时才重新生成。
     // cc-switch 的固定文件名属于已知的其他管理器投影，不视为用户手写 catalog；
@@ -1694,7 +1890,13 @@ fn apply_model_catalog_to_config(
             } else if official_deepseek_responses {
                 return Ok(config_text.to_string());
             } else if custom_responses
-                && copy_standard_responses_catalog(home, &existing, &catalog_relative)?
+                && copy_standard_responses_catalog(
+                    home,
+                    &existing,
+                    &catalog_relative,
+                    &entries,
+                    fallback,
+                )?
             {
                 let mut doc = parse_toml_document(&config_text)?;
                 doc["model_catalog_json"] = toml_edit::value(catalog_relative);
@@ -1709,7 +1911,13 @@ fn apply_model_catalog_to_config(
     {
         let mut doc = parse_toml_document(&config_text)?;
         if custom_responses
-            && copy_standard_responses_catalog(home, &external_catalog, &catalog_relative)?
+            && copy_standard_responses_catalog(
+                home,
+                &external_catalog,
+                &catalog_relative,
+                &entries,
+                fallback,
+            )?
         {
             doc["model_catalog_json"] = toml_edit::value(catalog_relative);
         } else {
@@ -1717,17 +1925,6 @@ fn apply_model_catalog_to_config(
         }
         return Ok(normalize_optional_toml(doc));
     }
-    let (model_list, model_windows): (String, std::collections::HashMap<String, String>) =
-        if profile.model_windows.trim().is_empty() && profile.model_list.contains('[') {
-            crate::model_suffix::migrate_model_list_with_suffixes(&profile.model_list)
-        } else {
-            (
-                profile.model_list.clone(),
-                serde_json::from_str(&profile.model_windows).unwrap_or_default(),
-            )
-        };
-    let entries =
-        crate::model_suffix::collect_catalog_entries(&model_list, &model_windows, &profile.model);
     // Known bundled metadata entries need a catalog even without a user-supplied window.
     if !entries.iter().any(|entry| {
         entry.suffix_window.is_some()
@@ -1736,7 +1933,6 @@ fn apply_model_catalog_to_config(
     }) {
         return Ok(config_text);
     }
-    let fallback = parse_optional_positive_u64(&profile.context_window, "上下文大小")?;
     let catalog_path = home.join(&catalog_relative);
     if let Some(parent) = catalog_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1877,6 +2073,8 @@ fn copy_standard_responses_catalog(
     home: &Path,
     source: &str,
     target_relative: &str,
+    entries: &[crate::model_suffix::ModelCatalogEntry],
+    fallback_window: Option<u64>,
 ) -> anyhow::Result<bool> {
     let source_path = {
         let path = Path::new(source);
@@ -1896,9 +2094,27 @@ fn copy_standard_responses_catalog(
         return Ok(false);
     };
     let mut changed = false;
+    let configured_windows = entries
+        .iter()
+        .map(|entry| (entry.slug.as_str(), entry.suffix_window.or(fallback_window)))
+        .collect::<std::collections::HashMap<_, _>>();
     for model in models {
         if model.get("use_responses_lite").and_then(Value::as_bool) == Some(true) {
             model["use_responses_lite"] = Value::Bool(false);
+            changed = true;
+        }
+        let Some(slug) = model.get("slug").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(Some(window)) = configured_windows.get(slug) else {
+            continue;
+        };
+        if model.get("context_window").and_then(Value::as_u64) != Some(*window) {
+            model["context_window"] = json!(window);
+            changed = true;
+        }
+        if model.get("max_context_window").and_then(Value::as_u64) != Some(*window) {
+            model["max_context_window"] = json!(window);
             changed = true;
         }
     }
@@ -3089,6 +3305,64 @@ fn account_label_from_jwt(token: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 回归真实故障：`[mcp_servers.node_repl]`（带正确的 `.env` 子表）之后又混入
+    /// 一个裸的空 `[mcp_servers]` 表头。行级去重会把两者当成互不相干的字符串，
+    /// 原样保留进输出——空表头在 TOML 语义上会与已有子表冲突，Codex 加载时报
+    /// `invalid transport`。语义合并后 `mcp_servers.node_repl` 的字段必须完整
+    /// 保留，且不能再出现裸的 `[mcp_servers]` 空表头。
+    #[test]
+    fn normalize_duplicate_toml_text_merges_child_table_with_later_empty_parent_header() {
+        let contents = "\
+[mcp_servers.node_repl]
+command = \"node\"
+
+[mcp_servers.node_repl.env]
+CODEX_HOME = \"/home/user/.codex\"
+
+[mcp_servers]
+";
+
+        let normalized = normalize_duplicate_toml_text(contents);
+        let doc = normalized.parse::<DocumentMut>().expect("must stay valid TOML");
+
+        assert_eq!(
+            doc["mcp_servers"]["node_repl"]["command"].as_str(),
+            Some("node")
+        );
+        assert_eq!(
+            doc["mcp_servers"]["node_repl"]["env"]["CODEX_HOME"].as_str(),
+            Some("/home/user/.codex")
+        );
+    }
+
+    /// 同一个表头出现两次、各自只写了部分字段：语义合并要拼成一份完整的表，
+    /// 而不是按旧的行级去重丢弃第二次出现的整段内容。
+    #[test]
+    fn normalize_duplicate_toml_text_merges_fields_from_repeated_same_header() {
+        let contents = "\
+[mcp_servers.node_repl]
+command = \"node\"
+
+[mcp_servers.node_repl]
+cwd = \"/tmp\"
+";
+
+        let normalized = normalize_duplicate_toml_text(contents);
+        let doc = normalized.parse::<DocumentMut>().expect("must stay valid TOML");
+
+        assert_eq!(doc["mcp_servers"]["node_repl"]["command"].as_str(), Some("node"));
+        assert_eq!(doc["mcp_servers"]["node_repl"]["cwd"].as_str(), Some("/tmp"));
+    }
+
+    /// 重复根键：后写覆盖前写，与 TOML 对同名键重复赋值时的直觉一致。
+    #[test]
+    fn normalize_duplicate_toml_text_later_root_key_wins() {
+        let contents = "model = \"a\"\nmodel = \"b\"\n";
+        let normalized = normalize_duplicate_toml_text(contents);
+        let doc = normalized.parse::<DocumentMut>().expect("must stay valid TOML");
+        assert_eq!(doc["model"].as_str(), Some("b"));
+    }
 
     #[test]
     fn merge_common_config_preserves_explicit_profile_goals_override() {
