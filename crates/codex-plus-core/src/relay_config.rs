@@ -280,7 +280,7 @@ pub fn responses_proxy_configured_in_home(home: &Path) -> bool {
     provider_string_from_config(&contents, "base_url").as_deref()
         == Some(
             crate::protocol_proxy::local_responses_proxy_base_url(
-                crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+                crate::protocol_proxy::protocol_proxy_port(),
             )
             .as_str(),
         )
@@ -367,7 +367,7 @@ pub fn apply_relay_config_to_home(
         base_url,
         bearer_token,
         RelayProtocol::Responses,
-        crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+        crate::protocol_proxy::protocol_proxy_port(),
     )
 }
 
@@ -438,7 +438,7 @@ pub fn apply_pure_api_config_to_home(
         base_url,
         bearer_token,
         RelayProtocol::Responses,
-        crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+        crate::protocol_proxy::protocol_proxy_port(),
     )
 }
 
@@ -762,7 +762,7 @@ const OPENAI_BASE_URL_KEY: &str = "openai_base_url";
 
 fn managed_openai_base_url() -> String {
     crate::protocol_proxy::local_responses_proxy_base_url(
-        crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+        crate::protocol_proxy::protocol_proxy_port(),
     )
 }
 
@@ -829,6 +829,8 @@ pub fn clear_relay_config_to_home_with_auth(
         "OPENAI_API_KEY",
         "model_provider",
         "model_catalog_json",
+        "model_context_window",
+        "model_auto_compact_token_limit",
         "base_url",
         "experimental_bearer_token",
         "env_key",
@@ -923,7 +925,7 @@ pub fn backfill_relay_profile_from_home_with_common(
         && provider_string_from_config(&profile.config_contents, "base_url").as_deref()
             == Some(
                 crate::protocol_proxy::local_responses_proxy_base_url(
-                    crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+                    crate::protocol_proxy::protocol_proxy_port(),
                 )
                 .as_str(),
             )
@@ -1727,11 +1729,19 @@ fn preserve_live_app_settings(home: &Path, config_text: &str) -> anyhow::Result<
             merge_toml_item(&mut target_doc["desktop"], &live_desktop);
         }
     }
-    for key in ["sandbox_mode", "approval_policy", "sandbox_workspace_write"] {
+    // Windows 沙盒实现属于本机设置，切换模板时保留，避免重启后重新要求设置。
+    for key in [
+        "sandbox_mode",
+        "approval_policy",
+        "sandbox_workspace_write",
+        "windows",
+    ] {
         if let Some(live_value) = live_doc.get(key).cloned() {
             merge_toml_item(&mut target_doc[key], &live_value);
         }
     }
+    // Preserve user-managed feature flags such as multi_agent_v2 and memories.
+    preserve_missing_table_keys(&mut target_doc, &live_doc, "features");
     remove_unsupported_approval_policies(&mut target_doc);
     preserve_live_hook_state(&mut target_doc, &live_doc);
     let context_usage_configured = target_doc
@@ -1748,6 +1758,77 @@ fn preserve_live_app_settings(home: &Path, config_text: &str) -> anyhow::Result<
         }
     }
     Ok(normalize_optional_toml(target_doc))
+}
+
+fn preserve_missing_table_keys(
+    target_doc: &mut DocumentMut,
+    live_doc: &DocumentMut,
+    table_name: &str,
+) {
+    let Some(live_table) = live_doc.get(table_name).and_then(Item::as_table_like) else {
+        return;
+    };
+    if target_doc.get(table_name).and_then(Item::as_table_like).is_none() {
+        target_doc[table_name] = toml_edit::table();
+    }
+    let target_table = target_doc[table_name]
+        .as_table_like_mut()
+        .expect("table was initialized above");
+    for (key, value) in live_table.iter() {
+        if target_table.get(key).is_none() {
+            target_table.insert(key, value.clone());
+        }
+    }
+}
+
+/// Normal-user launches cannot complete the elevated native Windows sandbox
+/// setup. Downgrade only that case; an elevated process keeps the user's mode.
+pub fn ensure_windows_sandbox_usable_for_current_user(home: &Path) -> anyhow::Result<bool> {
+    if windows_process_is_elevated() {
+        return Ok(false);
+    }
+    let config_path = home.join("config.toml");
+    let existing = match std::fs::read_to_string(&config_path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let mut doc = parse_toml_document(&existing)?;
+    let Some(windows) = doc.get_mut("windows").and_then(Item::as_table_mut) else {
+        return Ok(false);
+    };
+    let elevated = windows
+        .get("sandbox")
+        .and_then(Item::as_str)
+        .is_some_and(|value| value.eq_ignore_ascii_case("elevated"));
+    if !elevated {
+        return Ok(false);
+    }
+    windows["sandbox"] = toml_edit::value("unelevated");
+    crate::settings::atomic_write(&config_path, normalize_optional_toml(doc).as_bytes())?;
+    // 这是替用户改写了他的配置，留一条诊断记录，方便排障时回溯。
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "launcher.windows_sandbox_downgraded",
+        serde_json::json!({
+            "home": home.to_string_lossy(),
+            "from": "elevated",
+            "to": "unelevated",
+            "reason": "current process is not elevated; native sandbox setup would report updateRequired",
+        }),
+    );
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn windows_process_is_elevated() -> bool {
+    use windows::Win32::UI::Shell::IsUserAnAdmin;
+
+    unsafe { IsUserAnAdmin().as_bool() }
+}
+
+#[cfg(not(windows))]
+fn windows_process_is_elevated() -> bool {
+    true
 }
 
 fn preserve_live_hook_state(target_doc: &mut DocumentMut, live_doc: &DocumentMut) {
@@ -1972,6 +2053,8 @@ fn apply_model_catalog_to_config(
         return Ok(normalize_optional_toml(doc));
     }
     // Known bundled metadata entries need a catalog even without a user-supplied window.
+    // 自定义 Responses provider 走 model_routes 时需要 catalog，才能给路由目标暴露模型元数据；
+    // 纯平铺 model_list 且无窗口/元数据的仍保持"不生成"契约（无后缀不落盘，见既有测试）。
     if !has_metadata_overrides
         && !entries.iter().any(|entry| {
             entry.suffix_window.is_some()
@@ -1979,6 +2062,7 @@ fn apply_model_catalog_to_config(
                 || crate::model_suffix::requires_bundled_metadata_catalog(&entry.slug)
                 || (official_deepseek_responses && entry.slug.starts_with("deepseek-v4-"))
         })
+        && !(custom_responses && profile.has_model_routes())
     {
         let mut doc = parse_toml_document(&config_text)?;
         if root_key_string(&config_text, "model_catalog_json").as_deref()
@@ -2096,7 +2180,12 @@ fn apply_model_metadata_overrides(
             continue;
         };
         for (key, value) in user_override {
-            if matches!(key.as_str(), "slug" | "context_window" | "auto_compact_token_limit") {
+            // 窗口与压缩阈值由 model_windows / model_auto_compact 生成（issue #2191）；
+            // max_context_window 是 codex 运行时的 clamp 权威，绝不能被历史 metadata 残留值覆盖。
+            if matches!(
+                key.as_str(),
+                "slug" | "context_window" | "max_context_window" | "auto_compact_token_limit"
+            ) {
                 continue;
             }
             model_object.insert(key.clone(), value.clone());
@@ -2783,7 +2872,7 @@ pub fn relay_profile_model(profile: &RelayProfile) -> String {
 pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
     if profile.relay_mode == crate::settings::RelayMode::Aggregate {
         return crate::protocol_proxy::local_responses_proxy_base_url(
-            crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+            crate::protocol_proxy::protocol_proxy_port(),
         );
     }
     if profile.has_model_routes() {
@@ -2793,7 +2882,7 @@ pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
         if !profile.base_url.trim().is_empty()
             && profile.base_url.trim()
                 != crate::protocol_proxy::local_responses_proxy_base_url(
-                    crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+                    crate::protocol_proxy::protocol_proxy_port(),
                 )
         {
             return profile.base_url.trim().to_string();
@@ -2818,7 +2907,7 @@ pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
     if profile.protocol == RelayProtocol::ChatCompletions
         && provider_base_url
             == crate::protocol_proxy::local_responses_proxy_base_url(
-                crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+                crate::protocol_proxy::protocol_proxy_port(),
             )
     {
         String::new()
@@ -2936,13 +3025,13 @@ fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<Strin
     }
     let provider_base_url = if profile.has_model_routes() || profile.uses_no_auth() {
         crate::protocol_proxy::local_responses_proxy_base_url(
-            crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+            crate::protocol_proxy::protocol_proxy_port(),
         )
     } else {
         codex_base_url_for_protocol(
             base_url.trim(),
             profile.protocol,
-            crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+            crate::protocol_proxy::protocol_proxy_port(),
         )
     };
     if !provider_base_url.trim().is_empty() {

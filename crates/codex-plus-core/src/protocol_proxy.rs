@@ -13,6 +13,21 @@ use crate::relay_rotation::{RotationContext, RotationEvent};
 use crate::settings::{RelayProtocol, SettingsStore};
 
 pub const DEFAULT_PROTOCOL_PROXY_PORT: u16 = 57321;
+
+/// 协议代理的实际生效端口，默认 [`DEFAULT_PROTOCOL_PROXY_PORT`]，
+/// 可用环境变量 `CODEX_PLUS_PROTOCOL_PROXY_PORT` 覆盖。
+///
+/// 端口要写进 `config.toml` 的 `base_url`，不能像普通 helper 端口那样自动换；
+/// 但少数机器（issue #2189）上 57321 恰好被 Hyper-V/WSL 开机划进了 Windows
+/// 动态端口排除区间，bind 报 os error 10013 永远起不来，只能整体挪一个端口。
+/// 写入 base_url 与读取校验必须都走本函数，保证同一进程内一致。
+pub fn protocol_proxy_port() -> u16 {
+    std::env::var("CODEX_PLUS_PROTOCOL_PROXY_PORT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(DEFAULT_PROTOCOL_PROXY_PORT)
+}
 pub const NO_AUTH_PROXY_BEARER_TOKEN: &str = "codex-plus-no-auth";
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const UPSTREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -133,6 +148,13 @@ pub fn local_responses_proxy_base_url(port: u16) -> String {
 }
 
 pub fn responses_to_chat_completions(body: Value) -> anyhow::Result<Value> {
+    responses_to_chat_completions_with_options(body, false)
+}
+
+pub fn responses_to_chat_completions_with_options(
+    body: Value,
+    standard: bool,
+) -> anyhow::Result<Value> {
     let mut result = json!({});
 
     if let Some(model) = body.get("model") {
@@ -188,7 +210,7 @@ pub fn responses_to_chat_completions(body: Value) -> anyhow::Result<Value> {
         result["stream_options"] = stream_options;
     }
 
-    apply_chat_reasoning_options(&mut result, &body, model);
+    apply_chat_reasoning_options(&mut result, &body, model, standard);
 
     let tool_context = build_codex_tool_context(body.get("tools"));
     let mut has_chat_tools = false;
@@ -1097,7 +1119,8 @@ async fn upstream_request_parts(
     }
     let mut body = match relay.protocol {
         RelayProtocol::Responses => request_json,
-        RelayProtocol::ChatCompletions => responses_to_chat_completions(request_json)?,
+        RelayProtocol::ChatCompletions =>
+            responses_to_chat_completions_with_options(request_json, relay.standard_openai_protocol)?,
     };
     if relay.protocol == RelayProtocol::Responses {
         normalize_responses_item_ids(&mut body);
@@ -1388,7 +1411,8 @@ fn is_local_protocol_proxy_base_url(base_url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
         return false;
     };
-    if !url.scheme().eq_ignore_ascii_case("http") || url.port() != Some(DEFAULT_PROTOCOL_PROXY_PORT)
+    if !url.scheme().eq_ignore_ascii_case("http")
+        || url.port() != Some(protocol_proxy_port())
     {
         return false;
     }
@@ -4936,16 +4960,29 @@ fn canonical_json_string(value: &Value) -> String {
     }
 }
 
-fn apply_chat_reasoning_options(result: &mut Value, body: &Value, model: &str) {
+fn apply_chat_reasoning_options(
+    result: &mut Value,
+    body: &Value,
+    model: &str,
+    standard: bool,
+) {
     let Some(reasoning_enabled) = reasoning_requested(body) else {
         return;
     };
-    let style = infer_chat_reasoning_style(model);
+    let style = if standard {
+        ChatReasoningStyle::Default
+    } else {
+        infer_chat_reasoning_style(model)
+    };
 
     match style {
         ChatReasoningStyle::Thinking => {
             result["thinking"] = json!({
-                "type": if reasoning_enabled { "enabled" } else { "disabled" }
+                "type": if reasoning_enabled {
+                    kimi_thinking_enabled_type(model)
+                } else {
+                    "disabled"
+                }
             });
         }
         ChatReasoningStyle::EnableThinking => {
@@ -5085,7 +5122,15 @@ fn map_chat_reasoning_effort(effort: &str, style: ChatReasoningStyle) -> Option<
 /// 仍只发 thinking 开关。
 fn is_kimi_coding_model(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
-    model.starts_with("k3") || model.contains("for-coding")
+    model.starts_with("k3") || model.contains("kimi-k3") || model.contains("for-coding")
+}
+
+fn kimi_thinking_enabled_type(model: &str) -> &'static str {
+    if is_kimi_coding_model(model) {
+        "adaptive"
+    } else {
+        "enabled"
+    }
 }
 
 fn supports_reasoning_effort(model: &str) -> bool {

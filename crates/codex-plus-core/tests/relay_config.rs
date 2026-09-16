@@ -1307,6 +1307,28 @@ experimental_bearer_token = "sk-a"
 }
 
 #[test]
+fn apply_relay_files_preserves_live_windows_sandbox_across_profile_switches() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        "[windows]\nsandbox = \"unelevated\"\nsandbox_private_desktop = false\n",
+    )
+    .unwrap();
+    apply_relay_files_to_home(
+        temp.path(),
+        "model = \"new\"\n[windows]\nsandbox = \"elevated\"\nsandbox_private_desktop = true\n",
+        "{}",
+    )
+    .unwrap();
+    let parsed: toml::Value = std::fs::read_to_string(temp.path().join("config.toml"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(parsed["windows"]["sandbox"].as_str(), Some("unelevated"));
+    assert_eq!(parsed["windows"]["sandbox_private_desktop"].as_bool(), Some(false));
+}
+
+#[test]
 fn apply_relay_files_preserves_live_desktop_personalization_settings() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -2601,6 +2623,8 @@ fn clear_relay_config_removes_model_provider_and_preserves_other_config() {
         temp.path().join("config.toml"),
         r#"model = "gpt-5"
 model_provider = "custom"
+model_context_window = 262144
+model_auto_compact_token_limit = 200000
 [model_providers.custom]
 name = "custom"
 wire_api = "responses"
@@ -2637,6 +2661,8 @@ model = "gpt-5-mini"
     assert!(updated.contains(r#"model = "gpt-5""#));
     assert!(!updated.contains("model_provider ="));
     assert!(!updated.contains("model_catalog_json"));
+    assert!(!updated.contains("model_context_window"));
+    assert!(!updated.contains("model_auto_compact_token_limit"));
     assert!(!updated.contains("OPENAI_API_KEY"));
     assert!(updated.contains("[model_providers.custom]"));
     assert!(updated.contains(r#"wire_api = "responses""#));
@@ -4211,6 +4237,89 @@ experimental_bearer_token = "sk-new"
 }
 
 #[test]
+fn apply_relay_profile_generates_catalog_for_custom_responses_with_model_routes() {
+    // #2137：自定义 Responses provider 带 model_routes 时必须生成 catalog，
+    // 否则路由目标拿不到模型元数据，模型选择器只显示「自定义」。
+    // 同时守护反向契约：无 model_routes 的平铺 model_list 仍不落盘（见下一条测试）。
+    let temp = tempfile::tempdir().unwrap();
+    let profile = RelayProfile {
+        id: "relay-routes".to_string(),
+        name: "Relay Routes".to_string(),
+        model: "gpt-5.6-sol".to_string(),
+        relay_mode: RelayMode::PureApi,
+        config_contents: r#"model = "gpt-5.6-sol"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "https://relay.example/v1"
+experimental_bearer_token = "sk-new"
+"#
+        .to_string(),
+        auth_contents: r#"{"OPENAI_API_KEY":"sk-new"}"#.to_string(),
+        model_insert_mode: Default::default(),
+        model_list: "gpt-5.6-sol".to_string(),
+        model_routes: vec![RelayModelRoute {
+            model: "gpt-5.6-sol".to_string(),
+            target_relay_id: "target".to_string(),
+            target_model: String::new(),
+        }],
+        ..RelayProfile::default()
+    };
+
+    apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
+
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(
+        config.contains(r#"model_catalog_json = "model-catalogs/relay-routes.json""#),
+        "custom Responses provider with model routes must write a catalog: {config}"
+    );
+    let catalog = std::fs::read_to_string(
+        temp.path().join("model-catalogs").join("relay-routes.json"),
+    )
+    .unwrap();
+    assert!(catalog.contains(r#""slug": "gpt-5.6-sol""#), "{catalog}");
+}
+
+#[test]
+fn apply_relay_profile_no_catalog_for_custom_responses_without_model_routes() {
+    // 与上一条配对：没有 model_routes 时保持「平铺 model_list 不落盘」的既有契约。
+    let temp = tempfile::tempdir().unwrap();
+    let profile = RelayProfile {
+        id: "relay-flat".to_string(),
+        name: "Relay Flat".to_string(),
+        model: "qwen3-coder".to_string(),
+        relay_mode: RelayMode::PureApi,
+        config_contents: r#"model = "qwen3-coder"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "https://relay.example/v1"
+experimental_bearer_token = "sk-new"
+"#
+        .to_string(),
+        auth_contents: r#"{"OPENAI_API_KEY":"sk-new"}"#.to_string(),
+        model_insert_mode: Default::default(),
+        model_list: "qwen3-coder".to_string(),
+        ..RelayProfile::default()
+    };
+
+    apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
+
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(
+        !config.contains("model_catalog_json"),
+        "flat model_list without routes must not write a catalog: {config}"
+    );
+    assert!(!temp.path().join("model-catalogs").exists());
+}
+
+#[test]
 fn apply_relay_profile_no_catalog_when_model_list_has_no_suffix() {
     let temp = tempfile::tempdir().unwrap();
     let profile = RelayProfile {
@@ -4284,10 +4393,37 @@ experimental_bearer_token = "sk-new"
         .find(|model| model["slug"] == "gpt-5.6-sol")
         .unwrap();
     assert_eq!(sol["context_window"], 272_000);
+    // 未显式配置窗口时保留官方模板上限（issue #2191）。
+    assert_eq!(sol["max_context_window"], 872_000);
     assert_eq!(sol["default_reasoning_level"], "low");
     assert_eq!(sol["service_tiers"][0]["id"], "priority");
     assert_eq!(sol["supports_search_tool"], true);
     assert_eq!(sol["use_responses_lite"], false);
+    assert_eq!(sol["multi_agent_version"], "v2");
+}
+
+#[test]
+fn apply_relay_profile_preserves_live_multi_agent_features() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        "model = \"old\"\n[features]\nmulti_agent_v2 = true\nmemories = true\n",
+    )
+    .unwrap();
+    let profile = RelayProfile {
+        id: "relay-features".to_string(),
+        model: "gpt-5.6-sol".to_string(),
+        config_contents: "model = \"gpt-5.6-sol\"\n".to_string(),
+        model_list: "gpt-5.6-sol".to_string(),
+        ..RelayProfile::default()
+    };
+
+    apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
+
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    let parsed: toml::Value = toml::from_str(&config).unwrap();
+    assert_eq!(parsed["features"]["multi_agent_v2"].as_bool(), Some(true));
+    assert_eq!(parsed["features"]["memories"].as_bool(), Some(true));
 }
 
 #[test]
@@ -4321,6 +4457,8 @@ base_url = "https://relay.example/v1"
     let astra = &catalog["models"][0];
     assert_eq!(astra["slug"], "gpt-6-astra");
     assert_eq!(astra["context_window"], 272_000);
+    // 未显式配置窗口时保留官方模板上限（issue #2191）。
+    assert_eq!(astra["max_context_window"], 872_000);
     assert_eq!(astra["use_responses_lite"], false);
     assert_eq!(astra["additional_speed_tiers"], serde_json::json!(["fast"]));
     assert_eq!(astra["service_tiers"][0]["id"], "priority");
@@ -5400,7 +5538,7 @@ fn apply_model_metadata_overrides_catalog_and_protects_managed_fields() {
                 "display_name": "Imported model",
                 "description": "Imported description",
                 "context_window": 1,
-                "max_context_window": 1_000_000,
+                "max_context_window": 999_999,
                 "auto_compact_token_limit": 3,
                 "effective_context_window_percent": 4,
                 "priority": 5,
