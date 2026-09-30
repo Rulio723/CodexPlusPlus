@@ -1510,6 +1510,48 @@ pub fn weixin_connect_stop() -> CommandResult<codex_plus_core::connect::WeixinCo
 }
 
 #[tauri::command]
+pub fn query_builtin_model_metadata(slug: String) -> CommandResult<Value> {
+    match codex_plus_core::model_suffix::builtin_model_metadata(slug.as_str()) {
+        Some(metadata) => ok(
+            "内置元数据已匹配。",
+            json!({
+                "matched": true,
+                "source": metadata.source,
+                "entry": metadata.entry,
+            }),
+        ),
+        None => {
+            // 回退值从 bundled 静态资产首条实时取，不写死——
+            // sync_official_models.py 调整首条后这里自动跟随。
+            let (fallback_slug, fallback_window) =
+                codex_plus_core::model_suffix::fallback_template_info()
+                    .unwrap_or_else(|| ("gpt-5.5".to_string(), 272_000));
+            ok(
+                "未命中内置元数据，生成时回退官方模板。",
+                json!({
+                    "matched": false,
+                    "fallback": {
+                        "slug": fallback_slug,
+                        "context_window": fallback_window,
+                    },
+                }),
+            )
+        }
+    }
+}
+
+
+#[tauri::command]
+pub fn builtin_model_metadata_index() -> CommandResult<Value> {
+    let index = codex_plus_core::model_suffix::builtin_model_metadata_index();
+    let count = index.len();
+    ok(
+        "内置元数据索引已读取。",
+        json!({ "entries": index, "count": count }),
+    )
+}
+
+#[tauri::command]
 pub fn find_desktop_codex_cli() -> CommandResult<Value> {
     // Windows 标准路径：桌面版在用户目录维护、可直接运行的 CLI。
     // Store 包目录（WindowsApps）内的资源受系统保护，第三方进程无法执行（#2028），
@@ -1563,6 +1605,7 @@ pub fn find_desktop_codex_cli() -> CommandResult<Value> {
             "已填入桌面版内置 Codex CLI。",
             json!({ "path": path.to_string_lossy() }),
         )
+
     }
 }
 
@@ -1685,9 +1728,21 @@ fn empty_weixin_qr_payload(status: &str) -> WeixinQrPayload {
     }
 }
 
+#[derive(serde::Serialize)]
+pub struct NativeBrowserDiagnostics {
+    compatibility: codex_plus_core::native_browser::BrowserStatus,
+    connection: codex_plus_core::native_browser_connection::ConnectionStatus,
+}
+
 #[tauri::command]
-pub fn native_browser_status() -> codex_plus_core::native_browser::BrowserStatus {
-    codex_plus_core::native_browser::read_status()
+pub async fn native_browser_status() -> NativeBrowserDiagnostics {
+    let compatibility = tauri::async_runtime::spawn_blocking(codex_plus_core::native_browser::read_status)
+        .await
+        .unwrap_or_else(|_| codex_plus_core::native_browser::BrowserStatus {
+            state: "unavailable".into(), detail: String::new(),
+        });
+    let connection = codex_plus_core::native_browser_connection::check_connection().await;
+    NativeBrowserDiagnostics { compatibility, connection }
 }
 
 #[tauri::command]
@@ -3349,6 +3404,35 @@ fn merge_manual_provider_sync_targets(
             .cmp(&left.is_current_provider)
             .then_with(|| left.id.cmp(&right.id))
     });
+}
+
+#[tauri::command]
+pub async fn repair_session_index() -> CommandResult<Value> {
+    let result = tauri::async_runtime::spawn_blocking(|| codex_plus_data::repair_session_index(None))
+        .await
+        .map_err(|error| anyhow::anyhow!("session index repair task failed: {error}"))
+        .and_then(|result| result);
+    match result {
+        Ok(report) => ok(
+            &format!("会话索引检查完成，恢复 {} 条消息。", report.repaired_items),
+            json!(report),
+        ),
+        Err(error) => failed(&format!("修复会话索引失败：{error}"), json!({})),
+    }
+}
+
+#[tauri::command]
+pub async fn load_session_index_repair_report() -> CommandResult<Value> {
+    let result = tauri::async_runtime::spawn_blocking(|| {
+        codex_plus_data::load_session_index_repair_report(None)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("session index report task failed: {error}"))
+    .and_then(|result| result);
+    match result {
+        Ok(report) => ok("已读取会话索引修复报告。", json!({ "report": report })),
+        Err(error) => failed(&format!("读取会话索引修复报告失败：{error}"), json!({})),
+    }
 }
 
 #[tauri::command]
@@ -6537,6 +6621,26 @@ mod tests {
         GLOBAL_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn native_browser_diagnostics_keeps_connection_independent_from_patch_status() {
+        let result = NativeBrowserDiagnostics {
+            compatibility: codex_plus_core::native_browser::BrowserStatus {
+                state: "runtime_unverified".into(), detail: "Legacy runtime mismatch".into(),
+            },
+            connection: codex_plus_core::native_browser_connection::ConnectionStatus {
+                state: "available".into(), failed_checks: 0,
+                browsers: vec![codex_plus_core::native_browser_connection::ConnectedBrowser {
+                    family: "edge".into(), header_enabled: Some(true),
+                }],
+            },
+        };
+        let json = serde_json::to_value(result).unwrap();
+        assert_eq!(json["compatibility"]["state"], "runtime_unverified");
+        assert_eq!(json["connection"]["state"], "available");
+        assert_eq!(json["connection"]["browsers"][0]["headerEnabled"], true);
+        assert_eq!(json["connection"]["failedChecks"], 0);
     }
 
     #[test]

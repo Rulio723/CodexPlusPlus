@@ -86,14 +86,33 @@ import { isGitHubRepositoryHomepage } from "./github-repository";
 import { NativeBrowserStatusView, nativeBrowserConsent } from "./native-browser-settings";
 import { DEFAULT_AUTO_COMPACT_PERCENT, normalizeAutoCompactEditing, normalizeAutoCompactPercent } from "./auto-compact";
 import {
+  builtinEntryToImportDocument,
+  builtinRowBackfillValue,
   clearModelMetadataForSlug,
+  importDocumentSyncPatch,
+  importPanelControls,
+  importSaveDecision,
+  metadataMatchesBuiltin,
+  metadataSourceTags,
+  modelSlugFromRowName,
+  suffixWindowString,
+  modelMetadataKey,
   parseModelMetadataDocument,
   parseModelMetadataMap,
   remapModelMetadataSlugs,
   replaceModelMetadataForSlug,
+  resolveModelMetadataRowKey,
   retainModelMetadataForSlugs,
   serializeModelMetadataDocument,
   synchronizeModelMetadataDocumentLimitsPreview,
+  type ActiveImportDraft,
+  createActiveImportDraft,
+  updateActiveImportDraft,
+  cancelActiveImportDraft,
+  rematchActiveImportDraft,
+  builtinMetadataQueryState,
+  type BuiltinMetadataQueryState,
+  type BuiltinModelMetadataMatch,
   type ImportedModelMetadata,
 } from "./model-metadata";
 import {
@@ -381,6 +400,10 @@ export type RelayProfile = {
   noAuth: boolean;
   modelRoutes?: RelayModelRoute[];
   standardOpenaiProtocol: boolean;
+  rateLimitCooldownEnabled: boolean;
+  channelQueueEnabled: boolean;
+  channelRequestsPerMinute: number;
+  cooldownErrorStatuses: number[];
   aggregate?: RelayAggregateConfig | null;
 };
 
@@ -789,6 +812,31 @@ type TaskProgress = {
   message: string;
 };
 
+type SessionIndexRepairReport = {
+  scannedFiles: number;
+  cachedFiles: number;
+  repairedItems: number;
+  alreadyPresent: number;
+  skippedItems: number;
+  deferredItems?: number;
+  issues: string[];
+  issuesTruncated?: number;
+  abortedReason?: string | null;
+  warnings?: string[];
+  backupPath: string | null;
+  elapsedMs: number;
+  checkedAtMs?: number;
+  pendingDetails?: {
+    threadId: string | null;
+    turnId: string | null;
+    reason: string;
+    state: "waiting" | "blocked";
+    firstSeenAtMs: number;
+    lastCheckedAtMs: number;
+    checks: number;
+  }[];
+};
+
 type LogsResult = CommandResult<{
   path: string;
   text: string;
@@ -1097,6 +1145,10 @@ const defaultSettings: BackendSettings = {
       noAuth: false,
       sub2apiMultiplier: "",
       standardOpenaiProtocol: false,
+      rateLimitCooldownEnabled: false,
+      channelQueueEnabled: false,
+      channelRequestsPerMinute: 20,
+      cooldownErrorStatuses: [429, 500],
     },
   ],
   relayCommonConfigContents: "",
@@ -1191,6 +1243,11 @@ export function App() {
     message: t("尚未检查官方远端插件缓存。"),
   });
   const [providerSyncTargets, setProviderSyncTargets] = useState<ProviderSyncTargetsResult | null>(null);
+  const [sessionIndexRepairActive, setSessionIndexRepairActive] = useState(false);
+  const sessionIndexRepairRunning = useRef(false);
+  const sessionIndexReportLoading = useRef(false);
+  const [sessionIndexRepairReport, setSessionIndexRepairReport] = useState<SessionIndexRepairReport | null>(null);
+  const [sessionIndexRepairReportError, setSessionIndexRepairReportError] = useState<string | null>(null);
   const [selectedProviderSyncTarget, setSelectedProviderSyncTarget] = useState("");
   const [removeOwnedData, setRemoveOwnedData] = useState(false);
   const [relaySwitching, setRelaySwitching] = useState(false);
@@ -2088,6 +2145,7 @@ export function App() {
       await refreshSettings(true);
       await refreshLocalSessions(true);
       await refreshProviderSyncTargets(true);
+      await refreshSessionIndexRepairReport();
     }
     if (next === "zedRemote") {
       await refreshSettings(true);
@@ -2557,7 +2615,55 @@ export function App() {
     return result;
   };
 
+  const refreshSessionIndexRepairReport = async (isCurrent = () => true) => {
+    if (sessionIndexReportLoading.current || sessionIndexRepairRunning.current) return;
+    sessionIndexReportLoading.current = true;
+    try {
+      // 持久报告读取失败时保留现有结果，后台刷新不触发全局通知或忙碌状态。
+      const result = await call<CommandResult<{ report: SessionIndexRepairReport | null }>>(
+        "load_session_index_repair_report",
+      );
+      if (isCurrent() && !sessionIndexRepairRunning.current && isSuccessStatus(result.status)) {
+        setSessionIndexRepairReportError(null);
+        setSessionIndexRepairReport((previous) => {
+          if ((previous?.checkedAtMs ?? 0) > (result.report?.checkedAtMs ?? 0)) return previous;
+          return result.report;
+        });
+      } else if (isCurrent() && !isSuccessStatus(result.status)) {
+        setSessionIndexRepairReportError(result.message || t("读取会话索引修复报告失败"));
+      }
+    } catch (error) {
+      if (isCurrent()) {
+        setSessionIndexRepairReportError(
+          tf("读取会话索引修复报告失败：{0}", [stringifyError(error)]),
+        );
+      }
+    } finally {
+      sessionIndexReportLoading.current = false;
+    }
+  };
+
+  const repairSessionIndex = async () => {
+    if (sessionIndexRepairRunning.current || providerSyncProgress.active) return;
+    sessionIndexRepairRunning.current = true;
+    setSessionIndexRepairActive(true);
+    try {
+      const result = await run(() => call<CommandResult<SessionIndexRepairReport>>("repair_session_index"));
+      if (result) {
+        if (isSuccessStatus(result.status)) {
+          setSessionIndexRepairReport(result);
+          await refreshLocalSessions(true);
+        }
+        showNotice(t("修复会话索引"), result.message, result.status);
+      }
+    } finally {
+      sessionIndexRepairRunning.current = false;
+      setSessionIndexRepairActive(false);
+    }
+  };
+
   const syncProvidersNow = async () => {
+    if (sessionIndexRepairRunning.current) return;
     if (providerSyncProgress.active) return;
     setProviderSyncProgress({
       active: true,
@@ -3069,6 +3175,18 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (route !== "sessions") return;
+    let disposed = false;
+    const refresh = () => void refreshSessionIndexRepairReport(() => !disposed);
+    refresh();
+    const timer = window.setInterval(refresh, 15_000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [route]);
+
+  useEffect(() => {
     if (route !== "settings" || pendingSettingsSection !== "stepwise") return;
     let secondFrame = 0;
     const firstFrame = window.requestAnimationFrame(() => {
@@ -3357,6 +3475,7 @@ export function App() {
         }
       },
       syncProvidersNow,
+      repairSessionIndex,
       refreshProviderSyncTargets,
       setProviderSyncTarget: (provider: string) => {
         setSelectedProviderSyncTarget(provider);
@@ -3566,6 +3685,9 @@ export function App() {
               form={settingsForm}
               sessions={localSessions}
               providerSyncProgress={providerSyncProgress}
+              sessionIndexRepairActive={sessionIndexRepairActive}
+              sessionIndexRepairReport={sessionIndexRepairReport}
+              sessionIndexRepairReportError={sessionIndexRepairReportError}
               providerSyncTargets={providerSyncTargets}
               selectedProviderSyncTarget={selectedProviderSyncTarget}
               onFormChange={setSettingsForm}
@@ -3783,6 +3905,7 @@ type Actions = {
   saveDreamSkinScreenshot: () => Promise<void>;
   saveManualCodexAppPath: () => Promise<void>;
   syncProvidersNow: () => Promise<void>;
+  repairSessionIndex: () => Promise<void>;
   refreshProviderSyncTargets: (silent?: boolean) => Promise<ProviderSyncTargetsResult | null>;
   setProviderSyncTarget: (provider: string) => void;
   setLaunchMode: (launchMode: LaunchMode) => Promise<void>;
@@ -4836,7 +4959,7 @@ function EnhanceScreen({
               {isWindowsPlatform ? <>
                 <FeatureToggle
                   title={t("原生 Edge / Chrome 请求标识兼容（实验）")}
-                  detail={t("仅 Windows Edge / Chrome；下次启动 Codex++ 时应用。扩展可能持久保留请求标识。")}
+                  detail={t("此兼容补丁仅适配 Windows 上的 Edge / Chrome；下次启动 Codex++ 时应用。扩展可能保留请求标识设置。")}
                   checked={form.codexAppNativeBrowserRequireIdentification}
                   disabled={!masterEnabled}
                   onChange={(value) => {
@@ -6176,6 +6299,9 @@ function SessionsScreen({
   form,
   sessions,
   providerSyncProgress,
+  sessionIndexRepairActive,
+  sessionIndexRepairReport,
+  sessionIndexRepairReportError,
   providerSyncTargets,
   selectedProviderSyncTarget,
   onFormChange,
@@ -6185,6 +6311,9 @@ function SessionsScreen({
   form: BackendSettings;
   sessions: LocalSessionsResult | null;
   providerSyncProgress: ProviderSyncProgress;
+  sessionIndexRepairActive: boolean;
+  sessionIndexRepairReport: SessionIndexRepairReport | null;
+  sessionIndexRepairReportError: string | null;
   providerSyncTargets: ProviderSyncTargetsResult | null;
   selectedProviderSyncTarget: string;
   onFormChange: (value: BackendSettings) => void;
@@ -6313,7 +6442,7 @@ function SessionsScreen({
               />
               <span>
                 <strong>{t("启动前自动修复历史会话")}</strong>
-                <small>{t("启动 Codex 前整理旧对话的归属标记。")}</small>
+                <small>{t("启动前整理会话归属并检查缺失消息；运行期间每 30 分钟复查索引。保存设置后生效。")}</small>
               </span>
               <ToggleVisual />
             </label>
@@ -6328,12 +6457,20 @@ function SessionsScreen({
                 {t("导入文件")}
               </Button>
               <Button
-                disabled={providerSyncProgress.active || !canRepairProviderSessions}
+                disabled={providerSyncProgress.active || sessionIndexRepairActive || !canRepairProviderSessions}
                 onClick={() => void actions.syncProvidersNow()}
                 variant="outline"
               >
                 <Wrench className="h-4 w-4" />
                 {providerSyncProgress.active ? t("正在修复…") : t("修复历史会话")}
+              </Button>
+              <Button
+                disabled={sessionIndexRepairActive || providerSyncProgress.active}
+                onClick={() => void actions.repairSessionIndex()}
+                variant="outline"
+              >
+                <Wrench className="h-4 w-4" />
+                {sessionIndexRepairActive ? t("正在检查索引…") : t("修复会话索引")}
               </Button>
               <Button onClick={() => void actions.saveSettings()}>
                 <Save className="h-4 w-4" />
@@ -6370,6 +6507,59 @@ function SessionsScreen({
                 <div className="provider-sync-progress-fill" style={{ width: `${providerSyncProgress.percent}%` }} />
               </div>
               <small>{providerSyncProgress.message}</small>
+            </div>
+          ) : null}
+
+          {sessionIndexRepairActive ? (
+            <p role="status">{t("正在检查全部会话并恢复高可信缺失消息，首次检查可能需要较长时间…")}</p>
+          ) : null}
+          {sessionIndexRepairReportError ? (
+            <p role="alert" className="break-all">{sessionIndexRepairReportError}</p>
+          ) : null}
+          {sessionIndexRepairReport ? (
+            <div className="provider-sync-progress session-repair-progress" aria-live="polite">
+              <strong>{t("最近一次会话索引修复报告")}</strong>
+              <p>{t("最后检查：")}{sessionIndexRepairReport.checkedAtMs ? formatTime(sessionIndexRepairReport.checkedAtMs) : t("旧版报告未记录时间")}</p>
+              <p>
+                {t("读取文件")} {sessionIndexRepairReport.scannedFiles} · {t("复用缓存")} {sessionIndexRepairReport.cachedFiles} · {t("耗时")} {(sessionIndexRepairReport.elapsedMs / 1000).toFixed(1)} s
+              </p>
+              <p>
+                {t("恢复消息")} {sessionIndexRepairReport.repairedItems} · {t("已存在")} {sessionIndexRepairReport.alreadyPresent} · {t("短暂等待")} {sessionIndexRepairReport.deferredItems ?? 0} · {t("需核查")} {sessionIndexRepairReport.skippedItems}
+              </p>
+              <small>{t("仅恢复有本地原文且可确认位置的消息；已打开的会话可能需要重新打开才能显示。")}</small>
+              <p><small>{t("自动检查需要 Codex++ 启动器运行，且自动修复开关已开启并保存；每次检查完成后间隔 30 分钟复查。此页面每 15 秒刷新报告，不会单独启动修复；再次检查不保证恢复。")}</small></p>
+              <p><small>{t("短暂等待最长 30 分钟；原文和记录文件都已超过 24 小时未更新的项目直接转入需核查。缺少对应轮次或结束状态，当前证据不足以安全补回；后续检查仍会核验。")}</small></p>
+              {sessionIndexRepairReport.backupPath ? <p className="break-all">{t("修复前备份：")}{sessionIndexRepairReport.backupPath}</p> : null}
+              {sessionIndexRepairReport.abortedReason ? (
+                <p role="alert" className="break-all"><strong>{t("修复已中止：")}</strong>{sessionIndexRepairReport.abortedReason}</p>
+              ) : null}
+              {sessionIndexRepairReport.warnings?.map((warning, index) => (
+                <p key={index} role="alert" className="break-all"><strong>{t("修复警告：")}</strong>{warning}</p>
+              ))}
+              {sessionIndexRepairReport.pendingDetails?.length ? (
+                <details>
+                  <summary>{t("等待与持续无法恢复详情")} ({sessionIndexRepairReport.pendingDetails.length})</summary>
+                  <ul>
+                    {sessionIndexRepairReport.pendingDetails.map((item, index) => (
+                      <li key={`${item.threadId}-${item.turnId}-${index}`} className="break-all my-3">
+                        <strong>{item.state === "waiting" ? t("短暂等待") : t("持续无法恢复")}</strong>
+                        <p>{t("任务 ID：")}{item.threadId ?? "—"} · {t("轮次 ID：")}{item.turnId ?? "—"}</p>
+                        <p>{t("原因：")}{item.reason}</p>
+                        <small>{t("首次发现：")}{formatTime(item.firstSeenAtMs)} · {t("最后检查：")}{formatTime(item.lastCheckedAtMs)} · {t("检查次数：")}{item.checks}</small>
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+              ) : null}
+              {sessionIndexRepairReport.issues.length ? (
+                <details>
+                  <summary>{t("查看检查详情")} ({sessionIndexRepairReport.issues.length})</summary>
+                  <ul>{sessionIndexRepairReport.issues.map((issue, index) => <li key={index} className="break-all">{issue}</li>)}</ul>
+                </details>
+              ) : null}
+              {sessionIndexRepairReport.issuesTruncated ? (
+                <p><small>{tf("另有 {0} 条检查详情因报告上限未显示。", [sessionIndexRepairReport.issuesTruncated])}</small></p>
+              ) : null}
             </div>
           ) : null}
 
@@ -7561,16 +7751,94 @@ function RelayProfileEditor({
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [vlmTestOpen, setVlmTestOpen] = useState(false);
   const useCommonConfig = profile.useCommonConfig !== false;
-  const [metadataImportTarget, setMetadataImportTarget] = useState<{
-    index: number;
-    slug: string;
-    originalWindow: string;
-    originalAutoCompact: string;
-  } | null>(null);
-  const [metadataImportDocument, setMetadataImportDocument] = useState("");
-  const [metadataImportOriginalDocument, setMetadataImportOriginalDocument] = useState("");
+  const [activeImportDraft, setActiveImportDraft] = useState<ActiveImportDraft | null>(null);
   const [metadataImportError, setMetadataImportError] = useState("");
+  const [builtinMatch, setBuiltinMatch] = useState<BuiltinModelMetadataMatch | null>(null);
+  const [builtinMatchSlug, setBuiltinMatchSlug] = useState("");
+  const [builtinQueryState, setBuiltinQueryState] = useState<BuiltinMetadataQueryState | null>(null);
+  const [importPrefillSource, setImportPrefillSource] = useState<"builtin" | "existing" | null>(null);
+  const [builtinIndex, setBuiltinIndex] = useState<Map<string, { source: string; context_window: unknown; auto_compact_token_limit: unknown }>>(new Map());
+  // 面板内置查询的请求代数：begin/rematch 是命令式调用（没有 effect cleanup
+  // 的 cancelled 通道），响应返回时代数不匹配即丢弃全部 setState——防止迟到
+  // 响应把已取消的面板重新打开，或覆盖用户改名后的新查询结果。
+  const builtinQuerySeqRef = useRef(0);
+  const queryBuiltinCommand = async <T,>(command: string, args?: Record<string, unknown>): Promise<T | null> => {
+    try { return await invoke<T>(command, args); } catch (error) {
+      // 索引只影响行级标记与便利回填（失败是假阴性、不产错误数据），可诊断即可。
+      console.warn(`[Codex++] ${command} 查询失败`, error);
+      return null;
+    }
+  };
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const result = await queryBuiltinCommand<{ entries: Array<{ slug: string; source: string; context_window: unknown; auto_compact_token_limit: unknown }> }>("builtin_model_metadata_index");
+      if (cancelled || !result?.entries) return;
+      const map = new Map<string, { source: string; context_window: unknown; auto_compact_token_limit: unknown }>();
+      for (const entry of result.entries) {
+        map.set(modelMetadataKey(entry.slug), { source: entry.source, context_window: entry.context_window, auto_compact_token_limit: entry.auto_compact_token_limit });
+      }
+      setBuiltinIndex(map);
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  // 导入区打开期间模型名被修改：标签与内置预填实时跟随新名字（覆盖
+  // 「创建模型后改名」「编辑模型名」场景，而不是沿用旧名字的匹配结果）。
+  // 面板身份只用 draft.index；行已删除时回退打开面板时的行名兜底。
+  const activeImportSlug = activeImportDraft
+    ? modelWindowRows[activeImportDraft.index]?.model.trim() ?? activeImportDraft.originalSlug
+    : "";
+  const metadataImportTarget = activeImportDraft;
+  const metadataImportDocument = activeImportDraft?.document ?? "";
+  const metadataImportPreview = activeImportDraft?.preview ?? null;
+  const setMetadataImportDocument = (document: string) =>
+    setActiveImportDraft((draft) => draft ? updateActiveImportDraft(draft, { document }) : draft);
+  const setMetadataImportPreview = (preview: ImportedModelMetadata | null) =>
+    setActiveImportDraft((draft) => draft ? updateActiveImportDraft(draft, { preview }) : draft);
+  useEffect(() => {
+    if (!metadataImportTarget || !activeImportSlug || activeImportSlug === builtinMatchSlug) return;
+    let cancelled = false;
+    void (async () => {
+      let match: BuiltinModelMetadataMatch | null = null;
+      try {
+        const result = await invoke<BuiltinModelMetadataMatch>("query_builtin_model_metadata", { slug: activeImportSlug });
+        // 迟到响应守卫：改名后旧查询一律丢弃（含错误态），否则旧 error 会把
+        // 当前正确匹配的徽标误藏成回退/错误态（cancelled 只由 cleanup 置位，
+        // cleanup 跑过必有新 run 接手，不存在「最后一次响应被误丢」）。
+        if (cancelled) return;
+        const state = builtinMetadataQueryState(result);
+        setBuiltinQueryState(state);
+        match = state.status === "error" ? null : state.value;
+      } catch (error) {
+        if (cancelled) return;
+        const state = builtinMetadataQueryState(null, error);
+        setBuiltinQueryState(state);
+        setMetadataImportError(state.status === "error" ? state.error : "");
+      }
+      if (cancelled) return;
+      setBuiltinMatch(match);
+      setBuiltinMatchSlug(activeImportSlug);
+      // 内置预填态（用户尚未编辑）跟随新名字重新预填；已编辑/自有内容不动。
+      if (importPrefillSource === "builtin" && match?.matched && match.entry) {
+        const document = builtinEntryToImportDocument(match.entry, modelSlugFromRowName(activeImportSlug));
+        // 文档写的是后端返回的规范 slug，匹配时也要用规范 slug（剥掉 [1M] 后缀），
+        // 否则带后缀的行名永远匹配不到，面板一打开就报「找不到 slug」。
+        const preview = parseModelMetadataDocument(document, modelSlugFromRowName(activeImportSlug));
+        setMetadataImportDocument(document);
+        setMetadataImportError("");
+        setMetadataImportPreview(preview.ok ? preview.value : null);
+        if (preview.ok && preview.value.contextWindow && !suffixWindowString(activeImportSlug)) {
+          updateModelWindowRow(metadataImportTarget.index, { window: preview.value.contextWindow });
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeImportSlug, builtinMatchSlug, metadataImportTarget, importPrefillSource]);
+
   const [metadataImportPreview, setMetadataImportPreview] = useState<ImportedModelMetadata | null>(null);
+  const [channelStatusInput, setChannelStatusInput] = useState("");
   const modelSlugOriginsRef = useRef(modelWindowRows.map((row) => row.model.trim()));
   useEffect(() => {
     modelSlugOriginsRef.current = modelWindowRows.map((row) => row.model.trim());
@@ -7579,6 +7847,16 @@ function RelayProfileEditor({
     () => parseModelMetadataMap(profile.modelMetadata),
     [profile.modelMetadata],
   );
+  // 当前内置匹配条目的「全字段」基线：用来判断面板里的内容是否只是内置的复刻。
+  // 与预填走同一管道（同行名、同 slug 文本），并保留窗口/压缩字段——窗口/
+  // 压缩偏离内置值同样是用户编辑，保存应落自定义；写 map 仍走白名单过滤。
+  const builtinMetadata = useMemo(() => {
+    if (!builtinMatch?.matched || !builtinMatch.entry) return null;
+    const rowName = activeImportSlug || builtinMatchSlug || builtinMatch.entry.slug;
+    const canonical = modelSlugFromRowName(rowName);
+    const parsed = parseModelMetadataDocument(builtinEntryToImportDocument(builtinMatch.entry, canonical), canonical);
+    return parsed.ok ? parsed.value.documentEntry : null;
+  }, [builtinMatch, activeImportSlug, builtinMatchSlug]);
   // VLM/Strip 对 Chat Completions 与 Responses 协议均可用(注入块类型已按协议适配)。
   const vlmUnsupportedProtocol = false;
   if (isAggregateRelayProfile(profile)) {
@@ -7604,6 +7882,20 @@ function RelayProfileEditor({
   const updateDraft = (patch: Partial<RelayProfile>) => {
     onProfileChange(applyRelayProfilePatchToFiles(profile, patch, { allowGenerateFiles: isNew }));
   };
+  const addChannelStatuses = () => {
+    const next = channelStatusInput
+      .split(/[,\s]+/)
+      .map(Number)
+      .filter((status) => Number.isInteger(status) && status >= 100 && status <= 599);
+    if (!next.length) return;
+    updateDraft({
+      cooldownErrorStatuses: normalizeCooldownErrorStatuses([
+        ...profile.cooldownErrorStatuses,
+        ...next,
+      ]),
+    });
+    setChannelStatusInput("");
+  };
   const modelRoutes = normalizeRelayModelRoutes(profile.modelRoutes);
   const modelRouteTargets = form.relayProfiles.filter(
     (candidate) => candidate.id !== profile.id && !isAggregateRelayProfile(candidate) && candidate.protocol === "responses",
@@ -7620,6 +7912,19 @@ function RelayProfileEditor({
     setModelWindowRows(
       modelWindowRows.map((row, rowIndex) => (rowIndex === index ? { ...row, ...patch } : row)),
     );
+  };
+  // 内置命中 → 回填空窗口/压缩列的统一入口：上游获取、手动提交行名、打开导入
+  // 面板都走这一条规则，不再只有「重新匹配」才回填（裁决见 builtinRowBackfillValue）。
+  const backfillRowFromBuiltin = (index: number, slug: string) => {
+    const row = modelWindowRows[index];
+    if (!row) return;
+    const patch = builtinRowBackfillValue(slug, row.window, row.autoCompact, builtinIndex.get(modelMetadataKey(slug)));
+    if (patch.window || patch.autoCompact) {
+      updateModelWindowRow(index, {
+        ...(patch.window ? { window: patch.window } : {}),
+        ...(patch.autoCompact ? { autoCompact: patch.autoCompact } : {}),
+      });
+    }
   };
   const resolvePendingModelSlugRenames = (
     rows: ModelWindowRow[],
@@ -7643,6 +7948,8 @@ function RelayProfileEditor({
   const commitModelSlug = (index: number) => {
     const nextSlug = modelWindowRows[index]?.model.trim() ?? "";
     if (!nextSlug) return;
+    // 面板身份只用 index（activeImportSlug 实时跟随输入框），改名只需在这里
+    // 迁移 metadata map 的 key；draft 不再持有 slug 副本，避免双轨漂移。
     const resolved = resolvePendingModelSlugRenames(
       modelWindowRows,
       modelSlugOriginsRef.current,
@@ -7650,64 +7957,197 @@ function RelayProfileEditor({
     );
     modelSlugOriginsRef.current = resolved.origins;
     if (resolved.modelMetadata !== profile.modelMetadata) commitModelMetadata(resolved.modelMetadata);
+    // 手动新增/改名提交即同步：内置命中且窗口/压缩列为空时立即回填
+    backfillRowFromBuiltin(index, nextSlug);
   };
   const closeModelMetadataImport = () => {
-    setMetadataImportTarget(null);
-    setMetadataImportDocument("");
-    setMetadataImportOriginalDocument("");
+    // 作废所有在飞的命令式内置查询（begin/rematch）：面板已关，迟到响应
+    // 不得再把面板重新打开或写入陈旧匹配状态。
+    builtinQuerySeqRef.current += 1;
+    setActiveImportDraft(null);
     setMetadataImportError("");
-    setMetadataImportPreview(null);
   };
   const cancelModelMetadataImport = () => {
-    if (metadataImportTarget) {
-      updateModelWindowRow(metadataImportTarget.index, {
-        window: metadataImportTarget.originalWindow,
-        autoCompact: metadataImportTarget.originalAutoCompact,
+    if (activeImportDraft) {
+      const cancelled = cancelActiveImportDraft(activeImportDraft);
+      updateModelWindowRow(activeImportDraft.index, {
+        window: cancelled.rowPatch.window,
+        autoCompact: cancelled.rowPatch.autoCompact,
       });
     }
     closeModelMetadataImport();
   };
-  const beginModelMetadataImport = (index: number, slug: string) => {
-    const existingMetadata = importedModelMetadata[slug];
+  const beginModelMetadataImport = async (index: number, slug: string) => {
+    // 配置可能还挂在「改名尚未提交」的旧 key 下（resolvePendingModelSlugRenames
+    // 的 previousSlug 同源），按行解析而不是按实时名硬查。
+    const existingKey = resolveModelMetadataRowKey(importedModelMetadata, {
+      current: slug,
+      origin: modelSlugOriginsRef.current[index],
+    });
+    const existingMetadata = existingKey ? importedModelMetadata[existingKey] : undefined;
     const existingDocument = existingMetadata
       ? serializeModelMetadataDocument(
-          slug,
+          // 文档 slug 必须与解析目标（剥后缀的行名）一致，否则带 [1M] 的行
+          // 现有配置文档永远匹配不上，保存键被解析失败锁死。
+          modelSlugFromRowName(slug),
           existingMetadata,
           modelWindowRows[index]?.window ?? "",
           modelWindowRows[index]?.autoCompact ?? "",
         )
       : "";
-    const existingPreview = existingDocument ? parseModelMetadataDocument(existingDocument, slug) : null;
-    setMetadataImportTarget({
+    // 无论有无已导入配置都查询内置匹配（标签需要准确的匹配状态）；
+    // 无已导入配置且命中内置时，把内置条目预填为可编辑底稿（预填 ≠ 导入）。
+    let match: BuiltinModelMetadataMatch | null = null;
+    let metadataQueryError = "";
+    if (slug.trim()) {
+      const querySeq = ++builtinQuerySeqRef.current;
+      try {
+        const result = await invoke<BuiltinModelMetadataMatch>("query_builtin_model_metadata", { slug });
+        // 代数守卫：await 期间面板被取消或被另一次 begin/rematch 抢占
+        // （seq 已变）时，本次响应整体丢弃——迟到响应不得重开已关闭的面板。
+        if (querySeq !== builtinQuerySeqRef.current) return;
+        const state = builtinMetadataQueryState(result);
+        setBuiltinQueryState(state);
+        match = state.status === "error" ? null : state.value;
+      } catch (error) {
+        if (querySeq !== builtinQuerySeqRef.current) return;
+        const state = builtinMetadataQueryState(null, error);
+        setBuiltinQueryState(state);
+        metadataQueryError = state.status === "error" ? state.error : "";
+      }
+    }
+    let document = existingDocument;
+    if (!document && match?.matched && match.entry) {
+      document = builtinEntryToImportDocument(match.entry, modelSlugFromRowName(slug));
+      setImportPrefillSource("builtin");
+      // 打开面板即同步：内置条目的窗口/压缩回填空列（后缀与已填值不覆盖，
+      // 与上游获取/手动提交同一规则）
+      const backfill = builtinRowBackfillValue(
+        slug,
+        modelWindowRows[index]?.window ?? "",
+        modelWindowRows[index]?.autoCompact ?? "",
+        match.entry,
+      );
+      if (backfill.window || backfill.autoCompact) {
+        updateModelWindowRow(index, {
+          ...(backfill.window ? { window: backfill.window } : {}),
+          ...(backfill.autoCompact ? { autoCompact: backfill.autoCompact } : {}),
+        });
+      }
+    } else {
+      setImportPrefillSource(existingMetadata ? "existing" : null);
+    }
+    setBuiltinMatch(match);
+    setBuiltinMatchSlug(slug);
+    const existingPreview = document
+      ? parseModelMetadataDocument(document, modelSlugFromRowName(slug))
+      : null;
+    setActiveImportDraft(createActiveImportDraft({
       index,
-      slug,
-      originalWindow: modelWindowRows[index]?.window ?? "",
-      originalAutoCompact: modelWindowRows[index]?.autoCompact ?? "",
-    });
-    setMetadataImportDocument(existingDocument);
-    setMetadataImportOriginalDocument(existingDocument);
-    setMetadataImportError("");
-    setMetadataImportPreview(existingPreview?.ok ? existingPreview.value : null);
+      rowName: slug,
+      window: modelWindowRows[index]?.window ?? "",
+      autoCompact: modelWindowRows[index]?.autoCompact ?? "",
+      document,
+      preview: existingPreview?.ok ? existingPreview.value : null,
+    }));
+    setMetadataImportError(metadataQueryError);
   };
   const applyModelMetadataImport = () => {
-    if (!metadataImportTarget || !metadataImportPreview) return;
+    if (!metadataImportTarget) return;
+    // 空文档是合法保存输入（清除 → 保存 = 放弃自定义回退内置）；解析失败才无内容可存。
+    const documentBlank = !metadataImportDocument.trim();
+    if (!metadataImportPreview && !documentBlank) return;
+    // 保存跟当前行名（改名后保存写回新 slug，不存旧名）
+    const slug = modelWindowRows[metadataImportTarget.index]?.model.trim()
+      || metadataImportPreview?.slug || "";
+    const key = modelMetadataKey(slug);
+    const decision = importSaveDecision({
+      parseOk: true,
+      documentBlank,
+      imported: Boolean(importedModelMetadata[key]),
+      // 内容与内置全字段一致时目标态就是「用内置」，不写自定义覆盖——
+      // 否则「重新匹配后保存」会把内置数据复制成一份自定义配置。
+      matchesBuiltin: metadataImportPreview
+        ? metadataMatchesBuiltin(metadataImportPreview.documentEntry, builtinMetadata)
+        : false,
+    });
+    if (!decision.needsSave) {
+      closeModelMetadataImport();
+      return;
+    }
+    if (decision.effect === "builtin") {
+      commitModelMetadata(clearModelMetadataForSlug(profile.modelMetadata, slug));
+      closeModelMetadataImport();
+      return;
+    }
+    if (!metadataImportPreview) {
+      closeModelMetadataImport();
+      return;
+    }
     commitModelMetadata(replaceModelMetadataForSlug(
       profile.modelMetadata,
-      metadataImportPreview.slug,
+      slug,
       metadataImportPreview.metadata,
     ));
-    updateModelWindowRow(metadataImportTarget.index, {
-      window: metadataImportPreview.contextWindow ?? metadataImportTarget.originalWindow,
-      // 空值表示明确清除该模型的自动压缩覆盖，不应恢复导入前的旧值。
-      // 模型行只展示整数百分比；预览阶段的高精度值不直接写回输入框。
-      autoCompact: metadataImportPreview.autoCompactPercent ?? DEFAULT_AUTO_COMPACT_PERCENT,
-    });
+    // 保存的窗口/压缩写回与实时同步规则一致：解析有值才写，null 不写，
+    // 不再 fallback 回导入前的旧值（保存把用户清空的窗口又写回旧值）。
+    const row = modelWindowRows[metadataImportTarget.index];
+    if (row) {
+      const patch = importDocumentSyncPatch(row, metadataImportPreview);
+      if (suffixWindowString(row.model)) delete patch.window;
+      if (patch.window !== undefined || patch.autoCompact !== undefined) {
+        updateModelWindowRow(metadataImportTarget.index, patch);
+      }
+    }
     closeModelMetadataImport();
   };
-  const clearImportedModelMetadata = () => {
-    if (!metadataImportTarget) return;
-    commitModelMetadata(clearModelMetadataForSlug(profile.modelMetadata, metadataImportTarget.slug));
-    closeModelMetadataImport();
+  // 「重新匹配」：按当前模型名重查内置元数据并重填下方内容（含实时写回行窗口）。
+  const rematchBuiltinImport = async (slug: string) => {
+    if (!slug.trim()) return;
+    const querySeq = ++builtinQuerySeqRef.current;
+    let match: BuiltinModelMetadataMatch | null = null;
+    try {
+      const result = await invoke<BuiltinModelMetadataMatch>("query_builtin_model_metadata", { slug });
+      // 代数守卫：连点重新匹配或面板已关闭时，旧响应整体丢弃。
+      if (querySeq !== builtinQuerySeqRef.current) return;
+      const state = builtinMetadataQueryState(result);
+      setBuiltinQueryState(state);
+      match = state.status === "error" ? null : state.value;
+    } catch (error) {
+      if (querySeq !== builtinQuerySeqRef.current) return;
+      const state = builtinMetadataQueryState(null, error);
+      setBuiltinQueryState(state);
+      setMetadataImportError(state.status === "error" ? state.error : "");
+    }
+    setBuiltinMatch(match);
+    // 未命中也要同步 slug：否则跟随 effect 的「slug 未变」早退会挡住后续查询，
+    // 用户把名字改对后按钮状态不更新。
+    setBuiltinMatchSlug(slug);
+    if (!match?.matched || !match.entry) return;
+    // 重新匹配只替换当前 draft；窗口后缀是用户显式意图，不能被内置值覆盖。
+    const document = builtinEntryToImportDocument(match.entry, modelSlugFromRowName(slug));
+    const preview = parseModelMetadataDocument(document, modelSlugFromRowName(slug));
+    if (activeImportDraft) {
+      setActiveImportDraft(rematchActiveImportDraft(
+        activeImportDraft, document, preview.ok ? preview.value : null,
+      ));
+    }
+    setMetadataImportError("");
+    if (metadataImportTarget && preview.ok && preview.value.contextWindow
+      && !suffixWindowString(slug)) {
+      updateModelWindowRow(metadataImportTarget.index, { window: preview.value.contextWindow });
+    }
+  };
+  // 「清除」：只清空面板文档（draft 内容），面板保持打开——不摘已保存配置、
+  // 不回滚窗口/压缩列、不关闭面板。回到内置走 清除 → 重新匹配 → 保存（内容=
+  // 内置 → 目标态内置）；粘贴最新供应商元数据也以清空后的面板为起点。
+  const clearImportDocument = () => {
+    setActiveImportDraft((draft) => draft
+      ? updateActiveImportDraft(draft, { document: "", preview: null })
+      : draft);
+    // 内容已被用户接管：后续改名不再自动回填内置预填
+    setImportPrefillSource(null);
+    setMetadataImportError("");
   };
   const removeModelWindowRow = (index: number) => {
     const removedSlug = modelWindowRows[index]?.model.trim() || modelSlugOriginsRef.current[index] || "";
@@ -7725,7 +8165,7 @@ function RelayProfileEditor({
     if (metadataImportTarget?.index === index) {
       closeModelMetadataImport();
     } else if (metadataImportTarget && metadataImportTarget.index > index) {
-      setMetadataImportTarget({ ...metadataImportTarget, index: metadataImportTarget.index - 1 });
+      setActiveImportDraft({ ...activeImportDraft, index: activeImportDraft.index - 1 });
     }
   };
   const addModelWindowRows = (rows: ModelWindowRow[]) => {
@@ -7734,7 +8174,19 @@ function RelayProfileEditor({
       const currentIndex = modelWindowRows.findIndex((current) => current.model.trim() === row.model.trim());
       return currentIndex >= 0 ? modelSlugOriginsRef.current[currentIndex] || row.model.trim() : row.model.trim();
     });
-    setModelWindowRows(merged);
+    // 上游获取的行窗口/压缩列一律为空：内置命中时立即回填（同一回填裁决）
+    setModelWindowRows(merged.map((row) => {
+      if (row.window.trim() && row.autoCompact.trim()) return row;
+      const entry = builtinIndex.get(modelMetadataKey(row.model));
+      const patch = builtinRowBackfillValue(row.model, row.window, row.autoCompact, entry);
+      return patch.window || patch.autoCompact
+        ? {
+            ...row,
+            ...(patch.window ? { window: patch.window } : {}),
+            ...(patch.autoCompact ? { autoCompact: patch.autoCompact } : {}),
+          }
+        : row;
+    }));
   };
   const appendEmptyModelRow = () => {
     modelSlugOriginsRef.current = [...modelSlugOriginsRef.current, ""];
@@ -7742,6 +8194,26 @@ function RelayProfileEditor({
   };
   const modelRowsError = modelWindowRowsValidationMessage(modelWindowRowsValidationError(modelWindowRows));
   const customHeadersError = relayHeadersValidationMessage(profile.customHeaders || []);
+  const localizeMetadataSourceTag = (tag: ReturnType<typeof metadataSourceTags>[number]) => {
+    if (tag.kind === "match") {
+      return {
+        text: tf("匹配：{0}", [tag.source]),
+        title: tf("内置元数据：{0}", [tag.source]),
+      };
+    }
+    if (tag.kind === "fallback") {
+      return {
+        text: tf("回退：{0}", [tag.source]),
+        title: tf("无内置元数据，生成时回退 {0} 官方模板", [tag.source]),
+      };
+    }
+    return {
+      text: t("自定义"),
+      title: tag.source
+        ? tf("已导入自定义元数据，生成时覆盖内置（{0}）", [tag.source])
+        : t("已导入自定义元数据，生成时以该配置为准"),
+    };
+  };
   const fetchSub2ApiRate = async () => {
     const result = await actions.fetchSub2ApiBilling(deriveRelayProfileFromFiles(profile));
     if (!result) return;
@@ -7805,21 +8277,6 @@ function RelayProfileEditor({
             <p className="field-hint">{t("当前继承公共配置；修改后将为该供应商保存独立设置。")}</p>
           ) : null}
         </Field>
-        {profile.relayMode === "official" ? (
-          <Field className="relay-field-official-usage-alert" label={t("官方登录")}>
-            <label className="inline-check">
-              <input
-                checked={profile.hideOfficialUsageAlert}
-                onChange={(event) => updateDraft({ hideOfficialUsageAlert: event.currentTarget.checked })}
-                type="checkbox"
-              />
-              <span>{t("关闭官方低额度提示")}</span>
-            </label>
-            <p className="field-hint">
-              {t("只隐藏低额度和已用完提示，不改变发送限制。左下角账户菜单仍显示官方剩余额度。")}
-            </p>
-          </Field>
-        ) : null}
         <div className="relay-advanced-toggle">
           <Button
             aria-expanded={showAdvanced}
@@ -7858,6 +8315,91 @@ function RelayProfileEditor({
               />
             </Field>
           </div>
+        ) : null}
+        {!isAggregateRelayProfile(profile) ? (
+          <section className="relay-config-section relay-channel-protection">
+            <div className="relay-config-section-head">
+              <div>
+                <strong>{t("渠道保护")}</strong>
+                <span>{t("仅作用于当前供应商；可降低共享渠道触发 429、500 或 RPM 限制的概率。")}</span>
+              </div>
+            </div>
+            <label className="switch-row compact">
+              <input
+                checked={profile.rateLimitCooldownEnabled}
+                onChange={(event) => updateDraft({ rateLimitCooldownEnabled: event.currentTarget.checked })}
+                type="checkbox"
+              />
+              <span>
+                <strong>{t("启用错误冷却")}</strong>
+                <small>{t("命中下方状态码后，当前供应商暂停请求至少 30 秒并自动继续；最多自动重试 3 次，3 次仍失败则返回错误；上游 Retry-After 更长时优先使用上游时间。")}</small>
+              </span>
+              <ToggleVisual />
+            </label>
+            <label className="switch-row compact">
+              <input
+                checked={profile.channelQueueEnabled}
+                onChange={(event) => updateDraft({ channelQueueEnabled: event.currentTarget.checked })}
+                type="checkbox"
+              />
+              <span>
+                <strong>{t("启用同渠道队列")}</strong>
+                <small>{t("当前供应商的请求按顺序发送，并按每分钟上限预留请求次数。")}</small>
+              </span>
+              <ToggleVisual />
+            </label>
+            <div className="form-row relay-channel-protection-fields">
+              <Field label={t("每分钟请求数")}>
+                <Input
+                  min={1}
+                  max={10000}
+                  type="number"
+                  value={profile.channelRequestsPerMinute}
+                  onChange={(event) =>
+                    updateDraft({
+                      channelRequestsPerMinute: clampNumber(Number(event.currentTarget.value), 1, 10000),
+                    })
+                  }
+                />
+                <p className="field-hint">{t("请填入供应商提供的最大RPM")}</p>
+              </Field>
+              <Field label={t("触发冷却的状态码")}>
+                <div className="channel-status-editor">
+                  <div className="channel-status-list">
+                    {profile.cooldownErrorStatuses.map((status) => (
+                      <button
+                        key={status}
+                        className="channel-status-chip"
+                        onClick={() =>
+                          updateDraft({
+                            cooldownErrorStatuses: profile.cooldownErrorStatuses.filter((item) => item !== status),
+                          })
+                        }
+                        type="button"
+                      >
+                        {status} ×
+                      </button>
+                    ))}
+                  </div>
+                  <Input
+                    inputMode="numeric"
+                    placeholder={t("输入状态码后回车")}
+                    value={channelStatusInput}
+                    onChange={(event) => setChannelStatusInput(event.currentTarget.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        addChannelStatuses();
+                      }
+                    }}
+                  />
+                </div>
+              </Field>
+            </div>
+            <p className="field-hint">
+              {t("默认状态码为 429 和 500；删除某个状态码即可停止该状态触发冷却。")}
+            </p>
+          </section>
         ) : null}
         {profile.relayMode === "official" ? (
           <Field className="relay-field-official-key" label="API Key">
@@ -8030,8 +8572,32 @@ function RelayProfileEditor({
               </div>
               {modelWindowRows.map((row, index) => {
                 const slug = row.model.trim();
-                const importing = metadataImportTarget?.index === index && metadataImportTarget.slug === slug;
-                const imported = Boolean(importedModelMetadata[slug]);
+                // 面板身份只用 index：slug 双轨（draft 副本 vs 实时输入）曾导致
+                // 改名时面板整体卸载、blur 后重挂抢焦点。
+                const importing = metadataImportTarget?.index === index;
+                // 配置可能还挂在「改名尚未提交」的旧 key 下，按行解析而不是按实时名硬查。
+                const imported = resolveModelMetadataRowKey(importedModelMetadata, {
+                  current: slug,
+                  origin: modelSlugOriginsRef.current[index],
+                }) !== null;
+                // 按钮可用性与状态行都从这一个纯函数出（见 model-metadata.ts）。
+                // 面板关闭时不创建导入控件，避免用一个面板级状态为所有行派生按钮状态。
+                const importControls = importing
+                  ? importPanelControls({
+                      slug,
+                      document: metadataImportDocument,
+                      imported,
+                      // 空文档（清除后）不算解析失败：保存键保持可用，
+                      // 走「放弃自定义回退内置」的保存路径。
+                      parseOk: !metadataImportDocument.trim() || Boolean(metadataImportPreview),
+                      matched: builtinQueryState?.status === "error" ? false : Boolean(builtinMatch?.matched),
+                      // 面板内容与内置条目全字段等价：保存的目标态就是「用内置」。
+                      matchesBuiltin: metadataImportPreview
+                        ? metadataMatchesBuiltin(metadataImportPreview.documentEntry, builtinMetadata)
+                        : false,
+                    })
+                  : null;
+
                 return (
                   <div className="relay-model-entry" key={index}>
                     <div className="relay-model-row">
@@ -8113,14 +8679,14 @@ function RelayProfileEditor({
                         title={vlmUnsupportedProtocol ? t("VLM 仅支持 Chat Completions 协议和聚合模式") : t("多模态模型（支持图片输入的模型）请保持 send-as-is。")}
                       />
                       <Button
-                        className="relay-model-import-button"
+                        className={`relay-model-import-button${imported ? " relay-model-import-custom" : builtinIndex.has(modelMetadataKey(slug)) ? " relay-model-import-builtin" : ""}`}
                         aria-expanded={importing}
                         disabled={!slug}
                         onClick={() => (importing ? cancelModelMetadataImport() : beginModelMetadataImport(index, slug))}
                         size="icon"
                         title={imported ? t("查看或重新导入 models.json") : t("导入 models.json")}
                         type="button"
-                        variant={importing || imported ? "secondary" : "ghost"}
+                        variant="ghost"
                       >
                         <FileCode2 className="h-4 w-4" />
                       </Button>
@@ -8151,6 +8717,17 @@ function RelayProfileEditor({
                               return;
                             }
                             setMetadataImportPreview(parsed.value);
+                            // 实时替换：JSON 里的窗口/压缩比即时写回模型行输入框（所见即所得）。
+                            if (metadataImportTarget) {
+                              const row = modelWindowRows[metadataImportTarget.index];
+                              if (row) {
+                                const patch = importDocumentSyncPatch(row, parsed.value);
+                                if (suffixWindowString(row.model)) delete patch.window;
+                                if (patch.window !== undefined || patch.autoCompact !== undefined) {
+                                  updateModelWindowRow(metadataImportTarget.index, patch);
+                                }
+                              }
+                            }
                           }}
                           placeholder={t("需要补充供应商模型信息时填写；不填则使用 Codex++ 默认配置（自动压缩 90%、图片原样发送）。从供应商的 models.json 或 model.json 复制，支持多个模型。")}
                           rows={7}
@@ -8164,28 +8741,68 @@ function RelayProfileEditor({
                         <div className="relay-model-metadata-import-actions">
                           <div className="relay-model-import-copy">
                             <strong>{slug}</strong>
+                            {metadataSourceTags({
+                              slug,
+                              imported,
+                              builtinMatch: builtinQueryState?.status === "error" ? null : builtinMatch,
+                              builtinIndexSlug: builtinIndex.get(modelMetadataKey(slug)),
+                              // 回退模板名从后端 fallback 字段实时取，不写死
+                              fallbackSlug: builtinMatch?.fallback?.slug,
+                            }).map((tag) => (
+                              (() => {
+                                const localized = localizeMetadataSourceTag(tag);
+                                return (
+                                  <span
+                                    key={tag.kind}
+                                    className={`relay-model-source-badge relay-model-source-${tag.tone}`}
+                                    title={localized.title}
+                                  >
+                                    {localized.text}
+                                  </span>
+                                );
+                              })()
+                            ))}
                           </div>
                           <div className="relay-model-metadata-import-flow">
-                            <Button onClick={cancelModelMetadataImport} size="sm" type="button" variant="ghost">{t("取消")}</Button>
-                            {imported ? (
-                              <Button
-                                className="relay-model-metadata-reset"
-                                onClick={clearImportedModelMetadata}
-                                size="sm"
-                                title={t("清除已导入的模型字段，保留上下文窗口")}
-                                type="button"
-                                variant="ghost"
-                              >
-                                <RotateCcw className="h-4 w-4" />
-                                {t("清除导入配置")}
-                              </Button>
-                            ) : null}
-                            <Button disabled={!metadataImportPreview} onClick={applyModelMetadataImport} size="sm" type="button">
-                              {t(
-                                metadataImportDocument.trim() === metadataImportOriginalDocument.trim()
-                                  ? "保存此模型"
-                                  : "更新此模型配置",
-                              )}
+                            {/* 四个按钮恒定渲染：只用置灰表达可用性，不再随状态出现/消失 */}
+                            <Button
+                              disabled={importControls?.rematch.disabled ?? true}
+                              onClick={() => void rematchBuiltinImport(slug)}
+                              size="sm"
+                              title={t(importControls?.rematch.title ?? "重新匹配")}
+                              type="button"
+                              variant="ghost"
+                            >
+                              {t("重新匹配")}
+                            </Button>
+                            <Button
+                              disabled={importControls?.clear.disabled ?? true}
+                              onClick={() => clearImportDocument()}
+                              size="sm"
+                              title={t(importControls?.clear.title ?? "清除")}
+                              type="button"
+                              variant="ghost"
+                            >
+                              {t("清除")}
+                            </Button>
+                            <Button
+                              disabled={importControls?.cancel.disabled ?? true}
+                              onClick={cancelModelMetadataImport}
+                              size="sm"
+                              title={t(importControls?.cancel.title ?? "取消")}
+                              type="button"
+                              variant="ghost"
+                            >
+                              {t("取消")}
+                            </Button>
+                            <Button
+                              disabled={importControls?.save.disabled ?? true}
+                              onClick={applyModelMetadataImport}
+                              size="sm"
+                              type="button"
+                              title={t(importControls?.save.title ?? "保存此模型")}
+                            >
+                              {t(importControls?.save.label ?? "保存此模型")}
                             </Button>
                           </div>
                         </div>
@@ -9248,8 +9865,8 @@ function RelayFileEditors({
             <span>{isActive
               ? profile.relayMode === "pureApi"
                 ? t("当前使用中：保留此供应商的 auth 存档，避免 Codex 登录密钥覆盖供应商密钥")
-                : t("当前使用中：打开时从 ~/.codex/auth.json 回填，保存后会作为此供应商 auth 存档")
-              : t("切换到此供应商时会写入 ~/.codex/auth.json")}</span>
+                : t("当前使用中：打开时从 Codex 主目录的 auth.json 回填，保存后会作为此供应商 auth 存档")
+              : t("切换到此供应商时会写入 Codex 主目录的 auth.json")}</span>
           </div>
         </div>
         <SyncedTextarea
@@ -11123,6 +11740,10 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
             noAuth: false,
             sub2apiMultiplier: "",
             standardOpenaiProtocol: false,
+            rateLimitCooldownEnabled: false,
+            channelQueueEnabled: false,
+            channelRequestsPerMinute: 20,
+            cooldownErrorStatuses: [429, 500],
           },
         ];
   const activeRelayId = profiles.some((profile) => profile.id === settings.activeRelayId)
@@ -11165,6 +11786,17 @@ function backendSettingsEqual(left: BackendSettings, right: BackendSettings): bo
 function clampNumber(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return min;
   return Math.min(max, Math.max(min, Math.round(value)));
+}
+
+function normalizeCooldownErrorStatuses(value: number[] | undefined): number[] {
+  if (!Array.isArray(value)) return [429, 500];
+  return Array.from(
+    new Set(
+      value
+        .map(Number)
+        .filter((status) => Number.isInteger(status) && status >= 100 && status <= 599),
+    ),
+  ).slice(0, 20);
 }
 
 function normalizeStepwiseGenerationMode(value: StepwiseGenerationMode | undefined): StepwiseGenerationMode {
@@ -11224,6 +11856,10 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
         noAuth: false,
         sub2apiMultiplier: "",
         standardOpenaiProtocol: false,
+        rateLimitCooldownEnabled: profile.rateLimitCooldownEnabled === true,
+        channelQueueEnabled: profile.channelQueueEnabled === true,
+        channelRequestsPerMinute: clampNumber(profile.channelRequestsPerMinute ?? 20, 1, 10000),
+        cooldownErrorStatuses: normalizeCooldownErrorStatuses(profile.cooldownErrorStatuses),
       },
       null,
     );
@@ -11261,6 +11897,10 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
     sub2apiEnabled: profile.noAuth ? false : profile.sub2apiEnabled === true,
     sub2apiMultiplier: !profile.noAuth && profile.sub2apiEnabled === true ? profile.sub2apiMultiplier || "" : "",
     standardOpenaiProtocol: profile.standardOpenaiProtocol === true,
+    rateLimitCooldownEnabled: profile.rateLimitCooldownEnabled === true,
+    channelQueueEnabled: profile.channelQueueEnabled === true,
+    channelRequestsPerMinute: clampNumber(profile.channelRequestsPerMinute ?? 20, 1, 10000),
+    cooldownErrorStatuses: normalizeCooldownErrorStatuses(profile.cooldownErrorStatuses),
   };
   return relayProfileUsesLiveFiles(normalized) ? deriveRelayProfileFromFiles(normalized) : normalized;
 }
@@ -11625,19 +12265,13 @@ function codexModelFromConfig(contents: string): string {
 }
 
 /// 解析模型后缀语法，如 deepseek-v4-flash[1M] -> { slug: "deepseek-v4-flash", window: 1000000 }
-/// 非法或没有后缀时返回原串作为 slug。
+/// 非法或没有后缀时返回原串作为 slug。剥离与换算统一走 model-metadata.ts 的
+/// suffixWindowString/modelSlugFromRowName，避免两处实现对「什么算合法后缀」
+/// 的判断分叉。
 function parseModelSuffix(raw: string): { slug: string; window?: number } {
-  const trimmed = raw.trim();
-  const match = /^(.*?)\[(\d+(?:[KkMm])?)\]$/.exec(trimmed);
-  if (!match) return { slug: trimmed };
-  const inner = match[2];
-  const numPart = inner.replace(/[KkMm]$/, "");
-  const multiplier = inner.endsWith("K") || inner.endsWith("k") ? 1_000
-    : inner.endsWith("M") || inner.endsWith("m") ? 1_000_000
-    : 1;
-  const window = Number.parseInt(numPart, 10) * multiplier;
-  if (!Number.isFinite(window) || window <= 0) return { slug: trimmed };
-  return { slug: match[1].trim(), window };
+  const window = suffixWindowString(raw);
+  if (window === null) return { slug: raw.trim() };
+  return { slug: modelSlugFromRowName(raw), window: Number(window) };
 }
 
 function codexBaseUrlFromConfig(contents: string): string {
@@ -12078,6 +12712,10 @@ function createRelayProfile(settings: BackendSettings): RelayProfile {
     sub2apiMultiplier: "",
     modelRoutes: [],
     standardOpenaiProtocol: false,
+    rateLimitCooldownEnabled: false,
+    channelQueueEnabled: false,
+    channelRequestsPerMinute: 20,
+    cooldownErrorStatuses: [429, 500],
   };
   return withGeneratedRelayFiles(next);
 }
@@ -12122,6 +12760,10 @@ function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
       sub2apiMultiplier: "",
       modelRoutes: [],
       standardOpenaiProtocol: false,
+      rateLimitCooldownEnabled: false,
+      channelQueueEnabled: false,
+      channelRequestsPerMinute: 20,
+      cooldownErrorStatuses: [429, 500],
       aggregate: {
         strategy: "failover",
         members: candidates.slice(0, 1).map((profile) => ({ profileId: profile.id, weight: 1 })),

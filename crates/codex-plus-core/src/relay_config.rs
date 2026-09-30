@@ -583,8 +583,7 @@ fn align_profile_model_with_active_goal_thread(home: &Path, profile: &RelayProfi
         return profile.clone();
     }
     let Some(goal_model) = crate::codex_sqlite::latest_unarchived_goal_thread_model(home)
-        .filter(|model| !model.trim().is_empty())
-        .map(|model| model.trim().to_string())
+        .and_then(|model| sanitize_relay_model_name(&model))
     else {
         return profile.clone();
     };
@@ -672,8 +671,7 @@ pub fn align_live_config_model_with_goal_thread(
         return Ok(false);
     }
     let Some(goal_model) = crate::codex_sqlite::latest_unarchived_goal_thread_model(home)
-        .filter(|model| !model.trim().is_empty())
-        .map(|model| model.trim().to_string())
+        .and_then(|model| sanitize_relay_model_name(&model))
     else {
         return Ok(false);
     };
@@ -1092,7 +1090,9 @@ pub fn backfill_relay_profile_from_home(
     let live_config = profile.config_contents.clone();
     sync_context_limits_from_config(profile, &live_config);
     if profile.model.trim().is_empty() {
-        if let Some(model) = root_key_string(&live_config, "model") {
+        if let Some(model) = root_key_string(&live_config, "model")
+            .and_then(|model| sanitize_relay_model_name(&model))
+        {
             profile.model = model;
         }
     }
@@ -1152,7 +1152,9 @@ pub fn backfill_relay_profile_from_home_with_common(
     // `model =` 可能是 apply 写入的隐式默认/目标任务对齐值，固化进
     // profile.model 会挡住后续对齐（issue #2264）。
     if profile.model.trim().is_empty() {
-        if let Some(model) = root_key_string(&profile.config_contents, "model") {
+        if let Some(model) = root_key_string(&profile.config_contents, "model")
+            .and_then(|model| sanitize_relay_model_name(&model))
+        {
             profile.model = model;
         }
     }
@@ -2459,15 +2461,13 @@ fn apply_model_catalog_to_config(
     // Known bundled metadata entries need a catalog even without a user-supplied window.
     // 托管 Responses 传输走 model_routes 时需要 catalog，与会话身份无关；
     // 纯平铺 model_list 且无窗口/元数据的仍保持"不生成"契约（无后缀不落盘，见既有测试）。
-    if !has_metadata_overrides
-        && !entries.iter().any(|entry| {
-            entry.suffix_window.is_some()
-                || entry.auto_compact_percent.is_some()
-                || crate::model_suffix::requires_bundled_metadata_catalog(&entry.slug)
-                || (official_deepseek_responses && entry.slug.starts_with("deepseek-v4-"))
-        })
-        && !(standard_responses && profile.has_model_routes())
-    {
+    if !should_write_managed_model_catalog(
+        &entries,
+        has_metadata_overrides,
+        standard_responses,
+        profile.has_model_routes(),
+        official_deepseek_responses,
+    ) {
         let mut doc = parse_toml_document(&config_text)?;
         if root_key_string(&config_text, "model_catalog_json").as_deref()
             == Some(catalog_relative.as_str())
@@ -2562,19 +2562,208 @@ fn parse_model_metadata_map(metadata_json: &str) -> anyhow::Result<serde_json::M
     let map = value
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("model_metadata 必须是 JSON 对象"))?;
+    // 与前端 canonicalizeModelMetadataMap 完全对齐：key 统一剥 [1M] 后缀并做
+    // ASCII 小写归一，同名变体（大小写/后缀差异）后写者胜。否则旧数据里
+    // "DeepSeek-V4-Pro" 与 "deepseek-v4-pro[512K]" 会在前端显示与 Rust 生成
+    // catalog 两侧各选一份覆盖（前端末位胜、这里首位胜），界面与生效值分叉。
+    let mut canonical = serde_json::Map::new();
     for (slug, metadata) in map {
         if !metadata.is_object() {
             anyhow::bail!("model_metadata 的模型 {slug} 值必须是对象");
         }
+        let normalized = crate::model_suffix::parse_model_suffix(slug).0;
+        if normalized.is_empty() {
+            continue;
+        }
+        canonical.insert(normalized.to_ascii_lowercase(), metadata.clone());
     }
-    Ok(map.clone())
+    Ok(canonical)
 }
 
 fn model_metadata_has_entries(
     metadata: &serde_json::Map<String, Value>,
     entry_slugs: &HashSet<String>,
 ) -> bool {
-    metadata.keys().any(|slug| entry_slugs.contains(slug))
+    // metadata 的 key 已由 parse_model_metadata_map 归一化，entry slug 侧做
+    // 同样归一后直接求交。
+    let normalized_entry_slugs = entry_slugs
+        .iter()
+        .map(|slug| {
+            crate::model_suffix::parse_model_suffix(slug)
+                .0
+                .to_ascii_lowercase()
+        })
+        .collect::<HashSet<_>>();
+    metadata.keys().any(|slug| normalized_entry_slugs.contains(slug))
+}
+
+fn model_metadata_override_for_slug<'a>(
+    override_map: &'a serde_json::Map<String, Value>,
+    slug: &str,
+) -> Option<&'a serde_json::Map<String, Value>> {
+    // override_map 的 key 已由 parse_model_metadata_map 归一化（剥后缀 +
+    // 小写、变体去重），查询 slug 做同样归一后直接命中。
+    let normalized_slug = crate::model_suffix::parse_model_suffix(slug)
+        .0
+        .to_ascii_lowercase();
+    override_map
+        .get(&normalized_slug)
+        .and_then(Value::as_object)
+}
+
+/// 判断当前 profile 是否需要由 CodexPlusPlus 托管写入 model catalog。
+///
+/// 该谓词只依赖已解析的 catalog 条目和 profile 能力事实，不读取磁盘，也不
+/// 改变外部 catalog 的接管、冲突回滚及 per-profile 单值行为。
+fn should_write_managed_model_catalog(
+    entries: &[crate::model_suffix::ModelCatalogEntry],
+    metadata_overrides: bool,
+    standard_responses: bool,
+    has_model_routes: bool,
+    official_deepseek_responses: bool,
+) -> bool {
+    metadata_overrides
+        || entries.iter().any(|entry| {
+            entry.suffix_window.is_some()
+                || entry.auto_compact_percent.is_some()
+                || crate::model_suffix::requires_bundled_metadata_catalog(&entry.slug)
+                || (official_deepseek_responses && entry.slug.starts_with("deepseek-v4-"))
+        })
+        || (standard_responses && has_model_routes)
+}
+
+#[cfg(test)]
+mod managed_catalog_predicate_tests {
+    use super::{
+        apply_model_metadata_overrides, model_metadata_has_entries,
+        model_metadata_override_for_slug, parse_model_metadata_map,
+        should_write_managed_model_catalog,
+    };
+    use crate::model_suffix::ModelCatalogEntry;
+    use serde_json::{Value, json};
+    use std::collections::HashSet;
+
+    fn entry(slug: &str) -> ModelCatalogEntry {
+        ModelCatalogEntry {
+            slug: slug.to_string(),
+            display_name: slug.to_string(),
+            suffix_window: None,
+            auto_compact_percent: None,
+        }
+    }
+
+    #[test]
+    fn predicate_keeps_plain_profile_without_routes_unmanaged() {
+        assert!(!should_write_managed_model_catalog(
+            &[entry("custom-model")],
+            false,
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn predicate_writes_for_per_model_window_compact_or_metadata() {
+        let mut window = entry("custom-model");
+        window.suffix_window = Some(1_000_000);
+        assert!(should_write_managed_model_catalog(
+            &[window], false, false, false, false
+        ));
+
+        let mut compact = entry("custom-model");
+        compact.auto_compact_percent = Some(80_000_000);
+        assert!(should_write_managed_model_catalog(
+            &[compact], false, false, false, false
+        ));
+        assert!(should_write_managed_model_catalog(
+            &[entry("custom-model")],
+            true,
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn predicate_writes_for_routes_or_official_deepseek() {
+        assert!(should_write_managed_model_catalog(
+            &[entry("custom-model")],
+            false,
+            true,
+            true,
+            false,
+        ));
+        assert!(should_write_managed_model_catalog(
+            &[entry("deepseek-v4-pro")],
+            false,
+            false,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn metadata_keys_match_catalog_slugs_case_insensitively_and_without_suffix() {
+        // 生产链路里 has_entries 的入参恒来自 parse_model_metadata_map（key
+        // 已归一），这里走同一管道构造。
+        let metadata = parse_model_metadata_map(r#"{"DeepSeek-V4-Pro[1M]": {"description": "custom"}}"#).unwrap();
+        let slugs = HashSet::from(["deepseek-v4-pro".to_string()]);
+        assert!(model_metadata_has_entries(&metadata, &slugs));
+    }
+
+    #[test]
+    fn metadata_map_normalizes_keys_with_last_write_wins() {
+        // 同名变体（大小写/后缀）归一到同一 key，后写者胜——与前端
+        // canonicalizeModelMetadataMap 一致，否则两侧各选一份覆盖。
+        let metadata = parse_model_metadata_map(
+            r#"{
+                "DeepSeek-V4-Pro": {"description": "first"},
+                "deepseek-v4-pro[512K]": {"description": "second"}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata["deepseek-v4-pro"]["description"], "second");
+
+        // 覆盖查找同样按归一 key 命中：catalog 侧的 slug 带大小写变体也能查到。
+        let override_map =
+            parse_model_metadata_map(r#"{"GLM-5.3": {"display_name": "GLM"}}"#).unwrap();
+        assert_eq!(
+            model_metadata_override_for_slug(&override_map, "glm-5.3")
+                .unwrap()["display_name"],
+            "GLM"
+        );
+        assert_eq!(
+            model_metadata_override_for_slug(&override_map, "GLM-5.3[1M]")
+                .unwrap()["display_name"],
+            "GLM"
+        );
+        assert!(model_metadata_override_for_slug(&override_map, "other").is_none());
+    }
+
+    #[test]
+    fn metadata_overlay_uses_canonical_slug_and_preserves_managed_fields() {
+        let metadata = parse_model_metadata_map(
+            r#"{"DeepSeek-V4-Pro[1M]": {
+                "description": "custom",
+                "context_window": 1,
+                "max_context_window": 1
+            }}"#,
+        )
+        .unwrap();
+        let catalog = json!({"models": [{
+            "slug": "deepseek-v4-pro",
+            "context_window": 272000,
+            "max_context_window": 272000
+        }]});
+        let result = apply_model_metadata_overrides(&catalog.to_string(), &metadata).unwrap();
+        let value: Value = serde_json::from_str(&result).unwrap();
+        let model = &value["models"][0];
+        assert_eq!(model["description"], "custom");
+        assert_eq!(model["context_window"], 272000);
+        assert_eq!(model["max_context_window"], 272000);
+    }
 }
 
 fn apply_model_metadata_overrides(
@@ -2593,7 +2782,7 @@ fn apply_model_metadata_overrides(
         let Some(slug) = model.get("slug").and_then(Value::as_str) else {
             continue;
         };
-        let Some(user_override) = override_map.get(slug).and_then(Value::as_object) else {
+        let Some(user_override) = model_metadata_override_for_slug(override_map, slug) else {
             continue;
         };
         let Some(model_object) = model.as_object_mut() else {
@@ -3395,12 +3584,44 @@ fn codex_auth_api_key(auth_contents: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// 模型名只接受合理的单行 slug。issue #1097 问题 2：live config 里的
+/// `model =` 可能被污染成整段转义后的供应商配置，写侧转义、读侧
+/// （`root_key_string` 不反转义）逐轮叠加导致 settings.json 膨胀到几十 MB、
+/// 管理工具白屏。这里统一拒绝换行/控制字符/反斜杠、超长值以及明显混入
+/// 供应商配置关键字的值，视为「未声明」。
+const MAX_MODEL_NAME_LEN: usize = 256;
+const MODEL_NAME_FORBIDDEN_KEYWORDS: [&str; 6] = [
+    "model_provider",
+    "model_providers",
+    "base_url",
+    "wire_api",
+    "requires_openai_auth",
+    "model_catalog_json",
+];
+
+fn sanitize_relay_model_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > MAX_MODEL_NAME_LEN
+        || trimmed.contains(['\\', '\r', '\n'])
+        || trimmed.chars().any(char::is_control)
+        || MODEL_NAME_FORBIDDEN_KEYWORDS
+            .iter()
+            .any(|keyword| trimmed.contains(keyword))
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
 /// 解析 profile 實際使用的模型：優先取 config.toml 裡的 `model =`，
 /// 否則退回 profile.model 欄位。供應商測試用它做回退，避免串到別家供應商的模型名。
+/// 两侧来源都过 `sanitize_relay_model_name`：被污染的值视为未声明（issue #1097）。
 pub fn relay_profile_model(profile: &RelayProfile) -> String {
     root_key_string(&profile.config_contents, "model")
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| profile.model.trim().to_string())
+        .and_then(|value| sanitize_relay_model_name(&value))
+        .or_else(|| sanitize_relay_model_name(&profile.model))
+        .unwrap_or_default()
 }
 
 pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
@@ -3512,8 +3733,9 @@ fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<Strin
             .split(['\r', '\n', ','])
             .map(str::trim)
             .find(|value| !value.is_empty())
+            .and_then(sanitize_relay_model_name)
         {
-            model = crate::model_suffix::parse_model_suffix(first).0;
+            model = crate::model_suffix::parse_model_suffix(&first).0;
         }
     }
     // 若用户把后缀语法（如 deepseek-v4-flash[1M]）写在 model 字段，
@@ -3521,6 +3743,10 @@ fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<Strin
     let (model, _) = crate::model_suffix::parse_model_suffix(&model);
     if !model.trim().is_empty() {
         doc["model"] = toml_edit::value(model.trim());
+    } else {
+        // config_contents 里被污染的 `model =`（issue #1097 问题 2）必须剥掉，
+        // 否则 normalize 重写快照时脏值会原样保留、逐轮转义放大。
+        doc.as_table_mut().remove("model");
     }
 
     let base_url = relay_profile_base_url(profile);
@@ -3733,7 +3959,9 @@ fn no_auth_auth_contents(auth_contents: &str) -> anyhow::Result<String> {
 }
 
 fn merge_model_into_model_list(model: &str, model_list: &str) -> String {
-    let model = model.trim();
+    // 入参可能来自 official 分支的原始 profile.model 字段（未经 relay_profile_model
+    // 出口过滤），污染值并入列表后会在 normalize 逐轮转义放大（issue #1097 问题 2）。
+    let model = sanitize_relay_model_name(model).unwrap_or_default();
     let mut models = Vec::new();
     if !model.is_empty() {
         models.push(model.to_string());
@@ -4313,6 +4541,41 @@ command = \"pwsh -File end.ps1\"
             ..RelayProfile::default()
         };
         assert!(relay_profile_model(&empty).trim().is_empty());
+    }
+
+    /// issue #1097 问题 2：live config 的 `model =` 可能被污染成整段转义后的
+    /// 供应商配置（含反斜杠/换行逃逸、base_url 等关键字），读回不反转义会在
+    /// 保存/切换循环里逐轮放大。这里验证出口统一拒绝污染值。
+    #[test]
+    fn relay_profile_model_rejects_polluted_model_values() {
+        let polluted = "gpt-5.6-sol\\n\\nmodel_provider = \\\"custom\\\"\\nbase_url = \\\"https://relay.example.test/v1\\\"\\n";
+
+        // config 里的污染值视为未声明，退回 profile.model 字段
+        let falls_back = RelayProfile {
+            config_contents: format!("model = \"{polluted}\"\nmodel_provider = \"custom\"\n"),
+            model: "deepseek-v4-pro".to_string(),
+            ..RelayProfile::default()
+        };
+        assert_eq!(relay_profile_model(&falls_back), "deepseek-v4-pro");
+
+        // 两侧都被污染（字段值含反斜杠逃逸）→ 空串
+        let rejected = RelayProfile {
+            config_contents: format!("model = \"{polluted}\"\nmodel_provider = \"custom\"\n"),
+            model: "also\\npolluted".to_string(),
+            ..RelayProfile::default()
+        };
+        assert!(relay_profile_model(&rejected).trim().is_empty());
+
+        // 合法形态不受影响：斜杠命名空间、后缀语法
+        for valid in ["gpt-5.6-sol", "openai/gpt-4o", "deepseek-v4-flash[1M]"] {
+            assert_eq!(
+                relay_profile_model(&RelayProfile {
+                    config_contents: format!("model = \"{valid}\"\n"),
+                    ..RelayProfile::default()
+                }),
+                valid
+            );
+        }
     }
 
     /// 伪造一个带 threads / automation_runs 表的 Codex 会话库。

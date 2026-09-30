@@ -5,6 +5,25 @@
 
 // Plain strings: t("中文") -> EN_PLAIN["中文"].
 export const EN_PLAIN: Record<string, string> = {
+  "读取会话索引修复报告失败": "Failed to read the session index repair report",
+  "最后检查：": "Last checked: ",
+  "旧版报告未记录时间": "Timestamp unavailable in this older report",
+  "短暂等待": "Waiting for records to settle",
+  "持续无法恢复": "Still unable to restore",
+  "等待与持续无法恢复详情": "Waiting and unresolved items",
+  "任务 ID：": "Task ID: ",
+  "轮次 ID：": "Turn ID: ",
+  "原因：": "Reason: ",
+  "首次发现：": "First seen: ",
+  "检查次数：": "Checks: ",
+  "修复已中止：": "Repair aborted: ",
+  "修复警告：": "Repair warning: ",
+  "启动前整理会话归属并检查缺失消息；运行期间每 30 分钟复查索引。保存设置后生效。":
+    "Repair session ownership and check for missing messages before launch; recheck the index every 30 minutes while running. Save settings to apply.",
+  "自动检查需要 Codex++ 启动器运行，且自动修复开关已开启并保存；每次检查完成后间隔 30 分钟复查。此页面每 15 秒刷新报告，不会单独启动修复；再次检查不保证恢复。":
+    "Automatic checks require the Codex++ launcher to be running and automatic repair to be enabled and saved; checks repeat 30 minutes after the previous check finishes. This page refreshes the report every 15 seconds without starting a repair; another check does not guarantee recovery.",
+  "短暂等待最长 30 分钟；原文和记录文件都已超过 24 小时未更新的项目直接转入需核查。缺少对应轮次或结束状态，当前证据不足以安全补回；后续检查仍会核验。":
+    "Items wait for up to 30 minutes; when both the original message and its record file have been unchanged for more than 24 hours, the item goes directly to review. A missing native turn or completion state means there is insufficient evidence to safely restore it; later checks will still verify it.",
   "主导航": "Main navigation",
   "工作区": "Workspace",
   "扩展": "Extensions",
@@ -438,12 +457,55 @@ export const EN_PLAIN: Record<string, string> = {
     "When off, this tool won't write Codex's config.toml / auth.json on manual switches; it never auto-modifies these files when launching Codex.",
   "兼容增强": "Compatible enhancement",
   "内置": "Built-in",
+  "自定义": "Custom",
+  "已导入自定义元数据，生成时以该配置为准": "Custom metadata imported; this configuration takes precedence at generation",
+  "回退": "Fallback",
+  "重新匹配": "Re-match",
+  "清除": "Clear",
+  "按当前模型名重新匹配内置元数据并重填下方内容": "Re-match built-in metadata by the current model name and refill the content below",
+  "清空面板内容（不影响已保存的配置）": "Clear the panel content (the saved configuration is not affected)",
+  "请先填写模型名称": "Enter a model name first",
+  "当前模型名没有内置元数据可匹配": "The current model name has no built-in metadata to match",
+  "放弃本次在面板里的改动": "Discard the changes made in this panel",
+  "放弃本次在面板里的改动，不写入任何配置": "Discard the changes made in this panel; nothing is written to the configuration",
+  "保存当前内容为该模型的自定义配置": "Save the current content as this model's custom configuration",
+  "当前为内置元数据预览的修改版；保存后将成为该模型的自定义配置，生成时覆盖内置": "This is an edited version of the built-in preview; saving turns it into this model's custom configuration and overrides the built-in data at generation",
+  "内容与内置元数据一致，保存后改用内置元数据": "Identical to the built-in metadata; saving switches this model to the built-in data",
+  "保存后清除该模型的自定义配置，改用内置元数据": "Saving clears this model's custom configuration and switches to the built-in metadata",
+  "已在使用内置元数据，无需保存": "Already using the built-in metadata; nothing to save",
+  "没有可保存的内容": "There is nothing to save",
+  "恢复内置": "Restore built-in",
+  "当前为内置元数据预览；保存后将成为该模型的自定义配置，生成时覆盖内置": "Previewing built-in metadata; saving turns it into this model's custom configuration and overrides the built-in data at generation",
+  "内容与已保存的配置一致，无需再保存": "Identical to the saved configuration; no need to save again",
+  "JSON 无法解析，修复后即可保存": "JSON cannot be parsed; fix it to enable saving",
+  "上下文窗口与自动压缩值无效，无法同步模型配置。": "The context window or auto-compaction value is invalid, so the model configuration cannot be synchronized.",
+  "保存此模型": "Save this model",
+  "保存后清除该模型的自定义配置，生成时回退默认模板": "Saving clears this model's custom configuration; generation falls back to the default template",
+  "内容与内置元数据一致，保存后使用内置元数据": "Identical to the built-in metadata; saving switches this model to the built-in data",
+  "更新此模型配置": "Update this model's configuration",
+  "保存为自定义配置": "Save as custom configuration",
+  "已匹配内置元数据（{0}）；不导入时生成也会自动使用内置数据": "Matched built-in metadata ({0}); generation uses the built-in data automatically when you don't import",
+  "没有内置元数据可用，生成时回退 {0} 官方模板；可粘贴供应商 JSON 或手动编辑": "No built-in metadata available; generation falls back to the {0} official template. You can paste vendor JSON or edit by hand",
+  "没有内置元数据，生成时回退 {0} 官方模板；当前为自定义配置": "No built-in metadata; generation falls back to the {0} official template. This model currently uses a custom configuration",
+  "没有内置元数据可用，生成时回退 {0} 官方模板": "No built-in metadata available; generation falls back to the {0} official template",
+  "无内置元数据，生成时回退 {0}": "No built-in metadata; generation falls back to {0}",
+  "当前使用内置元数据（{0}）": "Currently using built-in metadata ({0})",
+  "当前使用自定义配置": "Currently using a custom configuration",
+  "窗口与压缩比随编辑实时生效，取消可撤销": "Window and compaction ratio apply as you edit; Cancel undoes them",
+  "保存后恢复内置": "Restores the built-in data after saving",
+  "保存后清除该模型的自定义配置，改用内置元数据（{0}）": "Saving clears this model's custom configuration and switches to the built-in metadata ({0})",
+  "保存后清除该模型的自定义配置，改用{0} 官方模板": "Saving clears this model's custom configuration and switches to the {0} official template",
+  "保存后：该模型改用这份自定义配置，覆盖当前自定义配置": "After saving: this model uses this custom configuration, replacing the current one",
+  "保存后：该模型改用这份自定义配置，覆盖内置（{0}）": "After saving: this model uses this custom configuration, overriding the built-in data ({0})",
+  "保存后：该模型改用这份自定义配置": "After saving: this model uses this custom configuration",
+  "窗口与压缩比已实时写回模型行；元数据保存后覆盖当前自定义配置": "Window and compaction ratio are written back to the model row as you edit; metadata replaces the current custom configuration after saving",
+  "窗口与压缩比已实时写回模型行；元数据保存后覆盖内置": "Window and compaction ratio are written back to the model row as you edit; metadata overrides the built-in data after saving",
   "内置、手动和市场安装脚本；可在这里启停或删除用户脚本": "Built-in, manual and marketplace-installed scripts; enable, disable or delete user scripts here",
   "内置和用户自定义脚本清单": "Built-in and user-defined script inventory",
   "切换 thread 时恢复上一次浏览位置。": "Restore the last scroll position when switching threads.",
   "切换中": "Switching",
   "切换主题": "Toggle theme",
-  "切换到此供应商时会写入 ~/.codex/auth.json": "Switching to this provider writes ~/.codex/auth.json",
+  "切换到此供应商时会写入 Codex 主目录的 auth.json": "Switching to this provider writes auth.json under the Codex home directory",
   "切换到此供应商时会写入的预览；上下文开关变化会立即反映": "Preview of what gets written when switching to this provider; context toggles are reflected immediately",
   "切换到中文": "Switch to Chinese",
   "切换到英文": "Switch to English",
@@ -469,9 +531,6 @@ export const EN_PLAIN: Record<string, string> = {
   "刷新本地": "Refresh local",
   "热重载脚本": "Reload scripts",
   "应用本地脚本及开关；旧脚本可能需要刷新 Codex 页面": "Apply local scripts and switches; legacy scripts may require refreshing the Codex page",
-  "部分脚本执行失败，请查看本地脚本状态。": "Some scripts failed. Check the local script status.",
-  "用户脚本已热重载。": "User scripts reloaded.",
-  "已请求刷新 Codex 页面以安全重载旧脚本。": "Refreshing the Codex page to safely reload legacy scripts.",
   "刷新项目": "Refresh projects",
   "加入当前工作区": "Add to current workspace",
   "包含版本、路径、设置和平台信息": "Includes version, paths, settings and platform info",
@@ -609,8 +668,8 @@ export const EN_PLAIN: Record<string, string> = {
   "当前为兼容增强模式，插件市场解锁不会启用；其他页面功能仍可用。":
     "Currently in compatible enhancement mode; plugin marketplace unlock is not enabled, but other page features still work.",
   "当前会话": "Current session",
-  "当前使用中：打开时从 ~/.codex/auth.json 回填，保存后会作为此供应商 auth 存档":
-    "Currently in use: backfilled from ~/.codex/auth.json when opened; saving stores it as this provider's auth archive",
+  "当前使用中：打开时从 Codex 主目录的 auth.json 回填，保存后会作为此供应商 auth 存档":
+    "Currently in use: backfilled from auth.json under the Codex home directory when opened; saving stores it as this provider's auth archive",
   "当前供应商 config.toml 里没有可提取的通用配置。": "The current provider's config.toml has no extractable common config.",
   "当前供应商切换后会写入的预览；上下文开关变化会立即反映": "Preview of what the current provider writes after switching; context toggles are reflected immediately",
   "当前供应商还没有完整 config.toml / API Key 存档。": "The current provider doesn't have a complete config.toml / API Key archive yet.",
@@ -789,8 +848,8 @@ export const EN_PLAIN: Record<string, string> = {
   "混入 API": "Mixed-in API",
   "混入 API KEY": "Mix in API KEY",
   "关闭官方低额度提示": "Hide official low-usage alert",
-  "只隐藏低额度和已用完提示，不改变发送限制。左下角账户菜单仍显示官方剩余额度。":
-    "Only hides low-usage and exhausted prompts. It does not change send restrictions. The account menu in Codex's lower-left corner still shows the official remaining quota.",
+  "关闭后仍可从 Codex 左下角账户菜单查看官方剩余额度。":
+    "When hidden, you can still view the official quota from the account menu in the lower-left corner of Codex.",
   "混入 API Key": "Mix in API Key",
   "添加供应商": "Add provider",
   "添加模型": "Add model",
@@ -1177,10 +1236,33 @@ export const EN_PLAIN: Record<string, string> = {
     "Custom headers apply to the connection test, the model list and proxied requests alike.",
   "Host、Content-Length 等传输头由协议层掌控，不能覆盖；配置 Authorization 时以它为准，不再注入 API Key。":
     "Transport headers such as Host and Content-Length are managed by the proxy and cannot be overridden. When Authorization is set here it takes precedence and the API key is not injected.",
+  "渠道保护": "Channel protection",
+  "仅作用于当前供应商；可降低共享渠道触发 429、500 或 RPM 限制的概率。":
+    "Applies only to the current provider; helps reduce the chance of hitting shared-channel 429, 500, or RPM limits.",
+  "启用错误冷却": "Enable error cooldown",
+  "命中下方状态码后，当前供应商暂停请求至少 30 秒并自动继续；最多自动重试 3 次，3 次仍失败则返回错误；上游 Retry-After 更长时优先使用上游时间。":
+    "After one of the status codes below is hit, requests for this provider pause for at least 30 seconds and then continue automatically; retry up to 3 times, return the error if all 3 retries fail; a longer upstream Retry-After takes precedence.",
+  "启用同渠道队列": "Enable per-provider queue",
+  "当前供应商的请求按顺序发送，并按每分钟上限预留请求次数。":
+    "Requests for this provider are sent in order, reserving capacity under the per-minute limit.",
+  "每分钟请求数": "Requests per minute",
+  "请填入供应商提供的最大RPM": "Enter the maximum RPM provided by the provider",
+  "触发冷却的状态码": "Cooldown-triggering status codes",
+  "输入状态码后回车": "Enter a status code and press Enter",
+  "默认状态码为 429 和 500；删除某个状态码即可停止该状态触发冷却。":
+    "The default status codes are 429 and 500; remove a status code to stop it from triggering cooldown.",
 };
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  // 模型元数据来源徽标（metadataSourceTags 下发，经 tf() 渲染，不能放 EN_PLAIN）
+  "匹配：{0}": "Matched: {0}",
+  "回退：{0}": "Fallback: {0}",
+  "内置元数据：{0}": "Built-in metadata: {0}",
+  "无内置元数据，生成时回退 {0} 官方模板": "No built-in metadata; generation falls back to the {0} official template",
+  "已导入自定义元数据，生成时覆盖内置（{0}）": "Custom metadata imported; overrides the built-in data ({0}) at generation",
+  "读取会话索引修复报告失败：{0}": "Failed to read the session index repair report: {0}",
+  "另有 {0} 条检查详情因报告上限未显示。": "{0} additional issue(s) are not shown because of the report limit.",
   "路由规则「{0}」的优先级必须是大于等于 0 的整数。":
     "Route rule \"{0}\" priority must be an integer greater than or equal to 0.",
   "路由规则「{0}」的目标供应商必须是聚合成员，请先将其勾选为成员。":
