@@ -897,7 +897,6 @@ type ScriptMarketItem = {
   tags: string[];
   homepage: string;
   script_url: string;
-  sha256: string;
   installed: boolean;
   installedVersion: string;
   updateAvailable: boolean;
@@ -1022,7 +1021,7 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "enhance", label: t("Codex增强"), icon: Hammer, tool: "codex" },
   { id: "dreamSkin", label: t("皮肤管理"), icon: Palette, tool: "codex" },
   { id: "zedRemote", label: t("Zed 远程项目"), icon: ExternalLink, tool: "codex" },
-  { id: "userScripts", label: t("脚本市场"), icon: FileCode2, tool: "codex" },
+  { id: "userScripts", label: t("拓展"), icon: FileCode2, tool: "codex" },
   { id: "recommendations", label: t("推荐内容"), icon: ExternalLink },
   { id: "maintenance", label: t("安装维护"), icon: Wrench, tool: "codex" },
   { id: "about", label: t("关于"), icon: Info },
@@ -1380,7 +1379,7 @@ export function App() {
     if (result) {
       setScriptMarket(result);
       setSettings((current) => (current ? { ...current, user_scripts: result.user_scripts } : current));
-      if (!silent || !isSuccessStatus(result.status)) showResultNotice(t("脚本市场"), result, { silentSuccess: true });
+      if (!silent || !isSuccessStatus(result.status)) showResultNotice(t("拓展"), result, { silentSuccess: true });
     }
   };
 
@@ -1398,7 +1397,7 @@ export function App() {
     if (result) {
       setSettings(result);
       setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
-      showResultNotice(t("本地脚本"), result);
+      showResultNotice(t("本地拓展"), result);
     }
   };
 
@@ -1407,7 +1406,7 @@ export function App() {
     if (result) {
       setScriptMarket(result);
       setSettings((current) => (current ? { ...current, user_scripts: result.user_scripts } : current));
-      showResultNotice(t("脚本市场"), result);
+      showResultNotice(t("拓展"), result);
     }
   };
 
@@ -1416,7 +1415,7 @@ export function App() {
     if (result) {
       setSettings(result);
       setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
-      showResultNotice(t("本地脚本"), result);
+      showResultNotice(t("本地拓展"), result);
       await refreshUserScriptInventory();
     }
   };
@@ -1424,12 +1423,12 @@ export function App() {
   const deleteUserScript = async (key: string) => {
     const script = settings?.user_scripts?.scripts?.find((item) => item.key === key);
     const name = script?.name || key;
-    if (!window.confirm(tf("删除脚本“{0}”？此操作会移除本地脚本文件。", [name]))) return;
+    if (!window.confirm(tf("删除拓展“{0}”？此操作会移除本地拓展文件。", [name]))) return;
     const result = await run(() => call<SettingsResult>("delete_user_script", { key }));
     if (result) {
       setSettings(result);
       setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
-      showResultNotice(t("本地脚本"), result);
+      showResultNotice(t("本地拓展"), result);
       await refreshUserScriptInventory();
     }
   };
@@ -4919,7 +4918,7 @@ function EnhanceScreen({
   return (
     <>
       <Panel className="enhance-panel">
-        <CardHead title={t("Codex增强")} detail={t("会话删除、导出和用户脚本等界面能力")} />
+        <CardHead title={t("Codex增强")} detail={t("会话删除、导出和用户拓展等界面能力")} />
         <CardContent className="enhance-content">
           <div className="enhance-control-deck">
             <section className="enhance-control-section">
@@ -6198,11 +6197,11 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
   return (
     <>
       <Panel>
-        <CardHead title={t("脚本市场")} detail={tf("{0} 个市场脚本，已安装 {1} 个，本地整体 {2}", [marketScripts.length, installedCount, inventory?.enabled === false ? t("关闭") : t("开启")])} />
+        <CardHead title={t("拓展")} detail={tf("{0} 个市场拓展，已安装 {1} 个，本地整体 {2}", [marketScripts.length, installedCount, inventory?.enabled === false ? t("关闭") : t("开启")])} />
         <CardContent>
           <div className="metric-list">
             <Metric label={t("市场状态")} value={market?.market.message ?? t("尚未刷新")} />
-            <Metric label={t("远程脚本")} value={tf("{0} 个", [marketScripts.length])} />
+            <Metric label={t("远程拓展")} value={tf("{0} 个", [marketScripts.length])} />
             <Metric label={t("已安装")} value={tf("{0} 个", [installedCount])} />
             <Metric label={t("本地整体")} value={inventory?.enabled === false ? t("关闭") : t("开启")} />
           </div>
@@ -6219,16 +6218,16 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
               <RefreshCw className="h-4 w-4" />
               {t("刷新本地")}
             </Button>
-            <Button onClick={() => void reload()} disabled={reloading} variant="secondary" title={t("应用本地脚本及开关；旧脚本可能需要刷新 Codex 页面")}>
+            <Button onClick={() => void reload()} disabled={reloading} variant="secondary" title={t("应用本地拓展及开关；旧拓展可能需要刷新 Codex 页面")}>
               <RefreshCw className={reloading ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
-              {t("热重载脚本")}
+              {t("热重载拓展")}
             </Button>
           </Toolbar>
         </CardContent>
       </Panel>
       <Panel>
         <CardHead
-          title={t("市场脚本")}
+          title={t("市场拓展")}
           detail={
             market?.market.updatedAt
               ? tf("清单更新时间：{0}，当前显示 {1} / {2}", [market.market.updatedAt, filteredMarketScripts.length, marketScripts.length])
@@ -6240,13 +6239,13 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
             <div className="script-market-search">
               <Search className="h-4 w-4" />
               <Input
-                aria-label={t("搜索市场脚本")}
+                aria-label={t("搜索市场拓展")}
                 onChange={(event) => setMarketSearch(event.currentTarget.value)}
                 placeholder={t("搜索名称、作者、描述或标签")}
                 value={marketSearch}
               />
             </div>
-            <div className="script-market-view-toggle" role="group" aria-label={t("脚本市场排版")}>
+            <div className="script-market-view-toggle" role="group" aria-label={t("拓展排版")}>
               <Button
                 aria-pressed={marketView === "grid"}
                 onClick={() => setMarketView("grid")}
@@ -6275,18 +6274,18 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
                 ))}
               </div>
             ) : (
-              <div className="empty">{t("没有匹配的市场脚本。")}</div>
+              <div className="empty">{t("没有匹配的市场拓展。")}</div>
             )
           ) : (
-            <div className="empty">{market?.status === "failed" ? market.message : t("点击刷新市场加载远程脚本。")}</div>
+            <div className="empty">{market?.status === "failed" ? market.message : t("点击刷新市场加载远程拓展。")}</div>
           )}
         </CardContent>
       </Panel>
       <Panel>
-        <CardHead title={t("本地脚本")} detail={t("内置、手动和市场安装脚本；可在这里启停或删除用户脚本")} />
+        <CardHead title={t("本地拓展")} detail={t("内置、手动和市场安装拓展；可在这里启停或删除用户拓展")} />
         <CardContent>
           <div className="table">
-            {scripts.length ? scripts.map((script) => <ScriptRow key={script.key} script={script} actions={actions} />) : <div className="empty">{t("未发现用户脚本。")}</div>}
+            {scripts.length ? scripts.map((script) => <ScriptRow key={script.key} script={script} actions={actions} />) : <div className="empty">{t("未发现用户拓展。")}</div>}
           </div>
         </CardContent>
       </Panel>
@@ -7662,7 +7661,7 @@ function RelayProfileDetail({
             type="button"
           >
             <Save className="h-4 w-4" />
-            {savingDraft ? t("保存中") : t("保存此模型")}
+            {savingDraft ? t("保存中") : t("保存供应商")}
           </Button>
         </div>
       </div>
@@ -7837,7 +7836,6 @@ function RelayProfileEditor({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeImportSlug, builtinMatchSlug, metadataImportTarget, importPrefillSource]);
 
-  const [metadataImportPreview, setMetadataImportPreview] = useState<ImportedModelMetadata | null>(null);
   const [channelStatusInput, setChannelStatusInput] = useState("");
   const modelSlugOriginsRef = useRef(modelWindowRows.map((row) => row.model.trim()));
   useEffect(() => {
@@ -8317,13 +8315,13 @@ function RelayProfileEditor({
           </div>
         ) : null}
         {!isAggregateRelayProfile(profile) ? (
-          <section className="relay-config-section relay-channel-protection">
-            <div className="relay-config-section-head">
+          <details className="relay-config-section relay-channel-protection">
+            <summary className="relay-config-section-head">
               <div>
                 <strong>{t("渠道保护")}</strong>
                 <span>{t("仅作用于当前供应商；可降低共享渠道触发 429、500 或 RPM 限制的概率。")}</span>
               </div>
-            </div>
+            </summary>
             <label className="switch-row compact">
               <input
                 checked={profile.rateLimitCooldownEnabled}
@@ -8399,7 +8397,7 @@ function RelayProfileEditor({
             <p className="field-hint">
               {t("默认状态码为 429 和 500；删除某个状态码即可停止该状态触发冷却。")}
             </p>
-          </section>
+          </details>
         ) : null}
         {profile.relayMode === "official" ? (
           <Field className="relay-field-official-key" label="API Key">
@@ -9815,49 +9813,51 @@ function RelayFileEditors({
           }}
         />
       </div>
-      <div className="relay-file-panel">
-        <div className="relay-file-head">
+      <details className="relay-file-panel relay-common-config-panel">
+        <summary className="relay-file-head relay-common-config-summary">
           <div>
             <strong>{t("通用配置文件")}</strong>
-            <span>{t("只保留非 MCP、插件的跨供应商配置；MCP&插件在独立页面管理。")}</span>
+            <span>{t("只保留非 MCP、插件的跨供应商配置；MCP&插件在独立页面管理。点此展开编辑。")}</span>
           </div>
-          <Button
-            onClick={async () => {
-              const extracted = await actions.extractRelayCommonConfig(profile.configContents || "");
-              if (!extracted) return;
-              const split = splitContextConfigText(extracted.commonConfigContents || "");
-              if (!split.common.trim() && !split.context.trim()) {
-                await actions.showMessage(t("通用配置文件"), t("当前供应商 config.toml 里没有可提取的通用配置。"), "failed");
-                return;
-              }
-              const promotedProfile = {
-                ...profile,
-                configContents: extracted.profileConfigContents,
-              };
-              const next = syncLegacyRelayFields({
-                ...form,
-                relayCommonConfigContents: split.common,
-                relayContextConfigContents: joinTomlSectionsRootFirst([form.relayContextConfigContents || "", split.context]),
-                relayProfiles: form.relayProfiles.map((item) => (item.id === profileId ? promotedProfile : item)),
-              });
-              onFormChange(next);
-              onProfileChange(promotedProfile);
-              await actions.saveSettingsValue(next, false);
-            }}
-            size="sm"
-            type="button"
-            variant="secondary"
-          >
-            <Download className="h-4 w-4" />
-            {t("提取当前供应商配置")}
-          </Button>
+        </summary>
+        <div className="relay-common-config-body">
+            <Button
+              onClick={async () => {
+                const extracted = await actions.extractRelayCommonConfig(profile.configContents || "");
+                if (!extracted) return;
+                const split = splitContextConfigText(extracted.commonConfigContents || "");
+                if (!split.common.trim() && !split.context.trim()) {
+                  await actions.showMessage(t("通用配置文件"), t("当前供应商 config.toml 里没有可提取的通用配置。"), "failed");
+                  return;
+                }
+                const promotedProfile = {
+                  ...profile,
+                  configContents: extracted.profileConfigContents,
+                };
+                const next = syncLegacyRelayFields({
+                  ...form,
+                  relayCommonConfigContents: split.common,
+                  relayContextConfigContents: joinTomlSectionsRootFirst([form.relayContextConfigContents || "", split.context]),
+                  relayProfiles: form.relayProfiles.map((item) => (item.id === profileId ? promotedProfile : item)),
+                });
+                onFormChange(next);
+                onProfileChange(promotedProfile);
+                await actions.saveSettingsValue(next, false);
+              }}
+              size="sm"
+              type="button"
+              variant="secondary"
+            >
+              <Download className="h-4 w-4" />
+              {t("提取当前供应商配置")}
+            </Button>
+          <SyncedTextarea
+            className="relay-file-textarea"
+            value={form.relayCommonConfigContents}
+            onValueChange={(value) => onFormChange({ ...form, relayCommonConfigContents: value })}
+          />
         </div>
-        <SyncedTextarea
-          className="relay-file-textarea"
-          value={form.relayCommonConfigContents}
-          onValueChange={(value) => onFormChange({ ...form, relayCommonConfigContents: value })}
-        />
-      </div>
+      </details>
       <div className="relay-file-panel">
         <div className="relay-file-head">
           <div>
@@ -9997,7 +9997,7 @@ function ModeSelector({ launchMode, actions }: { launchMode: LaunchMode; actions
         type="button"
       >
         <strong>{t("兼容增强")}</strong>
-        <span>{t("适合官方登录或官方混入 API Key；保留会话删除、导出和用户脚本，关闭插件市场相关增强。")}</span>
+        <span>{t("适合官方登录或官方混入 API Key；保留会话删除、导出和用户拓展，关闭插件市场相关增强。")}</span>
       </button>
       <button
         className={`mode-option ${launchMode === "patch" ? "active" : ""}`}
@@ -11026,10 +11026,10 @@ function routeSubtitle(route: Route) {
     context: t("独立管理 MCP 服务器与插件"),
     skills: t("从 GitHub 仓库安装 Skill 到 Codex"),
     weixin: t("通过个人微信连接本机 Codex 会话"),
-    enhance: t("会话删除、导出和脚本能力"),
+    enhance: t("会话删除、导出和拓展能力"),
     dreamSkin: t("Codex-Dream-Skin 风格主题和换图"),
     zedRemote: t("管理 Codex SSH 项目并加入 Zed workspace"),
-    userScripts: t("内置和用户自定义脚本清单"),
+    userScripts: t("内置和用户自定义拓展清单"),
     recommendations: t("普通推荐内容"),
     maintenance: t("入口安装、修复、Watcher 与手动启动"),
     about: t("版本信息、项目链接、GitHub Release 更新、日志与诊断"),

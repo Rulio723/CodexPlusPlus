@@ -273,6 +273,10 @@
         pointer-events: none;
       }
       .codex-delete-toast button { margin-left: 10px; pointer-events: auto; }
+      /* 拓展与内置提示共用的类型配色。不传 type 时保持上面的默认外观。 */
+      .codex-delete-toast[data-toast-type="success"] { border-color: var(--codex-plus-success, #2f9e63); }
+      .codex-delete-toast[data-toast-type="warn"] { border-color: var(--codex-plus-warn, #b7791f); }
+      .codex-delete-toast[data-toast-type="error"] { border-color: var(--codex-plus-error, #c53030); }
       .codex-delete-confirm-overlay {
         position: fixed;
         inset: 0;
@@ -1102,7 +1106,9 @@
       }
       .codex-plus-ad-text { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
       .codex-plus-ad-title { overflow: hidden; color: #f8fafc; font-size: 14px; font-weight: 600; line-height: 1.3; text-overflow: ellipsis; white-space: nowrap; }
-      .codex-plus-ad-description { overflow: hidden; color: #a1a1aa; font-size: 13px; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
+      /* 简介不再压成一行：卡片按内容撑高，最多 3 行，超出才省略。
+         nowrap 会让「提供 Claude 与 ...」这类较长简介只露前几个字。 */
+      .codex-plus-ad-description { display: -webkit-box; overflow: hidden; color: #a1a1aa; font-size: 13px; line-height: 1.4; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
       .codex-plus-ad-arrow { flex: 0 0 auto; width: 14px; height: 14px; margin-top: 2px; color: #71717a; }
       .codex-plus-ad-arrow svg { width: 14px; height: 14px; display: block; }
       .codex-plus-ad-card:hover .codex-plus-ad-arrow,

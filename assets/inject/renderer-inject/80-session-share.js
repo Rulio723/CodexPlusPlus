@@ -44,10 +44,59 @@
     }
   }
 
-  function showToast(message, undoToken) {
-    document.querySelectorAll(".codex-delete-toast").forEach((node) => node.remove());
+  /**
+   * 同一时间最多显示几条 toast。
+   *
+   * 原来是「新 toast 顶掉旧 toast」的单例语义。拓展也能弹 toast 之后，单例会让
+   * 第三方提示把「删除成功（可撤销）」这类关键反馈挤掉，所以改成有界队列：超出
+   * 上限时挤掉最旧的一条，而不是最关键的当前一条。
+   */
+  const codexPlusToastLimit = 3;
+  const codexPlusToastLifetimeMs = 10000;
+  const codexPlusToastGapPx = 48;
+
+  /**
+   * 按当前 DOM 顺序重排所有提示的纵向位置。
+   *
+   * 必须在每次「新增」和「移除」之后都调用：位置只在插入那一刻算的话，一旦有
+   * 人被挤掉或超时消失，剩下几条会停在自己的旧层号上，出现空档和重叠。
+   */
+  function layoutCodexPlusToasts() {
+    document.querySelectorAll(".codex-delete-toast").forEach((node, index) => {
+      node.style.bottom = `${18 + index * codexPlusToastGapPx}px`;
+    });
+  }
+
+  /** 移除一条提示并立刻重排剩下的。 */
+  function dismissCodexPlusToast(toast) {
+    toast.remove();
+    layoutCodexPlusToasts();
+  }
+
+  /**
+   * 显示一条提示。
+   *
+   * `options.type` 取 info / success / warn / error，对应 styles 里的四条配色；
+   * 不传则保持原先的默认外观。`options.undoToken` 会追加「撤销」按钮——这是
+   * 内部删除流程用的，拓展一般用不到。
+   */
+  function showToast(message, options = {}) {
+    // 兼容旧调用点：老签名是 showToast(message, undoToken)。第二个参数传字符串
+    // 时按 undoToken 处理，传对象时按新签名处理。
+    const settings = typeof options === "string" ? { undoToken: options } : (options || {});
+    const undoToken = settings.undoToken;
+    const type = typeof settings.type === "string" ? settings.type : "";
+    const live = document.querySelectorAll(".codex-delete-toast");
+    // 队列满时挤掉最旧的（DOM 顺序即插入顺序）。用 dismiss 而不是裸 remove，
+    // 它会顺带重排剩下几条的位置。
+    if (live.length >= codexPlusToastLimit) {
+      for (let index = 0; index <= live.length - codexPlusToastLimit; index += 1) {
+        dismissCodexPlusToast(live[index]);
+      }
+    }
     const toast = document.createElement("div");
     toast.className = "codex-delete-toast";
+    if (type) toast.dataset.toastType = type;
     toast.textContent = message;
     if (undoToken) {
       const undo = document.createElement("button");
@@ -59,12 +108,15 @@
           const refreshed = await refreshRecentConversationsForHost();
           if (!refreshed) window.location.reload();
         }
-        setTimeout(() => toast.remove(), 5000);
+        setTimeout(() => dismissCodexPlusToast(toast), 5000);
       });
       toast.appendChild(undo);
     }
     document.body.appendChild(toast);
-    setTimeout(() => toast.remove(), 10000);
+    // append 之后统一重排：此时这条才进入 DOM，索引才是它真实的层号。
+    layoutCodexPlusToasts();
+    setTimeout(() => dismissCodexPlusToast(toast), codexPlusToastLifetimeMs);
+    return () => dismissCodexPlusToast(toast);
   }
 
   function shareBase64Url(bytes) {

@@ -267,7 +267,7 @@
 
     const group = (title, entries, emptyText, count, headAction = "") => {
       // 只在「搜索无匹配」时省略分组；否则空分组要留着显示占位文案，
-      // 不然「正在读取脚本市场…」和加载失败提示都会被一起藏掉，面板全空。
+      // 不然「正在读取拓展…」和加载失败提示都会被一起藏掉，面板全空。
       if (!entries.length && searching) return "";
       const body = entries.length
         ? entries.map(itemHtml).join("")
@@ -287,8 +287,8 @@
     };
 
     const marketEmpty = loading
-      ? "正在读取脚本市场…"
-      : (codexPlusScriptMarket.message || "市场里没有可安装的脚本。");
+      ? "正在读取拓展…"
+      : (codexPlusScriptMarket.message || "市场里没有可安装的拓展。");
     const anyShown = shownInstalled.length || shownMarket.length;
     const hint = searching && !anyShown
       ? `<div class="codex-plus-page-nav-empty">没有匹配「${escapeHtml(codexPlusExtensionsQuery)}」的拓展。</div>`
@@ -300,9 +300,9 @@
           placeholder="搜索拓展" value="${escapeHtml(codexPlusExtensionsQuery)}" spellcheck="false" />
       </div>
       ${hint}
-      ${group("已安装", shownInstalled, codexPlusUserScriptsLoaded ? "未发现已安装的脚本。" : "正在读取用户脚本…", installed.length)}
+      ${group("已安装", shownInstalled, codexPlusUserScriptsLoaded ? "未发现已安装的拓展。" : "正在读取用户拓展…", installed.length)}
       ${group("市场", shownMarket, marketEmpty, market.length,
-        `<button type="button" class="codex-plus-page-nav-group-action" data-codex-market-refresh="true" title="刷新脚本市场">刷新</button>`)}
+        `<button type="button" class="codex-plus-page-nav-group-action" data-codex-market-refresh="true" title="刷新拓展">刷新</button>`)}
     `;
   }
 
@@ -560,7 +560,7 @@
         ...codexPlusScriptMarket,
         loaded: true,
         loading: false,
-        message: result?.message || "脚本市场加载失败",
+        message: result?.message || "拓展加载失败",
       };
     }
     if (codexPlusActiveEntry() === "extensions") refreshCodexPlusExtensionsView();
@@ -692,7 +692,7 @@
         ? `<img class="codex-plus-ad-icon" src="${escapeHtml(ad.image)}" alt="" loading="lazy" />`
         : `<span class="codex-plus-ad-icon codex-plus-ad-icon-fallback" aria-hidden="true">${escapeHtml(name.slice(0, 1))}</span>`;
       return `
-        <a class="codex-plus-ad-card" href="${escapeHtml(ad.url)}" target="_blank" rel="noreferrer" title="${escapeHtml(name)}">
+        <a class="codex-plus-ad-card" data-codex-plus-ad-url="${escapeHtml(ad.url)}" href="${escapeHtml(ad.url)}" rel="noreferrer" title="${escapeHtml(name)}">
           <span class="codex-plus-ad-main">
             ${icon}
             <span class="codex-plus-ad-text">
@@ -1115,11 +1115,11 @@
               <button type="button" class="codex-plus-toggle" data-codex-backend-setting="providerSyncEnabled"><span></span></button>
             </div>
             <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">页面增强模式</div><div class="codex-plus-row-description">${codexPlusBackendSettings.launchMode === "relay" ? "兼容增强：保留会话删除、导出和用户脚本，仅关闭插件市场相关增强。" : "完整增强：加载插件市场、会话管理等全部页面能力。"}</div></div>
+              <div><div class="codex-plus-row-title">页面增强模式</div><div class="codex-plus-row-description">${codexPlusBackendSettings.launchMode === "relay" ? "兼容增强：保留会话删除、导出和用户拓展，仅关闭插件市场相关增强。" : "完整增强：加载插件市场、会话管理等全部页面能力。"}</div></div>
               <button type="button" class="codex-plus-action-button" data-codex-open-manager="true">打开管理工具</button>
             </div>
             <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">打开 DevTools</div><div class="codex-plus-row-description">打开当前 Codex 页面开发者工具，方便查看用户脚本报错。</div></div>
+              <div><div class="codex-plus-row-title">打开 DevTools</div><div class="codex-plus-row-description">打开当前 Codex 页面开发者工具，方便查看用户拓展报错。</div></div>
               <button type="button" class="codex-plus-action-button" data-codex-open-devtools="true">打开 DevTools</button>
             </div>
             <div class="codex-plus-row">
@@ -1137,6 +1137,7 @@
               <div><div class="codex-plus-row-title">提出问题</div><div class="codex-plus-row-description">打开 GitHub Issues 反馈问题或建议。</div></div>
               <button type="button" class="codex-plus-issue-button" data-codex-plus-issue="true">提出问题</button>
             </div>
+            ${renderCodexPlusExtensionMenuRows()}
           </div>
           <div class="codex-plus-panel" data-codex-plus-panel="${codexPlusExtensionsTab}" hidden>
             <div class="codex-plus-extensions-detail" data-codex-plus-extensions-detail="true">${pageMode ? renderCodexPlusExtensionsDetail() : ""}</div>
@@ -1188,6 +1189,9 @@
     }, true);
     overlay.addEventListener("click", (event) => {
       const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+      // 拓展注册的菜单项。放在最前面是因为它的判定完全基于自己的 data 属性，
+      // 与下面那些内置分支不会重叠；万一将来重叠，也应当由拓展优先拿到。
+      if (handleCodexPlusExtensionMenuClick(target)) return;
       // 左面板的分组导航（仅拓展页有左面板）。
       const pageNav = target?.closest("[data-codex-plus-page-nav]");
       if (pageNav) {
@@ -1200,6 +1204,18 @@
       }
       if (target?.closest("[data-codex-open-manager]")) {
         openManagerFromCodex();
+        return;
+      }
+      // 推荐卡片用 window.open 而非原生 <a target="_blank">：Codex 是 Electron
+      // 应用，原生新窗口跳转在它的 webview 里不会交给系统浏览器（同页的
+      // Discord / Telegram / Issues 按钮也一律走 window.open）。
+      const adCard = target?.closest("[data-codex-plus-ad-url]");
+      if (adCard) {
+        const adUrl = adCard.getAttribute("data-codex-plus-ad-url") || "";
+        if (/^https?:\/\//i.test(adUrl)) {
+          event.preventDefault();
+          window.open(adUrl, "_blank", "noopener,noreferrer");
+        }
         return;
       }
       if (target?.closest("[data-codex-plus-discord]")) {
@@ -1520,6 +1536,9 @@
       rail.addEventListener("click", (event) => {
         const target = event.target instanceof Element ? event.target : event.target?.parentElement;
         if (target?.closest(`#${codexPlusRailNavId}, #${codexPlusRailExtensionsId}, #${codexPlusRailSponsorId}`)) return;
+        // 拓展入口的 id 是动态生成的，不在上面三个之内。不排除它，点拓展入口会被
+        // 当成「点了原生导航按钮」，刚打开的拓展页面立刻被关掉。
+        if (target?.closest(`[${codexPlusExtensionConstants.extensionAttribute}]`)) return;
         if (target?.closest("button, a")) closeCodexPlusPageAfterNativeNavigation();
       }, true);
     }
