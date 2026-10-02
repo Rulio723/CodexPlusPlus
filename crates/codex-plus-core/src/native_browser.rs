@@ -1,4 +1,4 @@
-//! Opt-in adaptation of a pinned native Edge/Chrome identification callback.
+//! Opt-in adaptation of a verified native Edge/Chrome identification callback.
 //! Does not implement browser execution, cloud identity or approval decisions.
 
 use std::collections::BTreeSet;
@@ -12,6 +12,9 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+
+#[path = "native_browser_contract.rs"]
+mod structural;
 
 const SERVICE: &str = "bin/node_modules/@oai/browser-desktop/scripts/browser-service.mjs";
 const ORIGINAL_SHA: &str = "3e6fd4a8cf09f57549d63f2c9cbfa2abf42f0a6b0c09c3d6605fe07c8ba09e4a";
@@ -55,6 +58,7 @@ struct RuntimeContract {
     files: Vec<(&'static str, FileCheck)>,
     /// 未知版本经结构校验后接受时置位，用于状态展示与诊断留痕。
     adaptive: bool,
+    binding: Option<structural::Binding>,
 }
 
 /// 新旧两代的共享组件清单：浏览器服务始终单独校验，其余在此登记。
@@ -64,6 +68,7 @@ impl RuntimeContract {
     fn pinned() -> Self {
         Self {
             service_sha: ORIGINAL_SHA.into(),
+            binding: None,
             files: vec![
                 ("bin/node_repl.exe", FileCheck::Known(NATIVE_SHA.into())),
                 (
@@ -92,6 +97,7 @@ impl RuntimeContract {
     fn current() -> Self {
         Self {
             service_sha: CURRENT_ORIGINAL_SHA.into(),
+            binding: None,
             files: vec![
                 (
                     "bin/node_repl.exe",
@@ -122,6 +128,7 @@ impl RuntimeContract {
     fn adapted(service_sha: String) -> Self {
         Self {
             service_sha,
+            binding: None,
             files: RUNTIME_FILES
                 .iter()
                 .map(|file| (*file, FileCheck::Structural))
@@ -182,6 +189,26 @@ impl std::fmt::Debug for ManifestVersion {
 fn parse_manifest(manifest: &[u8]) -> Result<ManifestVersion> {
     let value: Value = serde_json::from_slice(manifest)?;
     let object = value.as_object().context("Native runtime manifest is not an object")?;
+    // Desktop's generated manifests use archive identity, not package name/version.
+    if !object.contains_key("name") && !object.contains_key("version") {
+        let archive = value["runtime_archive_version"]
+            .as_str()
+            .context("Native runtime manifest is missing runtime_archive_version")?;
+        let (version, build) = archive
+            .split_once('/')
+            .context("Invalid runtime archive version")?;
+        ensure!(
+            !build.is_empty() && build.len() <= 128
+                && build.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+            "Invalid runtime archive build"
+        );
+        ensure!(
+            value["runtime_archive_name"].as_str()
+                == Some(format!("cua-node-{version}-{build}-windows-x64.zip").as_str()),
+            "Conflicting runtime archive identity"
+        );
+        return parse_version(version).context("Invalid runtime archive version");
+    }
     for required in ["name", "version"] {
         ensure!(
             object.get(required).is_some_and(|field| !field.is_null()),
@@ -266,6 +293,8 @@ struct Journal {
     candidate_sha: String,
     modified_secs: u64,
     modified_nanos: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binding: Option<structural::Binding>,
 }
 
 fn sha(bytes: &[u8]) -> String {
@@ -525,8 +554,10 @@ fn count_occurrences(text: &str, needle: &str) -> usize {
     text.match_indices(needle).count()
 }
 
-/// 参数契约只用于调用点对称；匹配与替换完全由源码结构决定（issue #2294）。
-fn transform_binding(source: &[u8], control: &Path, _contract: &RuntimeContract) -> Result<Vec<u8>> {
+fn transform_binding(source: &[u8], control: &Path, contract: &RuntimeContract) -> Result<Vec<u8>> {
+    if let Some(binding) = &contract.binding {
+        return binding.replace(source, control);
+    }
     let text = std::str::from_utf8(source)?;
     ensure!(
         !text.contains("cppNativeIdentificationReader"),
@@ -564,13 +595,15 @@ fn transform_binding(source: &[u8], control: &Path, _contract: &RuntimeContract)
     let rewritten = &output[..output.len() - HELPER.len() - 1];
     // 替换串里构造器用一次、policy 回调用一次、元数据回调用两次
     //（`()=>ze(...)` 的调用 + 传给 reader 的实参），所以只有后者 +1。
+    // The inserted JSON path is data, not another use of a minified identifier.
     for (name, added) in [
         (&binding.constructor, 0),
         (&binding.runtime_getter, 1),
         (&binding.policy, 0),
     ] {
         ensure!(
-            count_occurrences(rewritten, name) == count_occurrences(text, name) + added,
+            count_occurrences(rewritten, name)
+                == count_occurrences(text, name) + added + count_occurrences(&path, name),
             "Binding rewrite changed the {name} occurrence count"
         );
     }
@@ -735,11 +768,12 @@ fn prepare(paths: &BrowserPaths, key: &str, contract: &RuntimeContract) -> Resul
             .modified()?
             .duration_since(UNIX_EPOCH)?;
         let journal = Journal {
-            schema: 1,
+            schema: if contract.binding.is_some() { 2 } else { 1 },
             original_sha: contract.service_sha.clone(),
             candidate_sha: sha(&candidate),
             modified_secs: modified.as_secs(),
             modified_nanos: modified.subsec_nanos(),
+            binding: contract.binding.clone(),
         };
         // Durable original and journal precede any runtime write.
         atomic_write(&journal_path, &serde_json::to_vec(&journal)?)?;
@@ -778,12 +812,15 @@ fn recovery_material(paths: &BrowserPaths, key: &str) -> Result<(Journal, Vec<u8
         &dir.join(format!("candidate-{}.mjs", journal.candidate_sha)),
         MAX_SERVICE,
     )?;
+    let valid_schema = match (journal.schema, &journal.binding) {
+        (1, None) => true,
+        (2, Some(binding)) => {
+            binding.replace(&original, &paths.state_root.join("control.json"))? == candidate
+        }
+        _ => false,
+    };
     ensure!(
-        journal.schema == 1
-            // issue #2294：不再要求 original_sha 属于某个登记的哈希表——未登记版本的服务
-            // SHA 是现算的，禁用时的契约也未必是解析当前 runtime 得到的那个。
-            // 真正的约束是「日志里记的哈希必须等于备份文件的实际内容」，那条保持不变。
-            && sha(&original) == journal.original_sha
+        valid_schema && sha(&original) == journal.original_sha
             && journal.candidate_sha == sha(&candidate)
             && journal.modified_nanos < 1_000_000_000,
         "Recovery journal conflicts with verified content"
@@ -929,9 +966,19 @@ fn resolve_contract(paths: &BrowserPaths, key: &str) -> Result<RuntimeContract> 
     ensure!(key_valid(key), "Invalid runtime key");
     let runtime = paths.runtime_root.join(key);
     let manifest = read_regular(&runtime.join(MANIFEST), 1024 * 1024).context(MANIFEST)?;
-    let service_sha = sha(&read_regular(&runtime.join(SERVICE), MAX_SERVICE)?);
+    let source = if paths.state_root.join(key).join("journal.json").exists() {
+        recovery_material(paths, key)?.1
+    } else {
+        read_regular(&runtime.join(SERVICE), MAX_SERVICE)?
+    };
+    let service_sha = sha(&source);
     let contract = RuntimeContract::for_manifest(&manifest, &runtime, service_sha.clone())
         .context(MANIFEST)?;
+    let contract = if contract.adaptive {
+        structural::detect(paths, key)?
+    } else {
+        contract
+    };
     if !contract.adaptive {
         ensure!(
             contract.service_sha == service_sha,
@@ -1119,7 +1166,10 @@ pub fn wait_for_monitor_shutdown(timeout: Duration) -> Result<NativeBrowserShutd
     wait_for_monitor_shutdown_at(&paths, timeout)
 }
 
-fn wait_for_monitor_shutdown_at(paths: &BrowserPaths, timeout: Duration) -> Result<NativeBrowserShutdown> {
+fn wait_for_monitor_shutdown_at(
+    paths: &BrowserPaths,
+    timeout: Duration,
+) -> Result<NativeBrowserShutdown> {
     let path = paths.state_root.join("monitor.lock");
     let _guards = pin_parents(&path)?;
     let mut options = OpenOptions::new();
@@ -1147,15 +1197,25 @@ fn wait_for_monitor_shutdown_at(paths: &BrowserPaths, timeout: Duration) -> Resu
                 let mut bytes = Vec::new();
                 Read::by_ref(&mut file).take(1025).read_to_end(&mut bytes)?;
                 let receipt: MonitorReceipt = serde_json::from_slice(&bytes)?;
-                let receipt_is_valid = receipt.schema == 1
-                    && uuid::Uuid::parse_str(&receipt.generation).is_ok();
-                if receipt_is_valid && receipt.state == "restored" {
-                    return Ok(NativeBrowserShutdown::Ready);
-                }
-                if receipt_is_valid && receipt.state == "blocked" {
+                ensure!(
+                    receipt.schema == 1
+                        && uuid::Uuid::parse_str(&receipt.generation).is_ok()
+                        && matches!(receipt.state.as_str(), "active" | "blocked" | "restored"),
+                    "Invalid native browser cleanup receipt"
+                );
+                // A completed blocked recovery remains non-fatal upstream. A stale
+                // receipt is ready only when read-only disk verification succeeds.
+                let restored = verify_restored_state(paths);
+                if receipt.state == "blocked" && restored.is_err() {
                     return Ok(NativeBrowserShutdown::RestoreFailed);
                 }
-                anyhow::bail!("Native browser cleanup did not complete successfully");
+                restored.with_context(|| {
+                    format!(
+                        "Native browser cleanup is incomplete ({}); files were not overwritten",
+                        receipt.state
+                    )
+                })?;
+                return Ok(NativeBrowserShutdown::Ready);
             }
             Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
                 if std::time::Instant::now() >= deadline {
@@ -1487,9 +1547,14 @@ mod tests {
     #[test]
     fn newer_manifest_shape_is_accepted_and_enables_identification() {
         let temp = tempfile::tempdir().unwrap();
-        let (paths, _, service) = synthetic_with(&temp, "0.0.27");
+        let (paths, key) = structural::synthetic_runtime(&temp);
+        let contract = structural::detect_synthetic(&paths, key).unwrap();
+        let service = paths.runtime_root.join(key).join(SERVICE);
+        let dir = paths.codex_home.join("plugins/cache/openai-bundled/unified-computer-use/test");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".mcp.json"), serde_json::to_vec(&descriptor(&paths.runtime_root, key)).unwrap()).unwrap();
         let original = fs::read(&service).unwrap();
-        let status = reconcile(&paths, true).unwrap();
+        let status = reconcile_contract(&paths, true, &contract).unwrap();
         assert_eq!(status.state, "prepared", "{}", status.detail);
         let candidate = String::from_utf8(fs::read(&service).unwrap()).unwrap();
         assert!(candidate.contains("cppNativeIdentificationReader"), "{candidate}");
@@ -1550,6 +1615,10 @@ mod tests {
                 "版本 {version} 应被接受"
             );
         }
+        assert!(accepts(r#"{"runtime_archive_version":"0.0.27/20260927214556-b77d38801cca","runtime_archive_name":"cua-node-0.0.27-20260927214556-b77d38801cca-windows-x64.zip"}"#));
+        assert!(!accepts(r#"{"runtime_archive_version":"0.0.10/build","runtime_archive_name":"cua-node-0.0.10-build-windows-x64.zip"}"#));
+        assert!(!accepts(r#"{"runtime_archive_version":"0.0.27/build","runtime_archive_name":"cua-node-0.0.28-build-windows-x64.zip"}"#));
+        assert!(!accepts(r#"{"runtime_archive_version":"latest/build","runtime_archive_name":"cua-node-latest-build-windows-x64.zip"}"#));
     }
 
     #[test]
@@ -1590,6 +1659,25 @@ mod tests {
             plain_path(&root.join("a").join("..").join("b")).is_err(),
             "含 .. 的路径应被拒"
         );
+    }
+
+    #[test]
+    fn control_path_substrings_are_not_identifier_drift() {
+        let text = format!("fixture;{ANCHOR};original");
+        let contract = RuntimeContract {
+            service_sha: sha(text.as_bytes()),
+            files: vec![],
+            adaptive: false,
+            // 手工构造：本用例只验证控制文件路径不参与标识符漂移判定，
+            // 不经结构探测，故无 binding（issue #2378 新增字段）。
+            binding: None,
+        };
+        let output = transform(
+            text.as_bytes(), Path::new("C:/conflict/nf-ze-cD/control.json"), &contract,
+        ).unwrap();
+        let rewritten = String::from_utf8(output).unwrap();
+        assert!(rewritten.contains("C:/conflict/nf-ze-cD/control.json"));
+        assert!(rewritten.contains("cppNativeIdentificationReader(this.runtime,cD,ze,"));
     }
 
     #[test]
@@ -1913,6 +2001,7 @@ mod tests {
             service_sha: sha(original.as_bytes()),
             files: vec![("bin/node.exe", FileCheck::Known(sha(b"fixture-node")))],
             adaptive: false,
+            binding: None,
         };
         for file in RUNTIME_FILES {
             let path = paths.runtime_root.join(key).join(file);
@@ -1941,6 +2030,53 @@ mod tests {
 
     fn synthetic(temp: &tempfile::TempDir) -> (BrowserPaths, RuntimeContract, PathBuf) {
         synthetic_with(temp, "0.0.24")
+    }
+
+    #[test]
+    fn structural_journal_restores_without_a_runtime_or_current_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let (paths, mut contract, service) = synthetic(&temp);
+        let original = fs::read(&service).unwrap();
+        let text = std::str::from_utf8(&original).unwrap();
+        let start = text.rfind("cD)").unwrap();
+        contract.binding = Some(structural::Binding {
+            start, end: start + 2, policy: "cD".into(), metadata: "ze".into(),
+            contract_sha: "eae1b49427aebf3ed3d1119de1c303125c4f78b3b0ca644f055ed07ec2c2be30".into(),
+        });
+        let modified = fs::metadata(&service).unwrap().modified().unwrap();
+        reconcile_contract(&paths, true, &contract).unwrap();
+        let journal = paths.state_root.join("0123456789abcdef/journal.json");
+        let data: Value = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+        assert_eq!(data["schema"], 2);
+        fs::remove_file(paths.runtime_root.join("0123456789abcdef/bin/node.exe")).unwrap();
+        assert_eq!(reconcile(&paths, false).unwrap().state, "restored");
+        assert_eq!(fs::read(&service).unwrap(), original);
+        assert_eq!(fs::metadata(&service).unwrap().modified().unwrap(), modified);
+        // Hash-matching files alone do not authorize an altered transform record.
+        let mut bad = data;
+        bad["binding"]["metadata"] = json!("wrongMetadata");
+        fs::write(&journal, serde_json::to_vec(&bad).unwrap()).unwrap();
+        assert!(reconcile(&paths, false).is_err());
+        assert_eq!(fs::read(&service).unwrap(), original);
+    }
+
+    #[test]
+    fn structural_journal_refuses_external_changes_and_deleted_cache_resurrection() {
+        let temp = tempfile::tempdir().unwrap();
+        let (paths, mut contract, service) = synthetic(&temp);
+        let original = fs::read(&service).unwrap();
+        let start = std::str::from_utf8(&original).unwrap().rfind("cD)").unwrap();
+        contract.binding = Some(structural::Binding {
+            start, end: start + 2, policy: "cD".into(), metadata: "ze".into(),
+            contract_sha: "5bf64da3b8386af46a6fb2c2d8829a507130ba9896237a813b8e04c4ce8eb515".into(),
+        });
+        reconcile_contract(&paths, true, &contract).unwrap();
+        fs::write(&service, b"external edit").unwrap();
+        assert!(reconcile(&paths, false).is_err());
+        assert_eq!(fs::read(&service).unwrap(), b"external edit");
+        fs::remove_file(&service).unwrap();
+        reconcile(&paths, false).unwrap();
+        assert!(!service.exists());
     }
 
     #[test]
@@ -2147,7 +2283,7 @@ mod tests {
         let (paths, contract, service) = synthetic(&temp);
         let original = fs::read(&service).unwrap();
         let modified = fs::metadata(&service).unwrap().modified().unwrap();
-        let monitor = start_monitor_with_contract(paths.clone(), true, contract).await.unwrap();
+        let monitor = start_monitor_with_contract(paths.clone(), true, contract.clone()).await.unwrap();
         assert_ne!(fs::read(&service).unwrap(), original);
         monitor.stop().await;
         assert_eq!(sha(&fs::read(&service).unwrap()), sha(&original));
@@ -2258,7 +2394,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (paths, contract, service) = synthetic(&temp);
         let original = sha(&fs::read(&service).unwrap());
-        let monitor = start_monitor_with_contract(paths.clone(), true, contract).await.unwrap();
+        let monitor = start_monitor_with_contract(paths.clone(), true, contract.clone()).await.unwrap();
         let wait_paths = paths.clone();
         let waiter = tokio::task::spawn_blocking(move || {
             wait_for_monitor_shutdown_at(&wait_paths, Duration::from_secs(5)).unwrap();
@@ -2284,6 +2420,118 @@ mod tests {
         let error = reconcile_contract(&paths, true, &contract).unwrap_err();
         assert_eq!(error_status(&error).state, "runtime_unverified");
         assert_eq!(fs::read(&service).unwrap(), before);
+    }
+
+    // Only temporary Node runs our inspector; the supplied service and worker are not executed.
+    #[test]
+    #[ignore = "requires CPP_NATIVE_BROWSER_STRUCTURAL_FIXTURE; runs only our parser on a temp copy"]
+    fn structural_fixture_transaction_recovery_and_component_drift() {
+        let fixture = PathBuf::from(std::env::var_os("CPP_NATIVE_BROWSER_STRUCTURAL_FIXTURE").unwrap());
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(&temp);
+        let key = "0123456789abcdef";
+        let runtime = paths.runtime_root.join(key);
+        for file in [
+            SERVICE, "manifest.json", "bin/node.exe", "bin/node_repl.exe",
+            "bin/node_modules/@oai/cua-repl/bin/cua-repl.mjs",
+            "bin/node_modules/@oai/browser-desktop/package.json",
+        ] {
+            let target = runtime.join(file);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::copy(fixture.join(file), target).unwrap();
+        }
+        let dir = paths.codex_home.join("plugins/cache/openai-bundled/unified-computer-use/test");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".mcp.json"), serde_json::to_vec(&descriptor(&paths.runtime_root, key)).unwrap()).unwrap();
+        let service = runtime.join(SERVICE);
+        let original = fs::read(&service).unwrap();
+        let modified = fs::metadata(&service).unwrap().modified().unwrap();
+        assert_eq!(reconcile(&paths, true).unwrap().state, "prepared");
+        let candidate = fs::read(&service).unwrap();
+        assert_ne!(candidate, original);
+        assert_eq!(reconcile(&paths, true).unwrap().state, "prepared");
+        assert_eq!(fs::read(&service).unwrap(), candidate);
+        assert_eq!(reconcile(&paths, false).unwrap().state, "restored");
+        assert_eq!(fs::read(&service).unwrap(), original);
+        assert_eq!(fs::metadata(&service).unwrap().modified().unwrap(), modified);
+        // Parser-qualified snapshots are still exact transaction guards.
+        let contract = structural::detect(&paths, key).unwrap();
+        fs::write(runtime.join("bin/node_repl.exe"), b"external worker edit").unwrap();
+        assert!(prepare(&paths, key, &contract).is_err());
+        assert_eq!(fs::read(&service).unwrap(), original);
+        // Recovery does not need an executable or an intact generated descriptor.
+        fs::copy(fixture.join("bin/node_repl.exe"), runtime.join("bin/node_repl.exe")).unwrap();
+        reconcile(&paths, true).unwrap();
+        fs::remove_file(runtime.join("bin/node.exe")).unwrap();
+        fs::remove_file(dir.join(".mcp.json")).unwrap();
+        assert_eq!(reconcile(&paths, false).unwrap().state, "restored");
+        assert_eq!(fs::read(&service).unwrap(), original);
+    }
+    #[test]
+    fn stale_cleanup_receipt_is_checked_against_disk_without_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let (paths, contract, service) = synthetic(&temp);
+        reconcile_contract(&paths, true, &contract).unwrap();
+        reconcile_contract(&paths, false, &contract).unwrap();
+        let original = fs::read(&service).unwrap();
+        let control = fs::read(paths.state_root.join("control.json")).unwrap();
+        let mut owner = acquire_monitor_owner(&paths).unwrap();
+        let generation = uuid::Uuid::new_v4().to_string();
+        for state in ["active", "blocked", "restored"] {
+            write_monitor_receipt(&mut owner, &generation, state).unwrap();
+            FileExt::unlock(&owner).unwrap();
+            assert_eq!(
+                wait_for_monitor_shutdown_at(&paths, Duration::ZERO).unwrap(),
+                NativeBrowserShutdown::Ready
+            );
+            owner.try_lock_exclusive().unwrap();
+        }
+        write_monitor_receipt(&mut owner, &generation, "restored").unwrap();
+        drop(owner);
+        assert_eq!(fs::read(&service).unwrap(), original);
+        assert_eq!(fs::read(paths.state_root.join("control.json")).unwrap(), control);
+
+        fs::write(&service, b"external edit").unwrap();
+        for state in ["active", "restored"] {
+            let mut owner = acquire_monitor_owner(&paths).unwrap();
+            write_monitor_receipt(&mut owner, &generation, state).unwrap();
+            drop(owner);
+            assert!(wait_for_monitor_shutdown_at(&paths, Duration::ZERO).is_err());
+            assert_eq!(fs::read(&service).unwrap(), b"external edit");
+            assert_eq!(fs::read(paths.state_root.join("control.json")).unwrap(), control);
+        }
+    }
+
+    #[test]
+    fn blocked_cleanup_preserves_restore_failed_and_external_edits() {
+        let temp = tempfile::tempdir().unwrap();
+        let (paths, contract, service) = synthetic(&temp);
+        reconcile_contract(&paths, true, &contract).unwrap();
+        fs::write(&service, b"external edit").unwrap();
+        let control = fs::read(paths.state_root.join("control.json")).unwrap();
+        let mut owner = acquire_monitor_owner(&paths).unwrap();
+        write_monitor_receipt(&mut owner, &uuid::Uuid::new_v4().to_string(), "blocked").unwrap();
+        drop(owner);
+        assert_eq!(
+            wait_for_monitor_shutdown_at(&paths, Duration::ZERO).unwrap(),
+            NativeBrowserShutdown::RestoreFailed
+        );
+        assert_eq!(fs::read(&service).unwrap(), b"external edit");
+        assert_eq!(fs::read(paths.state_root.join("control.json")).unwrap(), control);
+    }
+
+    #[test]
+    fn unknown_cleanup_receipt_is_rejected_even_when_disk_is_restored() {
+        let temp = tempfile::tempdir().unwrap();
+        let (paths, contract, service) = synthetic(&temp);
+        reconcile_contract(&paths, true, &contract).unwrap();
+        reconcile_contract(&paths, false, &contract).unwrap();
+        let original = fs::read(&service).unwrap();
+        let mut owner = acquire_monitor_owner(&paths).unwrap();
+        write_monitor_receipt(&mut owner, &uuid::Uuid::new_v4().to_string(), "unknown").unwrap();
+        drop(owner);
+        assert!(wait_for_monitor_shutdown_at(&paths, Duration::ZERO).is_err());
+        assert_eq!(fs::read(&service).unwrap(), original);
     }
 
     // The proprietary runtime is supplied locally, never committed or executed by this test.
