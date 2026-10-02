@@ -27,12 +27,17 @@ const BRIDGE_HEALTH_FAILURE_THRESHOLD: u8 = 2;
 /// 改变了页面上下文），避免每 10~15 秒重发一次完整注入脚本（issue #2169）。
 const BRIDGE_REINJECT_BACKOFF_BASE_SECS: u64 = 10;
 const BRIDGE_REINJECT_BACKOFF_CAP_SECS: u64 = 300;
+/// 重注入后紧接着的那次健康检查必然通过（`lastInjectionAt` 还在 5 秒窗口内），
+/// 若一见健康就清零，退避会永远停在第一档、根本挡不住周期性重注入（issue #2330）。
+/// 必须持续健康满这么久才清零。
+const BRIDGE_REINJECT_BACKOFF_RESET_AFTER_SECS: u64 = 60;
 
-/// 看门狗内跟踪重注入退避状态；健康恢复或应用实例更换时重置。
+/// 看门狗内跟踪重注入退避状态；持续健康一段时间或应用实例更换时重置。
 #[derive(Debug, Default)]
 struct BridgeReinjectBackoff {
     consecutive_attempts: u32,
     next_allowed_at: Option<std::time::Instant>,
+    healthy_since: Option<std::time::Instant>,
 }
 
 fn reinject_backoff_delay(consecutive_attempts: u32) -> std::time::Duration {
@@ -60,6 +65,22 @@ impl BridgeReinjectBackoff {
     fn reset(&mut self) {
         self.consecutive_attempts = 0;
         self.next_allowed_at = None;
+        self.healthy_since = None;
+    }
+
+    /// 观测到一次健康：持续健康满 `BRIDGE_REINJECT_BACKOFF_RESET_AFTER_SECS` 才清零。
+    fn observe_healthy(&mut self, now: std::time::Instant) {
+        let since = *self.healthy_since.get_or_insert(now);
+        if now.saturating_duration_since(since)
+            >= std::time::Duration::from_secs(BRIDGE_REINJECT_BACKOFF_RESET_AFTER_SECS)
+        {
+            self.reset();
+        }
+    }
+
+    /// 观测到一次不健康：重新计时。
+    fn observe_unhealthy(&mut self) {
+        self.healthy_since = None;
     }
 }
 const MACOS_DEBUG_TAKEOVER_WAIT_MS: u64 = 5_000;
@@ -1027,6 +1048,15 @@ impl LaunchHooks for DefaultLaunchHooks {
                                 "error": error.to_string()
                             }),
                         );
+                        // 提权进程激活打包应用必然失败，按路径启动的进程会因缺少
+                        // 包身份立即退出、注入也必然失败；此时必须如实失败并给出
+                        // 指引，而不是静默回退导致 latest-status.json 误报 running
+                        // （issue #2351）。
+                        if let Some(reason) = packaged_activation_fallback_block_reason(
+                            crate::windows_integration::current_process_is_elevated(),
+                        ) {
+                            anyhow::bail!("{reason}（激活错误：{error}）");
+                        }
                     }
                 }
             }
@@ -2860,9 +2890,11 @@ async fn check_and_reinject_bridge_inner(
         }
     };
     match healthy {
-        // 健康恢复或探测不确定时清掉退避；失效计数由 should_reinject_* 统一管理。
-        Some(true) | None => backoff.reset(),
-        Some(false) => {}
+        // 持续健康一段时间才清掉退避（见 BRIDGE_REINJECT_BACKOFF_RESET_AFTER_SECS）；
+        // 探测不确定时不改变退避状态。失效计数由 should_reinject_* 统一管理。
+        Some(true) => backoff.observe_healthy(std::time::Instant::now()),
+        None => {}
+        Some(false) => backoff.observe_unhealthy(),
     }
     if !should_reinject_after_health_result(healthy, browser_identity_changed, health_failures) {
         return false;
@@ -3471,6 +3503,29 @@ pub async fn activate_packaged_app(
     anyhow::bail!("Packaged app activation is only supported on Windows")
 }
 
+/// 提权运行时禁止「AUMID 激活失败 → 按路径直接启动」回退的原因；
+/// 非提权返回 None 以保留回退（兜底清单 Application Id 变化等场景）。
+///
+/// 提权进程无法激活 MSIX 打包应用，按路径启动的进程会因缺少包身份
+/// （APPMODEL_ERROR_NO_PACKAGE）立即退出，注入也必然失败；此时必须如实失败
+/// 并给出指引，而不是静默回退导致 latest-status.json 误报 running（issue #2351）。
+///
+/// 不加 `#[cfg(windows)]`：调用点在 `if cfg!(windows)` 的运行时分支里，
+/// 全平台都要编译到这个函数（纯逻辑，无平台依赖）。
+fn packaged_activation_fallback_block_reason(is_elevated: bool) -> Option<&'static str> {
+    if is_elevated {
+        Some(
+            "Codex 打包应用激活失败，且 Codex++ 当前以管理员（提权）身份运行：\
+             Windows 不允许提权进程激活 MSIX 打包应用，按路径启动的进程会因缺少\
+             包身份立即退出。请取消可执行文件「属性 → 兼容性 → 以管理员身份运行\
+             此程序」的勾选（或清除 AppCompatFlags\\Layers 中的 RUNASADMIN 标记），\
+             然后以普通权限重新启动 Codex++",
+        )
+    } else {
+        None
+    }
+}
+
 #[cfg(windows)]
 pub async fn activate_packaged_app(
     app_user_model_id: &str,
@@ -3527,6 +3582,22 @@ fn activate_packaged_app_blocking(app_user_model_id: &str, arguments: &str) -> a
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    // 提权分支依赖 issue #2351 的手动复现步骤验收（勾选兼容性「以管理员身份运行」
+    // 后应得到指引错误）。这里不断言当前进程的提权状态：GitHub 的 Windows runner
+    // 本身就以提权令牌运行，断言「CI shell 非提权」必然失败。
+    #[test]
+    fn elevated_activation_failure_blocks_path_fallback_with_guidance() {
+        let reason = packaged_activation_fallback_block_reason(true)
+            .expect("elevated activation failure must block the path fallback");
+        assert!(reason.contains("管理员"));
+        assert!(reason.contains("以普通权限"));
+    }
+
+    #[test]
+    fn unelevated_activation_failure_keeps_path_fallback() {
+        assert!(packaged_activation_fallback_block_reason(false).is_none());
+    }
 
     fn counted_reinjector(calls: Arc<AtomicUsize>) -> BridgeReinjector {
         Arc::new(move || {
@@ -3632,6 +3703,39 @@ mod tests {
         backoff.reset();
         assert_eq!(backoff.consecutive_attempts, 0);
         assert!(backoff.ready(now), "健康恢复后应立即允许重注入");
+    }
+
+    #[test]
+    fn reinject_backoff_resets_only_after_sustained_health() {
+        let now = std::time::Instant::now();
+        let reset_after =
+            std::time::Duration::from_secs(BRIDGE_REINJECT_BACKOFF_RESET_AFTER_SECS);
+        let mut backoff = BridgeReinjectBackoff::default();
+
+        backoff.record_attempt(now);
+        backoff.observe_healthy(now + std::time::Duration::from_secs(1));
+        assert_eq!(
+            backoff.consecutive_attempts, 1,
+            "注入后立刻健康不应清零退避，否则退避永远停在第一档"
+        );
+
+        backoff.observe_healthy(now + std::time::Duration::from_secs(30));
+        assert_eq!(backoff.consecutive_attempts, 1, "未满阈值不应清零");
+
+        // 中途出现一次不健康，重新计时。
+        backoff.observe_unhealthy();
+        let restart = now + std::time::Duration::from_secs(40);
+        backoff.observe_healthy(restart);
+        backoff.observe_healthy(now + std::time::Duration::from_secs(1) + reset_after);
+        assert_eq!(
+            backoff.consecutive_attempts, 1,
+            "不健康之后必须从新起点重新计时"
+        );
+
+        backoff.observe_healthy(restart + reset_after);
+        assert_eq!(backoff.consecutive_attempts, 0, "持续健康满阈值后应清零");
+        assert!(backoff.healthy_since.is_none());
+        assert!(backoff.ready(restart + reset_after));
     }
 
     #[test]

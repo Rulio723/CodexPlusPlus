@@ -246,7 +246,11 @@ pub fn responses_to_chat_completions_with_options(
     if let Some(input) = body.get("input") {
         append_responses_input(input, &mut messages);
     }
+    // 必须在 enforce_tool_call_pairing 之前：配对一旦被错误摘除就无法恢复。
+    relocate_interleaved_non_tool_messages(&mut messages);
     enforce_tool_call_pairing(&mut messages);
+    // 配对判定之后仍有无主 tool 消息（上游会直接 400），降级成 user 保住内容。
+    degrade_unpaired_tool_messages(&mut messages);
     // 必须在 enforce_tool_call_pairing 之后：它依赖 tool 消息的连续性，
     // 而这一步会往中间插入 user 消息。
     relocate_tool_output_images(&mut messages);
@@ -3374,6 +3378,114 @@ fn orphan_tool_output_message(call_id: &str, output: &Value) -> Value {
 ///
 /// 这里把没有配对 output 的 tool_call 从消息里摘掉，降级成文本保留在历史中，
 /// 避免丢失「模型曾试图调用某工具」这一信息。
+/// 把插在「连续 tool 结果」之间的非 tool 消息整体搬到该 tool 区之后
+/// （issue #2275 / #2257）。
+///
+/// 上游 codex 会把 `<image_resize_notice>` 这类提示以 developer（映射成 system）
+/// 或 user 消息的形式插在两条 tool 结果之间，形成夹心结构：
+/// `assistant(tool_calls=[a,b]) → tool(a) → developer → tool(b)`。
+/// `enforce_tool_call_pairing` 用 `take_while` 只收集「role 连续为 tool」的后续消息，
+/// 数到夹心就停，于是 followers 只有 1 条、`b` 被误判 orphaned 并从 `tool_calls`
+/// 摘掉，但 `b` 的 tool 消息还留在原地 —— 这正是「role 'tool' 无前置 tool_calls」
+/// 与「No tool output found for tool call」的来源。
+///
+/// 这里在配对判定**之前**把夹心消息移到 tool 区之后，使 tool 结果重新连续。
+/// system 形态的夹心会被后续的 `collapse_system_messages_to_head` 带到头部（合法），
+/// user 形态的则留在 tool 区之后（同样合法）。
+fn relocate_interleaved_non_tool_messages(messages: &mut Vec<Value>) {
+    let mut index = 0;
+    while index < messages.len() {
+        let Some(tool_calls) = messages[index].get("tool_calls").and_then(Value::as_array) else {
+            index += 1;
+            continue;
+        };
+        let mut unanswered: BTreeSet<String> = tool_calls
+            .iter()
+            .filter_map(|tool_call| tool_call.get("id").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect();
+        if unanswered.is_empty() {
+            index += 1;
+            continue;
+        }
+
+        // 从本条 assistant 往后扫，收集本轮的所有 tool 结果与夹在其中的非 tool 消息，
+        // 直到 tool_call 集合配齐、撞上下一条 assistant（新轮次，不能越界）、或到底。
+        let mut tool_messages: Vec<Value> = Vec::new();
+        let mut interleaved: Vec<Value> = Vec::new();
+        let mut scan = index + 1;
+        while scan < messages.len() {
+            let role = messages[scan].get("role").and_then(Value::as_str);
+            if role == Some("assistant") {
+                break;
+            }
+            if role == Some("tool") {
+                if let Some(id) = messages[scan].get("tool_call_id").and_then(Value::as_str) {
+                    unanswered.remove(id);
+                }
+                tool_messages.push(messages[scan].clone());
+            } else if !tool_messages.is_empty() {
+                // 只有已经收到过 tool 结果之后的夹心才值得搬：
+                // 本条 assistant 尚未收到任何结果时，中间的消息是正常历史，不是夹心。
+                interleaved.push(messages[scan].clone());
+            }
+            scan += 1;
+            if unanswered.is_empty() {
+                break;
+            }
+        }
+
+        if interleaved.is_empty() {
+            index += 1;
+            continue;
+        }
+
+        // 重建这段区间：tool 结果。配齐时）在前、夹心消息在后。
+        let rebuilt: Vec<Value> = tool_messages.into_iter().chain(interleaved).collect();
+        let rebuilt_len = rebuilt.len();
+        messages.splice(index + 1..scan, rebuilt);
+        // 跳过刚重建的区间，避免在搬动过的消息上重复扫描导致死循环。
+        index += 1 + rebuilt_len;
+    }
+}
+
+/// 把没有前置 `tool_calls` 的 tool 消息降级成 user（issue #2275 / #2257 的防线）。
+///
+/// `enforce_tool_call_pairing` 目前只清理 assistant 侧（把 orphaned 的 tool_call
+/// 从 `tool_calls` 摘掉），被摘掉的那些 tool 消息本身仍留在原位，上游会直接
+/// 400「No tool output found for tool call」。这里把它们降级成 user，保住内容
+/// 且不再触发协议错误。
+fn degrade_unpaired_tool_messages(messages: &mut [Value]) {
+    let mut known: BTreeSet<String> = BTreeSet::new();
+    for message in messages.iter() {
+        if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+            for tool_call in tool_calls {
+                if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
+                    known.insert(id.to_string());
+                }
+            }
+        }
+    }
+
+    for message in messages.iter_mut() {
+        if message.get("role").and_then(Value::as_str) != Some("tool") {
+            continue;
+        }
+        let paired = message
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| known.contains(id));
+        if paired {
+            continue;
+        }
+        let content = message.get("content").cloned().unwrap_or(Value::Null);
+        *message = json!({
+            "role": "user",
+            "content": content
+        });
+    }
+}
+
 fn enforce_tool_call_pairing(messages: &mut [Value]) {
     let mut index = 0;
     while index < messages.len() {
@@ -3648,6 +3760,19 @@ fn flush_tool_calls(
     if let Some(last) = messages.last_mut() {
         if last.get("role").and_then(Value::as_str) == Some("assistant") {
             merge_tool_calls_into_message(last, std::mem::take(pending_tool_calls));
+            // 合并路径同样要消费 pending_reasoning（issue #2210）。
+            // 触发时序：reasoning item → 不带 tool_calls 的 assistant 文本消息
+            // （pending_tool_calls 为空，reasoning 被附加到该文本消息并 take）→
+            // function_call。此时最后一条已是 assistant，走本分支提前 return，
+            // 若这里不追加，随后的 reasoning 就随函数返回被静默丢弃；
+            // 而 ensure_tool_call_reasoning_content 只补 content 与
+            // reasoning_content 同时为空的占位，content 非空时补不上。
+            if !pending_reasoning.is_empty() {
+                append_reasoning_to_assistant_message(
+                    last,
+                    &std::mem::take(pending_reasoning).join("\n"),
+                );
+            }
             return;
         }
     }
@@ -4191,7 +4316,187 @@ fn normalize_chat_tool_parameters(parameters: &Value) -> Value {
             normalized["required"] = json!([]);
         }
     }
-    inline_ref_siblings(&normalized)
+    let normalized = inline_ref_siblings(&normalized);
+    // 必须先内联再摊平：合并分支时 $defs 已摊开才拿得到真实属性（issue #2367）。
+    flatten_top_level_combinators(normalized)
+}
+
+/// JSON Schema 的顶层组合器（`oneOf` / `anyOf` / `allOf`）。
+const SCHEMA_COMBINATOR_KEYS: [&str; 3] = ["oneOf", "anyOf", "allOf"];
+
+/// 摊平工具 schema **顶层**的组合器（issue #2367）。
+///
+/// zod-to-json-schema 会生成形如
+/// `{type:"object", properties:{}, oneOf:[{$ref:"#/$defs/__schema0"},…], $defs:{…}}`
+/// 的 schema。部分上游（Anthropic 系）拒绝顶层 `oneOf`，直接整轮 400、模型完全不可用。
+/// 全仓原本对 `oneOf` 零处理。
+///
+/// 策略（保守优先，绝不让整轮失败）：
+/// 1. 顶层有组合器时，逐分支归一化后再摊平；
+/// 2. `properties` 取各分支并集，同名属性都是 object 时递归合并其 properties；
+///    `required` 取交集（只有所有分支都要求才算必须）；
+/// 3. 剥掉组合器键，补回 `type:"object"`；
+/// 4. 无法摊平（分支不是对象、合并后 properties 为空）时把各分支塞进一个带
+///    description 的私有字段，保住信息且 schema 仍合法；
+/// 5. 结果仍不是合法对象 schema 时原样返回——宁可交给上游判断，也不静默丢掉工具。
+fn flatten_top_level_combinators(schema: Value) -> Value {
+    let Some(object) = schema.as_object() else {
+        return schema;
+    };
+    let Some((key, branches)) = SCHEMA_COMBINATOR_KEYS
+        .iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_array).map(|a| (*key, a)))
+    else {
+        return schema;
+    };
+    if branches.is_empty() {
+        return schema;
+    }
+
+    // 分支常是裸 `$ref`（`{ "$ref": "#/$defs/__schema0" }`），它自己不带 `$defs`，
+    // 所以必须拿**父级**的 $defs 来解析——只对分支单独调 inline_ref_siblings
+    // 永远解析不出来（实测：分支落进降级路径，properties 为空）。
+    let defs = object.get("$defs").and_then(Value::as_object);
+
+    let mut properties = Map::new();
+    let mut required: Option<BTreeSet<String>> = None;
+    let mut flattenable = true;
+
+    for branch in branches {
+        let normalized = match resolve_local_definition(
+            branch
+                .get("$ref")
+                .and_then(Value::as_str)
+                .and_then(local_definition_name)
+                .unwrap_or(""),
+            defs,
+            &mut Vec::new(),
+        ) {
+            // 分支是裸 $ref：用父级 $defs 解析出真实 schema。
+            Ok(Some(resolved)) if branch.as_object().is_some_and(|o| o.len() == 1) => {
+                normalize_schema_value(&resolved, defs, &mut Vec::new()).unwrap_or(resolved)
+            }
+            _ => inline_ref_siblings(branch),
+        };
+        let Some(branch_object) = normalized.as_object() else {
+            flattenable = false;
+            break;
+        };
+        let branch_properties = branch_object.get("properties").and_then(Value::as_object);
+        let branch_required: BTreeSet<String> = branch_object
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // 分支没有 properties 时（例如 type:"string"）无法并入对象 schema。
+        if branch_properties.is_none() && !branch_required.is_empty() {
+            flattenable = false;
+            break;
+        }
+        for (name, value) in branch_properties.into_iter().flatten() {
+            merge_schema_property(&mut properties, name, value);
+        }
+        required = Some(match required {
+            None => branch_required,
+            Some(current) => current.intersection(&branch_required).cloned().collect(),
+        });
+    }
+
+    if !flattenable || properties.is_empty() {
+        // 降级：把分支原样塞进一个带说明的字段，schema 依然合法。
+        let mut fallback = object.clone();
+        fallback.insert(
+            "type".to_string(),
+            json!("object"),
+        );
+        fallback.insert("properties".to_string(), json!({}));
+        let mut description: Vec<String> = Vec::new();
+        for branch in branches {
+            if let Some(text) = branch.get("description").and_then(Value::as_str) {
+                if !text.trim().is_empty() {
+                    description.push(text.trim().to_string());
+                }
+            }
+        }
+        fallback.insert(
+            "x-merged-combinator".to_string(),
+            json!({
+                "kind": key,
+                "branches": branches,
+                "description": description.join("\n")
+            }),
+        );
+        for combinator in SCHEMA_COMBINATOR_KEYS {
+            fallback.remove(combinator);
+        }
+        return Value::Object(fallback);
+    }
+
+    let mut flattened = object.clone();
+    for combinator in SCHEMA_COMBINATOR_KEYS {
+        flattened.remove(combinator);
+    }
+    flattened.insert("type".to_string(), json!("object"));
+    flattened.insert("properties".to_string(), Value::Object(properties));
+    flattened.insert(
+        "required".to_string(),
+        json!(required
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>()),
+    );
+    Value::Object(flattened)
+}
+
+/// 把分支属性并入目标 properties；同名且两侧都是 object schema 时递归合并
+/// （properties 并集、required 取交集），否则保留先到的一方（非破坏性）。
+fn merge_schema_property(properties: &mut Map<String, Value>, name: &str, value: &Value) {
+    let Some(existing) = properties.get_mut(name) else {
+        properties.insert(name.to_string(), value.clone());
+        return;
+    };
+    let (Some(left), Some(right)) = (existing.as_object(), value.as_object()) else {
+        return;
+    };
+    if left.get("properties").is_none() || right.get("properties").is_none() {
+        return;
+    }
+    let mut merged = left.clone();
+    let mut merged_properties = left
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for (child_name, child_value) in right.get("properties").and_then(Value::as_object).into_iter().flatten() {
+        merge_schema_property(&mut merged_properties, child_name, child_value);
+    }
+    merged.insert("properties".to_string(), Value::Object(merged_properties));
+
+    let left_required: BTreeSet<String> = left
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default();
+    let right_required: BTreeSet<String> = right
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default();
+    merged.insert(
+        "required".to_string(),
+        json!(left_required
+            .intersection(&right_required)
+            .cloned()
+            .collect::<Vec<_>>()),
+    );
+    *existing = Value::Object(merged);
 }
 
 fn inline_ref_siblings(root: &Value) -> Value {

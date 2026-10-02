@@ -412,7 +412,7 @@
   const styleId = "codex-delete-style";
   // 改 10-style.js 里的任何 CSS 都要把它 +1：installStyle 靠这个版本号判断
   // 页面里已有的 <style> 是否过期，不升的话新样式在旧标签存在时会被直接跳过。
-  const codexDeleteStyleVersion = "23";
+  const codexDeleteStyleVersion = "25";
   const codexPlusMenuId = "codex-plus-menu";
   const codexPlusMenuFloatingClass = "codex-plus-menu-floating";
   const codexPlusSidebarNavId = "codex-plus-sidebar-nav";
@@ -495,7 +495,7 @@
   const codexAppServerClientCaptureMarker = "AppServerRequestClient is missing a message dispatcher";
   const codexAppServerClientCaptureAnchor = "async sendRequest(";
   const codexRemoteSessionRecoveryVersion = "5";
-  const codexPluginMarketplaceUnlockVersion = "15";
+  const codexPluginMarketplaceUnlockVersion = "16";
   const codexThreadScrollMaxEntries = 120;
   const codexThreadScrollSaveThrottleMs = 120;
   const codexThreadScrollRestoreWindowMs = 3200;
@@ -605,6 +605,11 @@
     disabledInstallButton: 'button:disabled, button[aria-disabled="true"], [role="button"][aria-disabled="true"], button[data-disabled], [role="button"][data-disabled], button.cursor-not-allowed, [role="button"].cursor-not-allowed, button.pointer-events-none, [role="button"].pointer-events-none',
     pluginNavButton: 'nav[role="navigation"] button.h-token-nav-row.w-full',
     pluginSvgPath: 'svg path[d^="M7.94562 14.0277"]',
+    // 会话视图对齐的目标锚点。全部走 data-* / 结构性写法，不绑 Codex 的哈希类名，
+    // 见 90-action-groups.js 的候选链说明（issue #2258）。
+    conversationViewScrollContainer: ".thread-scroll-container",
+    conversationViewContentAnchor: "[data-thread-user-message-navigation-content]",
+    conversationViewFooter: "[data-thread-scroll-footer]",
   };
   const headerContextButtonClass = "border-token-border user-select-none no-drag cursor-interaction flex items-center gap-1 border whitespace-nowrap focus:outline-none disabled:cursor-not-allowed disabled:opacity-40 rounded-lg border-token-border text-token-button-tertiary-foreground bg-token-bg-fog enabled:hover:bg-token-list-hover-background data-[state=open]:bg-token-list-hover-background border h-token-button-composer px-2 py-0 text-base leading-[18px]";
 
@@ -815,7 +820,7 @@
         border: 0;
         border-radius: 6px;
         background: transparent;
-        color: var(--codex-session-action-color, var(--token-text-tertiary, rgba(255,255,255,.5)));
+        color: var(--codex-session-action-color, var(--color-token-text-tertiary, var(--codex-plus-text-tertiary, rgba(255,255,255,.5))));
         font: 14px/1 system-ui, sans-serif;
         padding: 0;
         cursor: default;
@@ -829,7 +834,7 @@
       .${actionButtonClass}:hover,
       .${actionButtonClass}:focus-visible {
         background: var(--codex-session-action-hover-background, transparent);
-        color: var(--codex-session-action-hover-color, var(--codex-session-action-color, var(--token-text-default, #f4f4f5)));
+        color: var(--codex-session-action-hover-color, var(--codex-session-action-color, var(--color-token-text-primary, #f4f4f5)));
         outline: none;
       }
       .${moreMenuClass} {
@@ -878,7 +883,7 @@
         align-items: center;
         max-width: 152px;
         margin-right: 8px;
-        color: var(--text-secondary, var(--token-text-secondary, rgba(142,142,160,.95)));
+        color: var(--text-secondary, var(--color-token-text-secondary, var(--codex-plus-text-secondary, rgba(142,142,160,.95))));
         font: 11px/1.1 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
         letter-spacing: .01em;
         opacity: .9;
@@ -897,10 +902,10 @@
         min-width: 0;
       }
       .codex-archive-row-button {
-        border: 1px solid var(--color-token-border-light, var(--token-border, rgba(0,0,0,.12)));
+        border: 1px solid var(--color-token-border-light, var(--color-token-border-default, rgba(0,0,0,.12)));
         border-radius: var(--border-radius-sm, 6px);
-        background: var(--color-token-bg-secondary, var(--token-bg-fog, transparent));
-        color: var(--color-token-text-secondary, var(--token-text-secondary, inherit));
+        background: var(--color-token-bg-secondary, transparent);
+        color: var(--color-token-text-secondary, inherit);
         font: inherit;
         font-size: 13px;
         line-height: 16px;
@@ -913,15 +918,15 @@
         color: var(--color-text-danger, #dc2626);
       }
       .codex-archive-row-button.${exportButtonClass} {
-        border-color: var(--color-token-border-light, var(--token-border, rgba(0,0,0,.12)));
-        background: var(--color-token-bg-secondary, var(--token-bg-fog, transparent));
-        color: var(--color-token-text-primary, var(--token-text-primary, inherit));
+        border-color: var(--color-token-border-light, var(--color-token-border-default, rgba(0,0,0,.12)));
+        background: var(--color-token-bg-secondary, transparent);
+        color: var(--color-token-text-primary, inherit);
       }
       .${zedRemoteButtonClass} {
-        border: 1px solid var(--color-token-border-light, var(--token-border, rgba(0,0,0,.12)));
+        border: 1px solid var(--color-token-border-light, var(--color-token-border-default, rgba(0,0,0,.12)));
         border-radius: var(--border-radius-sm, 6px);
-        background: var(--color-token-bg-secondary, var(--token-bg-fog, transparent));
-        color: var(--color-token-text-primary, var(--token-text-primary, inherit));
+        background: var(--color-token-bg-secondary, transparent);
+        color: var(--color-token-text-primary, inherit);
         font: inherit;
         font-size: 13px;
         line-height: 16px;
@@ -931,7 +936,7 @@
       }
       .${zedRemoteButtonClass}:hover,
       .${zedRemoteButtonClass}:focus-visible {
-        background: var(--color-token-interactive-bg-secondary-hover, var(--token-list-hover-background, rgba(0,0,0,.06)));
+        background: var(--color-token-interactive-bg-secondary-hover, rgba(0,0,0,.06));
         outline: none;
       }
       .${zedRemoteOpenInMenuItemClass} {
@@ -957,8 +962,8 @@
       }
       .${sessionShareButtonClass}:hover,
       .${sessionShareButtonClass}:focus-visible {
-        background: var(--token-list-hover-background, rgba(70,70,70,.96));
-        color: var(--token-text-default, #fff);
+        background: var(--color-token-list-hover-background, var(--codex-plus-bg-hover));
+        color: var(--color-token-text-primary, var(--codex-plus-text));
         outline: none;
       }
       .${sessionShareButtonClass}[aria-busy="true"] {
@@ -1016,7 +1021,7 @@
         max-width: min(220px, calc(100vw - 32px));
         border: 1px solid var(--codex-plus-border);
         border-radius: var(--border-radius-md, 6px);
-        background: var(--color-token-bg-tooltip, var(--codex-plus-bg-elevated));
+        background: var(--codex-plus-bg-elevated);
         color: var(--codex-plus-text);
         font: inherit;
         font-size: 13px;
@@ -1199,8 +1204,8 @@
       #${codexPlusSidebarNavId} .codex-plus-sidebar-nav-status[data-status="failed"] { background: #ef4444; }
       #${codexPlusSidebarNavId} .codex-plus-sidebar-nav-status[data-status="checking"] { background: #fbbf24; }
       #${codexPlusSidebarNavId} button[data-active="true"] {
-        background: var(--token-list-hover-background, rgba(255,255,255,.08));
-        color: var(--token-text-primary, inherit);
+        background: var(--codex-plus-bg-selected);
+        color: var(--codex-plus-text);
       }
       /*
        * 新版导航图标栏里的 Codex++ / 拓展 / 推荐内容入口：原生按钮只放图标，
@@ -1251,13 +1256,13 @@
        * 主题切换时下次同步会重算。
        */
       html[data-codex-plus-page-open] nav[data-app-navigation-rail] [data-sidebar-destination][aria-current="page"] {
-        color: var(--codex-plus-rail-dim, rgba(255,255,255,.498)) !important;
+        color: var(--codex-plus-rail-dim, var(--codex-plus-text-tertiary, currentColor)) !important;
       }
       html[data-codex-plus-page-open] nav[data-app-navigation-rail] [data-sidebar-destination][aria-current="page"]::before {
         opacity: 0 !important;
       }
       html[data-codex-plus-page-open] nav[data-app-navigation-rail] [data-sidebar-destination][aria-current="page"] * {
-        color: var(--codex-plus-rail-dim, rgba(255,255,255,.498)) !important;
+        color: var(--codex-plus-rail-dim, var(--codex-plus-text-tertiary, currentColor)) !important;
       }
       /*
        * 页面 overlay 的 left 由 positionCodexPlusPage 按图标栏右边界算好写进来。
@@ -1277,7 +1282,7 @@
         height: calc(100vh / var(--codex-plus-zoom, 1));
         z-index: 2147483644;
         display: block;
-        background: var(--token-bg-primary, #212121);
+        background: var(--codex-plus-bg-primary, #fff);
         pointer-events: auto;
         -webkit-app-region: no-drag;
       }
@@ -1287,7 +1292,7 @@
         max-height: none;
         border: 0;
         border-radius: 0;
-        background: var(--token-bg-primary, #212121);
+        background: var(--codex-plus-bg-primary, #fff);
         box-shadow: none;
       }
       .${codexPlusPageClass} .codex-plus-modal-header {
@@ -1566,7 +1571,8 @@
         font-size: 13px;
       }
       .codex-plus-extensions-detail-sep { margin: 0 6px; color: var(--codex-plus-text-tertiary); }
-      .codex-plus-extensions-detail-update { margin-top: 5px; color: #fbbf24; font-size: 13px; }
+      /* issue #2359：原 #fbbf24 在浅色主题下对比度仅 1.56:1，改为随主题走的警告色。 */
+      .codex-plus-extensions-detail-update { margin-top: 5px; color: var(--codex-plus-warning); font-size: 13px; }
       .codex-plus-extensions-detail-actions {
         flex: 0 0 auto;
         display: inline-flex;
@@ -1624,13 +1630,13 @@
         line-height: 1.7;
       }
       .codex-plus-extensions-detail-link { margin-top: 16px; font-size: 13px; }
-      .codex-plus-extensions-detail-link a { color: #10a37f; word-break: break-all; }
+      .codex-plus-extensions-detail-link a { color: var(--codex-plus-success); word-break: break-all; }
       .codex-plus-extensions-detail-error {
         margin-top: 14px;
         padding: 8px 10px;
         border-radius: 8px;
-        background: rgba(239,68,68,.12);
-        color: #ef4444;
+        background: var(--codex-plus-danger-bg);
+        color: var(--codex-plus-danger);
         font-size: 13px;
       }
       .codex-plus-page-nav-group { margin-bottom: 10px; }
@@ -1813,7 +1819,9 @@
         display: grid;
         gap: 4px;
         margin-top: 10px;
-        color: #d4d4d8;
+        /* issue #2359：原来是写死的 #d4d4d8，浅色主题下对比度只有 1.38:1（≈看不见）。
+           标签文字改跟主题走。 */
+        color: var(--codex-plus-text-secondary);
         font-size: 13px;
         font-family: inherit;
         text-align: left;
@@ -1914,20 +1922,32 @@
         white-space: nowrap;
       }
       .codex-plus-ad-empty { border: 1px dashed rgba(255,255,255,.16); border-radius: 12px; color: #9ca3af; font-size: 13px; padding: 12px; text-align: center; }
-      /* Keep injected surfaces on Codex's own semantic palette in both themes. */
+      /*
+       * 注入面板的语义色板：前景/背景必须取自同一套 token，且都要能被主题切换带走。
+       *
+       * issue #2359（Windows 浅色主题下黑底黑字）：旧写法在中间塞了一整层
+       * --token-* 回退名（--token-bg-primary / --token-text-primary /
+       * --token-border / --token-list-hover-background / --token-text-default /
+       * --token-bg-fog / --token-text-tertiary …）。实测 Codex 客户端（26.9xx）
+       * 的产物里这些名字**一个都不存在**——真正在用的一套是 --color-token-*。
+       * 于是三级回退链的中间那级永远落空，浅色主题下只靠最后一级写死的深色值
+       * 兜底，前景与背景各自独立兜底时明度撞在一起，就成了黑底黑字。
+       * 这里把死名删掉，直接接到确实存在、且**由 Codex 自己按主题重算**的
+       * --color-token-* 上；末级兜底仅作最后保险，不再承担主题判断。
+       */
       :root {
-        --codex-plus-bg-primary: var(--color-token-bg-primary, var(--token-bg-primary, #fff));
-        --codex-plus-bg-secondary: var(--color-token-bg-secondary, var(--token-bg-secondary, #f7f7f7));
-        --codex-plus-bg-elevated: var(--color-token-dropdown-background, var(--color-token-bg-elevated-secondary, var(--codex-plus-bg-primary)));
-        --codex-plus-bg-hover: var(--color-token-interactive-bg-secondary-hover, var(--token-list-hover-background, rgba(0,0,0,.06)));
+        --codex-plus-bg-primary: var(--color-token-bg-primary, var(--color-token-main-surface-primary, #fff));
+        --codex-plus-bg-secondary: var(--color-token-bg-secondary, var(--codex-plus-bg-primary));
+        --codex-plus-bg-elevated: var(--color-token-dropdown-background, var(--color-token-bg-secondary, var(--codex-plus-bg-primary)));
+        --codex-plus-bg-hover: var(--color-token-interactive-bg-secondary-hover, var(--color-token-list-hover-background, rgba(0,0,0,.06)));
         --codex-plus-bg-selected: var(--color-token-interactive-bg-secondary-selected, var(--codex-plus-bg-hover));
-        --codex-plus-text: var(--color-token-text-primary, var(--token-text-primary, #171717));
-        --codex-plus-text-secondary: var(--color-token-text-secondary, var(--token-text-secondary, #5d5d5d));
-        --codex-plus-text-tertiary: var(--color-token-text-tertiary, var(--token-text-tertiary, #8a8a8a));
-        --codex-plus-border: var(--color-token-border-light, var(--color-token-border, var(--token-border, rgba(0,0,0,.12))));
-        --codex-plus-border-subtle: var(--color-token-border-subtle, var(--codex-plus-border));
+        --codex-plus-text: var(--color-token-text-primary, var(--color-token-foreground, #171717));
+        --codex-plus-text-secondary: var(--color-token-text-secondary, var(--codex-plus-text));
+        --codex-plus-text-tertiary: var(--color-token-text-tertiary, var(--codex-plus-text-secondary));
+        --codex-plus-border: var(--color-token-border-light, var(--color-token-border, var(--color-token-border-default, rgba(0,0,0,.12))));
+        --codex-plus-border-subtle: var(--codex-plus-border);
         --codex-plus-focus: var(--color-token-focus-border, var(--color-border-focus, currentColor));
-        --codex-plus-danger: var(--color-text-danger, var(--color-token-text-error, #dc2626));
+        --codex-plus-danger: var(--color-text-danger, #dc2626);
         --codex-plus-danger-bg: var(--color-background-danger-soft, rgba(220,38,38,.1));
         --codex-plus-success: var(--color-text-success, #15803d);
         --codex-plus-warning: var(--color-text-warning, #a16207);
@@ -1966,7 +1986,7 @@
       .${actionTooltipClass} {
         border-color: var(--codex-plus-border);
         border-radius: var(--border-radius-md, 6px);
-        background: var(--color-token-bg-tooltip, var(--codex-plus-bg-elevated));
+        background: var(--codex-plus-bg-elevated);
         color: var(--codex-plus-text);
         font-family: inherit;
         font-size: 13px;
@@ -3113,7 +3133,12 @@
   const codexServiceTierReadTimeoutMs = 5000;
   const codexServiceTierModulePromises = new Map();
   // namePart -> { at, attempts, error }，见 loadCodexAppModule 里的说明。
-  const codexAppModuleFailures = new Map();
+  // 挂在 window 上跨重注入保留：否则每次重注入都会清空失败记录，重新全量 fetch asset
+  // （issue #2330 / #2169：桥接看门狗重注入后 asset rescan 被重新跑满）。
+  const codexAppModuleFailures = window.__codexPlusAppModuleFailures || (window.__codexPlusAppModuleFailures = new Map());
+  // namePart -> { at, url }：codexAppAssetUrlFromScriptText 的查找结果，未命中也缓存，
+  // 同样跨重注入保留（有调用方会绕过 asset loader 直接调它）。
+  const codexAppAssetUrlLookups = window.__codexPlusAssetUrlLookups || (window.__codexPlusAssetUrlLookups = new Map());
   const codexAppModuleRetryCooldownMs = 30000;
   const codexAppModuleMaxAttempts = 8;
   const codexServiceTierSupportedFastModels = new Set(["gpt-5.4", "gpt-5.5"]);
@@ -3144,6 +3169,19 @@
 
   async function codexAppAssetUrlFromScriptText(namePart) {
     if (!namePart) return "";
+    // 有调用方会绕过 asset loader 直接调这里，
+    // 没有缓存时每次注入都要把全部 app asset fetch 一遍（issue #2330）。
+    // 未命中同样缓存：冷却期内不重复扫描。
+    const cached = codexAppAssetUrlLookups.get(namePart);
+    if (cached && (cached.url || Date.now() - cached.at < codexAppModuleRetryCooldownMs)) {
+      return cached.url;
+    }
+    const url = await scanCodexAppAssetUrlFromScriptText(namePart);
+    codexAppAssetUrlLookups.set(namePart, { at: Date.now(), url });
+    return url;
+  }
+
+  async function scanCodexAppAssetUrlFromScriptText(namePart) {
     const scripts = codexAppAssetCandidateUrls();
     const escaped = String(namePart).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const patterns = [
@@ -6390,25 +6428,56 @@
     return source;
   }
 
+  // 这三种 marketplace 过滤器由 Codex 打包后压缩，标识符每版都会换名
+  // （历史形态: !u(e.marketplaceName)||e.marketplaceName===r / !ne(...) / !Eu(...) /
+  // 26.928.31416 起: !Mj(e.marketplaceName)||e.marketplaceName===n）。
+  // 所以按「结构」而不是按字面量识别，避免每次发版都要补一个新变体。
+  const codexPluginBuildFlavorFilterSourcePattern =
+    /!\s*([A-Za-z_$][\w$]*)\s*\(\s*([A-Za-z_$][\w$]*)\s*\.marketplaceName\s*\)\s*\|\|\s*\2\s*\.marketplaceName\s*===\s*[A-Za-z_$][\w$]*/;
+  // featuredPluginIds 那条：{let t=Gj(e);return t==null||!Mj(t)||t===n}
+  // 入参是 plugin id 字符串（不是对象），先取 marketplace 再判，形态和上面不同，需单独认。
+  // 三个 X 必须同一个标识符，且 `===` 右边是标识符而非调用——否则会误伤 bundle 里
+  // 形如 `t==null||r==null||!ds(r)||r===SFe(t)` 的无关函数（实测存在）。
+  // 右值后面必须紧跟非标识符字符（`(?![\w$(])`），光写 `(?!\s*\()` 会被贪婪回溯绕过：
+  // `===SFe(t)` 里 `SFe` 可退回 `SF`，后面 `e` 不是 `(`，前瞻就放行了。实测踩过。
+  const codexPluginFeaturedFilterSourcePattern =
+    /([A-Za-z_$][\w$]*)\s*==\s*null\s*\|\|\s*!\s*[A-Za-z_$][\w$]*\s*\(\s*\1\s*\)\s*\|\|\s*\1\s*===\s*[A-Za-z_$][\w$]*(?![\w$(])/;
+
   function isCodexPluginBuildFlavorFilter(callback, sample, filtered = null) {
     if (!Array.isArray(sample) || sample.length === 0 || typeof callback !== "function") return false;
     if (!sample.some((plugin) => codexPluginOfficialMarketplaceName(plugin?.marketplaceName))) return false;
     const source = codexPluginFilterCallbackSource(callback);
     if (!source) return false;
-    const isKnownFilterSource = source.includes("!u(e.marketplaceName)||e.marketplaceName===r")
-      || source.includes("!ne(e.marketplaceName)||e.marketplaceName===n")
-      || source.includes("!Eu(e.marketplaceName)||e.marketplaceName===n");
-    if (!isKnownFilterSource) return false;
+    if (!codexPluginBuildFlavorFilterSourcePattern.test(source)) return false;
     return sample.some((plugin) => codexPluginOfficialMarketplaceName(plugin?.marketplaceName)
       && (Array.isArray(filtered) ? !filtered.includes(plugin) : !callback(plugin)));
   }
+
+  // featuredPluginIds 过滤：sample 是字符串数组，回调按 id 反查 marketplace 后剔除官方目录。
+  // 外部拿不到 id→marketplace 的映射，所以这里只做「结构 + 确实过滤掉了元素」的判定。
+  function isCodexPluginFeaturedFilter(callback, sample, filtered = null) {
+    if (!Array.isArray(sample) || sample.length === 0 || typeof callback !== "function") return false;
+    if (!sample.every((id) => typeof id === "string")) return false;
+    const source = codexPluginFilterCallbackSource(callback);
+    if (!source) return false;
+    if (!codexPluginFeaturedFilterSourcePattern.test(source)) return false;
+    if (Array.isArray(filtered) && filtered.length >= sample.length) return false;
+    return true;
+  }
+
+  // 结构式匹配 `<arr>.filter(p => !<list>.includes(p.name))`：
+  // list 标识符每版都换名，写死会失效（历史写死过 "!t.includes(e.name)"）。
+  // 必须锚定 filter 箭头形态且箭头参数与 `.name` 的宿主同名，
+  // 否则会误伤 bundle 里 `!w4.includes(t.name)` 这类与插件无关的守卫（实测存在）。
+  const codexPluginHiddenFilterSourcePattern =
+    /filter\s*\(\s*([A-Za-z_$][\w$]*)\s*=>\s*!\s*[A-Za-z_$][\w$]*\s*\.includes\s*\(\s*\1\s*\.name\s*\)/;
 
   function isCodexPluginMarketplaceHiddenFilter(callback, sample, filtered = null) {
     if (!Array.isArray(sample) || sample.length === 0 || typeof callback !== "function") return false;
     if (!sample.some((marketplace) => codexPluginOfficialMarketplaceName(marketplace?.name))) return false;
     const source = codexPluginFilterCallbackSource(callback);
     if (!source) return false;
-    if (!source.includes("!t.includes(e.name)")) return false;
+    if (!codexPluginHiddenFilterSourcePattern.test(source)) return false;
     return sample.some((marketplace) => codexPluginOfficialMarketplaceName(marketplace?.name)
       && (Array.isArray(filtered) ? !filtered.includes(marketplace) : !callback(marketplace)));
   }
@@ -6438,6 +6507,10 @@
       }
       if (isCodexPluginMarketplaceHiddenFilter(callback, this, filtered)) {
         sendCodexPlusDiagnostic("plugin_marketplace_hidden_filter_bypassed", { marketplaceCount: this.length });
+        return Array.from(this);
+      }
+      if (isCodexPluginFeaturedFilter(callback, this, filtered)) {
+        sendCodexPlusDiagnostic("plugin_featured_filter_bypassed", { featuredCount: this.length });
         return Array.from(this);
       }
       return filtered;
@@ -10850,6 +10923,9 @@
     return document.querySelector(".thread-scroll-container") || document.scrollingElement || document.documentElement;
   }
 
+  // 旧版（26.9xx 之前）内容容器类名清单。保留它当候选之一，但**不再当唯一判据**：
+  // 新版 Codex 把 `max-w-(--thread-content-max-width)` 换成了 `max-w-(--thread-body-max-width)`，
+  // `pb-8` 也并入 `has-[[…]]:pb-0` 的条件组合，全等匹配必然归零（issue #2258）。
   const conversationViewContentClasses = [
     "mx-auto",
     "w-full",
@@ -10871,6 +10947,21 @@
     "max-w-(--thread-content-max-width)",
     "px-toolbar",
   ];
+  // Codex 把中间栏宽度的工具类写成 `max-w-(--thread-<用途>-max-width)`，用途词换过好几轮
+  // （content → body、content-responsive…）。所以只钉住「结构」——`max-w-(--thread-*-max-width)`
+  // 这个形状本身——而不是某个具体用途词。哈希类名（`_shell_151xi_3` 那类）一律不写死。
+  const conversationViewThreadWidthTokenPattern = /^(?:[a-z-]+:)*max-w-\(--thread-[a-z-]+-max-width\)$/;
+  // 内容容器的新版稳定锚点。它是虚拟列表宿主（data-mcp-app-portal-target 同节点），
+  // 由 Codex 自己维护在滚动容器内部，比类名抗改。选择器统一登记在 00-prelude.js 的
+  // selectors 表里，不在这里另起一份。
+  const conversationViewContentAnchorSelector = selectors.conversationViewContentAnchor;
+  const conversationViewScrollContainerSelector = selectors.conversationViewScrollContainer;
+  // 页脚包裹层同样带 `max-w-(--thread-…-max-width)`，会被结构候选误当成内容容器。
+  // 用 Codex 自己的页脚标记把它排掉。
+  const conversationViewFooterSelector = selectors.conversationViewFooter;
+  // 两侧留白：Codex 的 `--padding-toolbar` 是 `calc(var(--spacing) * 2)`（= 8px * 2）。
+  // 仅在拿不到父节点 computed style 时作为回落的单侧留白。
+  const conversationViewSideInset = 8;
   const conversationViewState = {
     contentEl: null,
     composerEl: null,
@@ -10881,6 +10972,7 @@
     pollId: 0,
     runtimeStarted: false,
     moObserved: false,
+    targetsReported: false,
     observed: new WeakSet(),
     elements: new Set(),
   };
@@ -10898,12 +10990,121 @@
     return Array.from(document.querySelectorAll("div")).find((el) => conversationViewHasAllClasses(el, classes)) || null;
   }
 
+  function conversationViewHasThreadWidthToken(el) {
+    for (const token of conversationViewTokenSet(el)) {
+      if (conversationViewThreadWidthTokenPattern.test(token)) return true;
+    }
+    return false;
+  }
+
+  // 结构性判定：居中 + 满宽 + 线程宽度工具类。不依赖任何具体用途词或哈希类名。
+  function conversationViewLooksLikeThreadWidthBox(el) {
+    if (el?.tagName !== "DIV") return false;
+    const set = conversationViewTokenSet(el);
+    if (!set.has("mx-auto") || !set.has("w-full")) return false;
+    return conversationViewHasThreadWidthToken(el);
+  }
+
+  // 页脚包裹层**自身**也带宽度工具类，所以这里不仅要排掉它的后代，还要排掉它本身。
+  function conversationViewIsInsideFooter(el) {
+    if (!el) return false;
+    try {
+      return el.matches?.(conversationViewFooterSelector) === true
+        || el.closest?.(conversationViewFooterSelector) != null;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function conversationViewScrollContainer() {
+    return document.querySelector(conversationViewScrollContainerSelector);
+  }
+
+  function conversationViewCollectThreadWidthBoxes(root) {
+    if (!root?.querySelectorAll) return [];
+    return Array.from(root.querySelectorAll("div")).filter(conversationViewLooksLikeThreadWidthBox);
+  }
+
+  /**
+   * 按候选顺序找内容容器，任一候选命中即返回。
+   *
+   * 候选链刻意从「最精确」排到「最宽松」：
+   *   1. 旧版类名全等（老版本 Codex 上仍然最准）；
+   *   2. Codex 自己的 data-* 锚点（当前版本）；
+   *   3. 结构判定（滚动容器内、居中满宽、带 thread 宽度工具类）；
+   *   4. #2085 报告里提到的兜底：两处类名都没命中时，按 CSS 变量反查宿主节点。
+   *
+   * 顺序不能反：结构判定会把页脚包裹层也算进来，而它和内容容器在同一棵子树里。
+   */
   function conversationViewFindContentEl() {
-    return conversationViewFindByClasses(conversationViewContentClasses);
+    const legacy = conversationViewFindByClasses(conversationViewContentClasses);
+    if (legacy && !conversationViewIsInsideFooter(legacy)) return legacy;
+    const anchored = document.querySelector(conversationViewContentAnchorSelector);
+    if (anchored) return anchored;
+    const scroller = conversationViewScrollContainer();
+    const structural = conversationViewCollectThreadWidthBoxes(scroller || document)
+      // 页脚包裹层（data-thread-scroll-footer）也带同样的宽度工具类，必须排掉。
+      .find((el) => !conversationViewIsInsideFooter(el));
+    if (structural) return structural;
+    return conversationViewFindByThreadWidthVariable(scroller || document);
   }
 
   function conversationViewFindComposerEl() {
-    return conversationViewFindByClasses(conversationViewComposerClasses);
+    // 页脚包裹层带的是和作曲器同一套工具类，会被旧清单全等命中，所以要排除它。
+    const footer = document.querySelector(conversationViewFooterSelector);
+    const legacy = conversationViewFindByClasses(conversationViewComposerClasses);
+    if (legacy && !conversationViewIsInsideFooter(legacy)) return legacy;
+    // 新版作曲器在页脚包裹层内部——页脚自身也是 max-w 盒子，得往里再找一层。
+    const insideFooter = conversationViewCollectThreadWidthBoxes(footer)[0];
+    if (insideFooter) return insideFooter;
+    // 老版本作曲器不在页脚里；退回整棵文档，但只认页脚缺席时的候选，
+    // 且排除内容容器（两者宽度工具类同形）。
+    const scroller = conversationViewScrollContainer() || document;
+    const anywhere = conversationViewCollectThreadWidthBoxes(scroller)
+      .find((el) => !conversationViewIsContentCandidate(el));
+    if (anywhere) return anywhere;
+    if (footer) return conversationViewFindByThreadWidthVariable(footer, (el) => el !== footer);
+    return conversationViewFindByThreadWidthVariable(document, (el) => !conversationViewIsContentCandidate(el));
+  }
+
+  // 内容容器的判定（锚点或全等类名），供作曲器查找排除同形节点用。
+  function conversationViewIsContentCandidate(el) {
+    if (!el) return false;
+    if (el.matches?.(conversationViewContentAnchorSelector)) return true;
+    return conversationViewHasAllClasses(el, conversationViewContentClasses);
+  }
+
+  // 兜底：类名全不对时，看计算样式里 Codex 是否在该节点上定义了线程宽度变量。
+  // 变量名只按 `--thread-*-max-width` 这个形状匹配，同样不绑具体用途词。
+  // accept 为 null 时默认排除页脚内部节点（内容容器的用法）；作曲器查找会传自己的判定。
+  function conversationViewFindByThreadWidthVariable(root, accept = null) {
+    if (!root?.querySelectorAll) return null;
+    const candidates = Array.from(root.querySelectorAll("div"));
+    return candidates.find((el) => {
+      if (accept ? !accept(el) : conversationViewIsInsideFooter(el)) return false;
+      try {
+        const style = getComputedStyle(el);
+        for (const name of conversationViewThreadWidthCustomProperties(style)) {
+          if (String(style.getPropertyValue(name) || "").trim()) return true;
+        }
+      } catch (_) {
+        return false;
+      }
+      return false;
+    }) || null;
+  }
+
+  function conversationViewThreadWidthCustomProperties(style) {
+    // CSSStyleDeclaration 的索引属性在 Chromium 里可用；拿不到时退回固定候选名，
+    // 保证兜底在受限环境（测试夹具）里也不会抛。
+    const names = [];
+    const length = Number(style?.length) || 0;
+    for (let index = 0; index < length; index += 1) {
+      const name = style[index];
+      if (typeof name === "string" && name.startsWith("--thread-") && name.endsWith("-max-width")) names.push(name);
+    }
+    if (!names.length) names.push("--thread-body-max-width", "--thread-content-max-width");
+    return names;
   }
 
   function codexServiceTierBadgeVisibleElement(element) {
@@ -11167,9 +11368,19 @@
     }
   }
 
-  function conversationViewApplyNativeWidth(el) {
+  // #2085：设置值是**上限**，不是必须写死的宽度。容器比上限窄时按容器可用宽度
+  // 收敛，否则 900px 会让内容溢出滚动容器、两侧被裁。
+  // 容器宽度已由调用方在读取阶段量好，这里只做纯计算，不读几何——见 conversationViewAlignNow。
+  function conversationViewEffectiveWidth(containerWidth) {
+    const configured = conversationViewWidth();
+    if (!Number.isFinite(containerWidth) || containerWidth <= 0) return configured;
+    return Math.max(conversationViewMinWidth, Math.min(configured, Math.round(containerWidth)));
+  }
+
+  function conversationViewApplyNativeWidth(el, effectiveWidth) {
     conversationViewRememberOriginals(el);
-    const maxWidth = `${conversationViewWidth()}px`;
+    const width = Number.isFinite(effectiveWidth) ? effectiveWidth : conversationViewWidth();
+    const maxWidth = `${width}px`;
     if (el.style.boxSizing !== "border-box") el.style.boxSizing = "border-box";
     if (el.style.width !== "100%") el.style.width = "100%";
     if (el.style.maxWidth !== maxWidth) el.style.maxWidth = maxWidth;
@@ -11179,6 +11390,22 @@
 
   function conversationViewSessionRectFor(el) {
     return el?.parentElement?.getBoundingClientRect() || null;
+  }
+
+  // 容器可用宽度：取宿主节点的内容盒宽（rect.width 含内边距，减掉左右 padding 才是可用空间）。
+  // 拿不到几何（离屏、display:none、父节点缺失）时返回 0，由 effectiveWidth 回落设置上限。
+  function conversationViewAvailableWidth(el) {
+    const host = el?.parentElement;
+    const rect = conversationViewSessionRectFor(el);
+    if (!host || !rect || !(rect.width > 0)) return 0;
+    let inlinePadding = conversationViewSideInset * 2;
+    try {
+      const style = getComputedStyle(host);
+      inlinePadding = (Number.parseFloat(style.paddingLeft) || 0) + (Number.parseFloat(style.paddingRight) || 0);
+    } catch (_) {
+      inlinePadding = conversationViewSideInset * 2;
+    }
+    return Math.max(0, rect.width - inlinePadding);
   }
 
   function conversationViewHtmlCenter() {
@@ -11210,15 +11437,24 @@
   function conversationViewAlignNow() {
     if (!codexPlusSettings().conversationView) return;
     conversationViewResolveTargets();
-    // 两阶段批量对齐：先对全部目标应用宽度/复位（写 style），
-    // 再统一读取几何并决定是否写入 left，避免写-读-写交替触发强制重排。
     const targets = [
       conversationViewState.contentEl,
       conversationViewState.composerEl,
     ].filter((el) => el?.isConnected);
-    if (!targets.length) return;
-    targets.forEach((el) => {
-      conversationViewApplyNativeWidth(el);
+    if (!targets.length) {
+      conversationViewReportMissingTargets();
+      return;
+    }
+    conversationViewState.targetsReported = false;
+    // 三阶段批量对齐，全程不出现读-写交替（否则退回 commit 82fb0924 修掉的强制重排）：
+    //   ① 读：一次性量完全部目标的宿主可用宽度，算出各自的有效上限；
+    //   ② 写：按算好的宽度统一写 style（宽度 + 复位自身偏移）；
+    //   ③ 读 + 写 left：统一读几何，决定是否需要再写 left。
+    // #2085 的自适应计算落在 ①，写动作仍集中在 ②，与原有两阶段结构一致。
+    const availableWidths = targets.map((el) => conversationViewAvailableWidth(el));
+    const effectiveWidths = availableWidths.map((width) => conversationViewEffectiveWidth(width));
+    targets.forEach((el, index) => {
+      conversationViewApplyNativeWidth(el, effectiveWidths[index]);
       conversationViewResetOwnOffset(el);
     });
     const htmlCenter = conversationViewHtmlCenter();
@@ -11232,6 +11468,24 @@
         const nextLeft = `${delta.toFixed(2)}px`;
         if (el.style.left !== nextLeft) el.style.left = nextLeft;
       }
+    });
+  }
+
+  /**
+   * #2258 最贵的地方是「静默」：类名变化导致目标归零时，对齐整段直接 return，
+   * 用户只看到居中失效，日志里什么都没有。这里每个会话只上报一次，
+   * 并在下一次成功命中时重置，避免长时间运行时刷屏。
+   */
+  function conversationViewReportMissingTargets() {
+    if (conversationViewState.targetsReported) return;
+    conversationViewState.targetsReported = true;
+    const scroller = conversationViewScrollContainer();
+    sendCodexPlusDiagnostic("conversation_view_target_not_found", {
+      hasScrollContainer: !!scroller,
+      hasContentAnchor: !!document.querySelector(conversationViewContentAnchorSelector),
+      hasFooter: !!document.querySelector(conversationViewFooterSelector),
+      threadWidthBoxes: conversationViewCollectThreadWidthBoxes(scroller || document).length,
+      configuredWidth: conversationViewWidth(),
     });
   }
 

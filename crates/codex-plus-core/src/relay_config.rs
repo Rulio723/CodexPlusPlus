@@ -719,7 +719,14 @@ pub fn apply_relay_profile_to_home_with_switch_rules(
             apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
 
         if profile.relay_mode == crate::settings::RelayMode::PureApi {
-            apply_relay_files_to_home(home, &compatible_config, &profile.auth_contents)
+            // 与 Aggregate / Official 分支对称：先读 live auth.json 再合并，
+            // 不能直接把 profile 快照整体写进去（issue #2173）。
+            // 纯 API 供应商每切换一次就可能把 live 里的 `tokens` 抹掉，从而静默
+            // 摧毁「OpenAI 会话身份」这个唯一能让 CUA 浏览器插件可用的 workaround——
+            // 用户表现为「本来能用，某天开始报 unsupported Codex auth method: apikey」，
+            // 且没有任何配置报错。
+            let auth_contents = pure_api_auth_contents_with_live_login(home, profile)?;
+            apply_relay_files_to_home(home, &compatible_config, &auth_contents)
         } else if profile.relay_mode == crate::settings::RelayMode::Aggregate {
             // 聚合模式的实际请求发往本地代理，它需要 API 模式的凭据。
             // 不能走 Official 分支删 OPENAI_API_KEY，否则 auth.json 会被清成空文件/空对象，
@@ -2329,6 +2336,29 @@ fn apply_context_limits_to_config(
     Ok(normalize_optional_toml(doc))
 }
 
+/// 外部 `model_catalog_json` 与每模型配置冲突时的降级路径（issue #2203）。
+///
+/// 保留用户手写的外部指针不动，只往 config.toml 顶层写 `model_context_window` /
+/// `model_auto_compact_token_limit` 作兜底。顶层键对全部模型生效，是「每模型窗口
+/// 用不上」时的最优可用近似；而过去直接 bail 会让用户**完全切不了供应商**，
+/// 代价远大于特性降级。
+fn apply_external_catalog_fallback(
+    config_text: &str,
+    context_window: Option<u64>,
+    auto_compact_limit: Option<u64>,
+) -> String {
+    let Ok(mut doc) = parse_toml_document(config_text) else {
+        return config_text.to_string();
+    };
+    if let Some(value) = context_window {
+        doc["model_context_window"] = toml_edit::value(value as i64);
+    }
+    if let Some(value) = auto_compact_limit {
+        doc["model_auto_compact_token_limit"] = toml_edit::value(value as i64);
+    }
+    normalize_optional_toml(doc)
+}
+
 fn apply_model_catalog_to_config(
     home: &Path,
     profile: &RelayProfile,
@@ -2391,6 +2421,10 @@ fn apply_model_catalog_to_config(
         official_login,
     );
     let fallback = parse_optional_positive_u64(&profile.context_window, "上下文大小")?;
+    // 外部 catalog 降级时的顶层兜底键（issue #2203）。顶层键对全部模型生效，
+    // 是「每模型窗口用不上」时的最优可用近似。
+    let auto_compact_fallback =
+        parse_optional_positive_u64(&profile.auto_compact_limit, "压缩上下文大小")?;
     // 用户已手写 model_catalog_json 指针时保留，不覆盖（保 preserves_user_model_catalog_json 测试）。
     // Codex++ 管理的 catalog 必须随当前 profile 切换；否则前一个供应商的模型列表会残留。
     // cc-switch 的固定文件名属于已知的其他管理器投影，不视为用户手写 catalog；
@@ -2408,9 +2442,14 @@ fn apply_model_catalog_to_config(
                 config_text = remove_root_key(&config_text, "model_catalog_json");
             } else {
                 if has_per_model_overrides {
-                    anyhow::bail!(
-                        "当前配置使用外部 model_catalog_json，无法同时应用每模型窗口、自动压缩或元数据"
-                    );
+                    // 用户手写了外部 catalog 且本 profile 配了每模型窗口/元数据。
+                    // 过去直接 bail，代价是用户**完全切不了供应商**——远比「特性降级」严重。
+                    // 改为保留外部指针、写顶层兜底键，并让调用方带 warning（issue #2203）。
+                    return Ok(apply_external_catalog_fallback(
+                        &config_text,
+                        fallback,
+                        auto_compact_fallback,
+                    ));
                 }
                 if official_deepseek_responses {
                     return Ok(config_text.to_string());
@@ -2437,9 +2476,13 @@ fn apply_model_catalog_to_config(
         && let Some(external_catalog) = live_external_model_catalog(home)
     {
         if has_per_model_overrides {
-            anyhow::bail!(
-                "当前 Codex 配置使用外部 model_catalog_json，无法同时应用每模型窗口、自动压缩或元数据"
-            );
+            // 同上一处：live 里已有外部指针且本 profile 配了每模型覆盖时，
+            // 降级为「保留外部指针 + 顶层兜底键」，不再拒绝整次切换（issue #2203）。
+            return Ok(apply_external_catalog_fallback(
+                &config_text,
+                fallback,
+                auto_compact_fallback,
+            ));
         }
         let mut doc = parse_toml_document(&config_text)?;
         if standard_responses
@@ -3556,6 +3599,77 @@ fn auth_contents_with_proxy_key(
         "{}\n",
         serde_json::to_string_pretty(&json!({ "OPENAI_API_KEY": bearer_token }))?
     ))
+}
+
+/// 纯 API 模式写 auth.json 前的合并（issue #2173）。
+///
+/// Aggregate / Official 两条分支都会先经 `auth_contents_with_proxy_key` 读 live
+/// auth.json 再合并，只有 PureApi 过去是直接写 profile 快照。那把 live 里的
+/// `tokens` / `auth_mode` 整体覆盖掉，而 `tokens` 正是「OpenAI 会话身份」
+/// （`auth_contents_looks_like_chatgpt_auth` 依赖它）让 CUA 浏览器插件可用的前提，
+/// 于是纯 API 供应商每切换一次就可能静默弄坏插件，且不报任何配置错误。
+///
+/// 策略：以 profile 快照为基底（它承载本供应商需要的 `OPENAI_API_KEY` 等字段），
+/// 但把 live 里已有的登录态键原样保留——本 profile 没声明的键也一并继承，
+/// 使写入结果与 Aggregate / Official 的行为对齐。
+fn pure_api_auth_contents_with_live_login(
+    home: &Path,
+    profile: &RelayProfile,
+) -> anyhow::Result<String> {
+    let auth_contents = profile.auth_contents.as_str();
+    // 只有会话身份是 openai 的 profile 才保留 live 的 ChatGPT 登录态。
+    // 普通纯 API 供应商本就该清掉官方凭据（切换语义要求），无条件保留会破坏它。
+    if relay_session_provider_from_config(&profile.config_contents) != RelaySessionProvider::Openai {
+        return Ok(auth_contents.to_string());
+    }
+    let live = read_optional_text(&home.join("auth.json"))?;
+    let Some(mut snapshot) = parse_json_object(auth_contents) else {
+        // 快照本身不是合法 JSON 对象：沿用旧的「快照为空白则视为无凭据」语义，
+        // 非空但损坏时报错，避免写入损坏内容。
+        if auth_contents.trim().is_empty() {
+            return Ok(auth_contents.to_string());
+        }
+        anyhow::bail!(
+            "供应商快照里的 auth.json 不是有效 JSON 对象，已停止切换以避免写入损坏内容"
+        );
+    };
+    let Some(live_object) = parse_json_object(&live) else {
+        return Ok(auth_contents.to_string());
+    };
+
+    // 登录态键：live 有就保留，避免把用户的 ChatGPT 登录凭据抹掉。
+    const LOGIN_STATE_KEYS: [&str; 2] = ["tokens", "auth_mode"];
+    for key in LOGIN_STATE_KEYS {
+        if let Some(value) = live_object.get(key) {
+            if !value.is_null() {
+                snapshot.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+
+    // live 里本 profile 未声明的其它键也继承，保持与 Aggregate / Official 一致。
+    for (key, value) in &live_object {
+        if value.is_null() || snapshot.contains_key(key) {
+            continue;
+        }
+        snapshot.insert(key.clone(), value.clone());
+    }
+
+    Ok(format!(
+        "{}\n",
+        serde_json::to_string_pretty(&Value::Object(snapshot))?
+    ))
+}
+
+/// 解析成 JSON 对象；来源为空、非 JSON 或不是对象时返回 None。
+fn parse_json_object(source: &str) -> Option<serde_json::Map<String, Value>> {
+    if source.trim().is_empty() {
+        return None;
+    }
+    serde_json::from_str::<Value>(source)
+        .ok()?
+        .as_object()
+        .cloned()
 }
 
 /// 把代理 token 合进一份 auth.json 文本；来源为空或不是 JSON 对象时返回 None，
