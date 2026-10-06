@@ -3571,6 +3571,49 @@ pub async fn apply_session_index_cleanup(
 
 const PROVIDER_SYNC_PROGRESS_EVENT: &str = "provider-sync-progress";
 
+/// issue #240：执行前先给「会动到什么、备份在哪」的只读预览。
+///
+/// 用户报「修复历史会话后会话从列表消失」，所以真实执行前要先看影响范围。
+/// 这条命令不写盘：不开锁、不备份、不改 sqlite，只统计。
+#[tauri::command]
+pub async fn preview_provider_sync() -> CommandResult<Value> {
+    let result = tauri::async_runtime::spawn_blocking(|| {
+        codex_plus_data::provider_sync::preview_provider_sync(None)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("provider sync preview task failed: {error}"))
+    .and_then(|result| result);
+    match result {
+        Ok(preview) => {
+            let audit = &preview.audit;
+            let message = if audit.catalog_only_sessions > 0 {
+                format!(
+                    "预览：审计发现 {} 条仅存在于会话目录的记录，其中 {} 条仍有当前 rollout、{} 条只能从历史备份恢复、{} 条没有恢复来源。执行时的备份目录：{}",
+                    audit.catalog_only_sessions,
+                    audit.catalog_only_with_current_rollout,
+                    audit.catalog_only_with_backup_database,
+                    audit.catalog_only_without_recovery_source,
+                    preview.backup_root.to_string_lossy(),
+                )
+            } else {
+                format!(
+                    "预览：未发现仅存在于会话目录的记录。执行时的备份目录：{}",
+                    preview.backup_root.to_string_lossy(),
+                )
+            };
+            ok(
+                &message,
+                json!({
+                    "targetProvider": preview.target_provider,
+                    "repairAudit": preview.audit,
+                    "backupRoot": preview.backup_root,
+                }),
+            )
+        }
+        Err(error) => failed(&format!("预览历史会话修复失败：{error}"), json!({})),
+    }
+}
+
 #[tauri::command]
 pub async fn sync_providers_now(
     window: tauri::WebviewWindow,
@@ -3596,9 +3639,12 @@ pub async fn sync_providers_now(
     };
     let target_for_settings = target_provider.clone();
     let home = codex_plus_core::relay_config::default_codex_home_dir();
-    prepare_codex_app_state_before_provider_switch(&home, "manager.sync_providers_now.before");
     let progress_window = window.clone();
+    let before_home = home.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
+        // issue #1341：快照要读整份 app state 文件，属阻塞 IO，必须留在阻塞线程里，
+        // 否则同步一跑起来就把 async 运行时的那条工作线程占住，界面卡死。
+        prepare_codex_app_state_before_provider_switch(&before_home, "manager.sync_providers_now.before");
         codex_plus_data::run_provider_sync_with_target_and_progress(
             None,
             target_provider.as_deref(),
@@ -3681,6 +3727,13 @@ fn provider_sync_command_result(sync: codex_plus_data::ProviderSyncResult) -> Co
             String::new()
         }
     );
+    // issue #240：改动了记录就把备份位置一并告诉用户，出事时能自己找回。
+    let success_message = match sync.backup_dir.as_ref() {
+        Some(path) if sync.changed_session_files > 0 || sync.sqlite_catalog_rows_inserted > 0 => {
+            format!("{success_message} 备份目录：{}", path.to_string_lossy())
+        }
+        _ => success_message,
+    };
     let failure_message = format!("历史会话修复未执行：{}", sync.message);
     let payload = json!({
         "syncStatus": sync.status,
@@ -4862,6 +4915,35 @@ pub fn write_diagnostic_event(event: String, detail: Value) -> CommandResult<Val
     }
 }
 
+/// 预检 live config.toml 能否被回填流程解析（issue #618）。
+///
+/// core 侧的 `backfill_relay_profile_from_home_with_common` 会先做重复表头/重复
+/// 根键的语义归一化（`normalize_duplicate_toml_text`，公开入口是
+/// `normalize_config_text`），再对归一化结果做整份 TOML 解析。所以这里必须走同一
+/// 条归一化路径，否则会对「只是有重复表头」的文件误报语法错误。
+///
+/// 返回 `Some(错误描述)` 表示回填注定失败：要么读文件失败，要么归一化后仍不是合法
+/// TOML。返回 `None` 表示可以继续回填。文件不存在等同于空文件，属可回填。
+fn live_config_backfill_blocking_error(home: &Path) -> Option<String> {
+    let config_path = home.join("config.toml");
+    let contents = match fs::read_to_string(&config_path) {
+        Ok(contents) => contents,
+        // 不存在按空文件处理，与 core 的 read_optional_text 一致。
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => return Some(format!("读取 {} 失败：{error}", config_path.display())),
+    };
+    // 与 core 的 parse_toml_document 一样先剥掉 BOM。
+    let contents = contents.trim_start_matches('\u{feff}');
+    if contents.trim().is_empty() {
+        return None;
+    }
+    let normalized = codex_plus_core::relay_config::normalize_config_text(contents);
+    match normalized.parse::<toml_edit::DocumentMut>() {
+        Ok(_) => None,
+        Err(error) => Some(format!("{error}")),
+    }
+}
+
 #[tauri::command]
 pub fn backfill_relay_profile_from_live(
     request: BackfillRelayProfileRequest,
@@ -4876,10 +4958,10 @@ pub fn backfill_relay_profile_from_live(
             "activeRelayId": settings.active_relay_id
         }),
     );
-    let Some(profile) = settings
+    let Some(profile_index) = settings
         .relay_profiles
-        .iter_mut()
-        .find(|profile| profile.id == request.profile_id)
+        .iter()
+        .position(|profile| profile.id == request.profile_id)
     else {
         log_manager_event(
             "manager.backfill_relay_profile_from_live.missing_profile",
@@ -4893,12 +4975,37 @@ pub fn backfill_relay_profile_from_live(
         );
     };
 
+    // live 的 config.toml 只要有一处手写语法错误，core 的整份 TOML 解析就会失败
+    // （relay_config.rs 的 parse_toml_document），回填因此无法进行。但「回填」只是
+    // 切换前的一次快照采集，不是切换到新供应商的必要条件；让整条切换流程失败会
+    // 把用户卡死在中转态（issue #618）。这里比照同文件 2089 / 2350 两处既有写法，
+    // 在解析失败时降级：保留原 settings 不动、只提示用户先修 config.toml 语法。
+    if let Some(error) = live_config_backfill_blocking_error(&home) {
+        log_manager_event(
+            "manager.backfill_relay_profile_from_live.degraded",
+            json!({
+                "profileId": requested_profile_id,
+                "error": error
+            }),
+        );
+        return degraded(
+            &format!("config.toml 有语法错误，已跳过回填并保留原有配置（切换照常进行）：{error}"),
+            SettingsBackfillPayload { settings },
+        );
+    }
+
+    // 回填会就地改写 profile 与公共配置。先在副本上跑，成功才提交，避免中途
+    // 失败时留下「改了一半」的 profile 被后续切换流程用上。
+    let mut next_profile = settings.relay_profiles[profile_index].clone();
+    let mut next_context = settings.relay_context_config_contents.clone();
     match codex_plus_core::relay_config::backfill_relay_profile_from_home_with_common(
         &home,
-        profile,
-        &mut settings.relay_context_config_contents,
+        &mut next_profile,
+        &mut next_context,
     ) {
         Ok(()) => {
+            settings.relay_profiles[profile_index] = next_profile;
+            settings.relay_context_config_contents = next_context;
             log_manager_event(
                 "manager.backfill_relay_profile_from_live.ok",
                 json!({
@@ -6610,6 +6717,16 @@ fn failed<T: Serialize>(message: &str, payload: T) -> CommandResult<T> {
     }
 }
 
+/// 「功能降级但流程可继续」：与 `failed` 区分开，让调用方能继续走后面的步骤，
+/// 同时仍然把原因提示给用户（issue #618 的回填跳过即属此列）。
+fn degraded<T: Serialize>(message: &str, payload: T) -> CommandResult<T> {
+    CommandResult {
+        status: "degraded".to_string(),
+        message: message.to_string(),
+        payload,
+    }
+}
+
 // Hold ownership across stop and config sync, then release before the successor starts.
 fn ensure_provider_sync_is_idle_before_stop() -> Result<codex_plus_data::ProviderSyncLifecycleGuard, String> {
     codex_plus_data::try_acquire_provider_sync_lifecycle_guard(None).map_err(|error| {
@@ -6697,6 +6814,75 @@ mod tests {
         let status = requested_launch_status(&request, "starting", "starting", 1);
 
         assert_eq!(status.codex_app, None);
+    }
+
+    /// issue #618：live config.toml 有语法错误时必须被判成「可降级」，而不是让
+    /// 整条供应商切换流程失败。缺失文件等同于空文件，同样不阻断。
+    #[test]
+    fn live_config_backfill_blocking_error_only_flags_unparseable_toml() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+
+        // 文件不存在（全新安装）→ 不阻断。
+        assert_eq!(live_config_backfill_blocking_error(home), None);
+
+        // 空文件 / 只有空白 → 不阻断。
+        std::fs::write(home.join("config.toml"), "  \n").unwrap();
+        assert_eq!(live_config_backfill_blocking_error(home), None);
+
+        // 正常 TOML → 不阻断。
+        std::fs::write(
+            home.join("config.toml"),
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"https://relay.example/v1\"\n",
+        )
+        .unwrap();
+        assert_eq!(live_config_backfill_blocking_error(home), None);
+
+        // 手写坏掉的 TOML（未闭合数组）→ 必须阻断并带上位置信息。
+        std::fs::write(
+            home.join("config.toml"),
+            "model_provider = \"custom\"\nmodel_list = [\"a\", \n",
+        )
+        .unwrap();
+        let error = live_config_backfill_blocking_error(home)
+            .expect("unparseable live config must be reported as blocking");
+        assert!(!error.is_empty(), "error detail must not be empty");
+    }
+
+    /// 重复表头/重复根键属于 core 归一层能修好的形态，预检不能误报成语法错误——
+    /// 否则 #618 的降级路径会吃掉本来能成功的回填。
+    #[test]
+    fn live_config_backfill_blocking_error_tolerates_duplicate_tables_and_root_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "\
+model = \"a\"
+model = \"b\"
+
+[mcp_servers.node_repl]
+command = \"node\"
+
+[mcp_servers.node_repl]
+cwd = \"/tmp\"
+",
+        )
+        .unwrap();
+
+        assert_eq!(live_config_backfill_blocking_error(temp.path()), None);
+    }
+
+    /// 预检必须与 core 的读取路径同样剥掉 BOM，否则带 BOM 的正常文件会被误判。
+    #[test]
+    fn live_config_backfill_blocking_error_ignores_utf8_bom() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "\u{feff}model_provider = \"openai\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(live_config_backfill_blocking_error(temp.path()), None);
     }
 
     #[test]
@@ -6790,6 +6976,43 @@ mod tests {
             encrypted_content_warning: None,
             repair_audit: codex_plus_data::ProviderSyncAudit::default(),
         }
+    }
+
+    #[test]
+    fn provider_sync_success_reports_backup_directory_when_something_changed() {
+        let mut sync = provider_sync_result_for_test(
+            codex_plus_data::ProviderSyncStatus::Synced,
+            "Provider sync complete",
+        );
+        sync.changed_session_files = 3;
+        sync.backup_dir = Some(std::path::PathBuf::from("/tmp/backups/provider-sync/run-1"));
+
+        let result = provider_sync_command_result(sync);
+
+        assert_eq!(result.status, "ok");
+        assert!(
+            result.message.contains("/tmp/backups/provider-sync/run-1"),
+            "有改动时应告知备份目录：{}",
+            result.message
+        );
+    }
+
+    /// 什么都没改的时候不该多出一行备份目录，避免噪音。
+    #[test]
+    fn provider_sync_success_omits_backup_hint_without_changes() {
+        let sync = provider_sync_result_for_test(
+            codex_plus_data::ProviderSyncStatus::Synced,
+            "Provider sync already up to date",
+        );
+
+        let result = provider_sync_command_result(sync);
+
+        assert_eq!(result.status, "ok");
+        assert!(
+            !result.message.contains("备份目录："),
+            "无改动时不该提示备份目录：{}",
+            result.message
+        );
     }
 
     #[test]
