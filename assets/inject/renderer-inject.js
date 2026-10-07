@@ -1323,18 +1323,29 @@
        * 页面 overlay 的 left 由 positionCodexPlusPage 按图标栏右边界算好写进来。
        *
        * 关键：写进来的必须是**布局坐标**（视觉值 / zoom），因为 overlay 自己在缩放
-       * 空间里布局，宽度也要用同一个空间的量。width 的 calc(100vw / zoom - left)
-       * 把右边贴到视口右边缘；两个量都除过 zoom，缩放后才正好补齐。
+       * 空间里布局，宽度也要用同一个空间的量。width 的 calc(100vw / zoom - left - right)
+       * 把右边贴到原生内容区的右边缘；三个量都除过 zoom，缩放后才正好补齐。
        * 注意：本段在 JS 模板字符串里，注释里不能出现反引号，否则会提前闭合。
+       *
+       * 右/下各留一圈槽（原生是 4px）并给四角加圆角，对齐官方面板的观感：
+       * 官方页面面板 [_PageSurface_] 的 rect 与我们这块 overlay 完全相同（都是
+       * [52, 44, 1663, 940]），四角 12px；它外面套了一个 padding: 0 4px 4px 0 的槽，
+       * 右、下能看到底色。我们原先 right/bottom 贴 0 且无圆角，于是方角并且比官方
+       * 多占 4px，用户反馈「少一个圆角」就是这个。
+       * 圆角值由 positionCodexPlusPage 量官方面板写入，四个角一起用，不做左右区分。
+       * overflow: hidden 让圆角真正裁到内容；内容都在 .codex-plus-modal-content 内，
+       * 没有依赖溢出显示的全屏浮层，切掉是安全的。
        */
       .${codexPlusPageClass} {
         position: fixed;
-        top: 0;
-        right: 0;
-        bottom: 0;
-        left: 0;
-        width: calc(100vw / var(--codex-plus-zoom, 1) - var(--codex-plus-page-left, 0px));
-        height: calc(100vh / var(--codex-plus-zoom, 1));
+        top: var(--codex-plus-page-top, 0px);
+        right: var(--codex-plus-page-right, 0px);
+        bottom: var(--codex-plus-page-bottom, 0px);
+        left: var(--codex-plus-page-left, 0px);
+        width: calc(100vw / var(--codex-plus-zoom, 1) - var(--codex-plus-page-left, 0px) - var(--codex-plus-page-right, 0px));
+        height: calc(100vh / var(--codex-plus-zoom, 1) - var(--codex-plus-page-top, 0px) - var(--codex-plus-page-bottom, 0px));
+        border-radius: var(--codex-plus-page-radius, 0px);
+        overflow: hidden;
         z-index: 2147483644;
         display: block;
         background: var(--codex-plus-bg-primary, #fff);
@@ -5585,7 +5596,49 @@
     const layoutLeft = zoom === 1 ? left : left / zoom;
     overlay.style.setProperty("--codex-plus-page-left", `${layoutLeft}px`);
     overlay.style.left = `${layoutLeft}px`;
-    overlay.style.top = "0px";
+    // 官方顶部有一条 header（返回/前进/隐藏侧边栏），图标栏与侧边栏都从它的下沿开始。
+    // 我们的 overlay 若从 y=0 铺满就会把整条 header 盖住——用户反馈「比官方少了一条顶部栏」
+    // 就是这个原因。这里同样量图标栏的顶边（而非硬编码高度），让 overlay 从 header 下沿开始。
+    const top = railRect && railRect.height > 0
+      ? Math.max(0, railRect.top)
+      : (rect && rect.height > 0 ? Math.max(0, rect.top) : 0);
+    const layoutTop = zoom === 1 ? top : top / zoom;
+    overlay.style.setProperty("--codex-plus-page-top", `${layoutTop}px`);
+    overlay.style.top = `${layoutTop}px`;
+    // 右侧与下方官方各留了一圈槽：整行的 [data-app-shell-workspace-row] 比视口小
+    // （真机 1715x984 / 视口 1719x988，即右、下各 4px），官方内容面板正好收在行的右下角。
+    // 我们原先 right/bottom 都贴 0，于是比官方多占这 4px。这里量取而不是硬编码 4。
+    const row = document.querySelector("[data-app-shell-workspace-row]");
+    const rowRect = row?.getBoundingClientRect?.();
+    const rightGutter = rowRect && rowRect.width > 0 ? Math.max(0, window.innerWidth - rowRect.right) : 0;
+    const bottomGutter = rowRect && rowRect.height > 0 ? Math.max(0, window.innerHeight - rowRect.bottom) : 0;
+    const layoutRight = zoom === 1 ? rightGutter : rightGutter / zoom;
+    const layoutBottom = zoom === 1 ? bottomGutter : bottomGutter / zoom;
+    overlay.style.setProperty("--codex-plus-page-right", `${layoutRight}px`);
+    overlay.style.setProperty("--codex-plus-page-bottom", `${layoutBottom}px`);
+    overlay.style.right = `${layoutRight}px`;
+    overlay.style.bottom = `${layoutBottom}px`;
+    // 圆角同样量取官方面板自身的值，不写死 12px。
+    // 这里量的是 _PageSurface_：官方那个与我们 overlay 同格子的页面面板（rect 都是
+    // [52, 44, 1663, 940]），它四角同为 12px，左侧那一角也真实可见——真机像素扫描确认
+    // 官方左边缘从 y=44 的 x=62 收到 y=54 的 x=52，是一条完整的弧。
+    // 别改用 main[data-app-shell-main-surface] 的 --app-shell-main-surface-clip-start-radius：
+    // 那个元素左边缘在 362（缩在侧边栏后面），左侧还用 inset 负内缩把圆角裁掉，start 恒为 0，
+    // 会让人误判左侧不该圆——第一版就是这么写错的，用户反馈「少一个圆角」正是缺了左边两个角。
+    // 类名是 CSS Modules 的哈希名，但 _PageSurface_ 这个片段稳定，且不会命中 _PageSurfaceLayout_
+    //（其后紧跟 L 而非 _）。量到的是视觉值，同样折算成布局坐标。读不到就保持 0，不做猜测。
+    const pageSurface = document.querySelector('[class*="_PageSurface_"]');
+    const pageSurfaceStyle = pageSurface ? getComputedStyle(pageSurface) : null;
+    const mainSurfaceStyle = (() => {
+      const main = document.querySelector("main[data-app-shell-main-surface]");
+      return main ? getComputedStyle(main) : null;
+    })();
+    const radius =
+      parseFloat(pageSurfaceStyle?.borderTopLeftRadius || "") ||
+      parseFloat(mainSurfaceStyle?.getPropertyValue("--app-shell-main-surface-clip-end-radius") || "") ||
+      0;
+    const layoutRadius = zoom === 1 ? radius : radius / zoom;
+    overlay.style.setProperty("--codex-plus-page-radius", `${layoutRadius}px`);
   }
 
   function codexPlusHostUsesLightTheme() {
@@ -7289,25 +7342,31 @@
     };
   }
 
-  function wrapThreadTitleForBadge(row, titleNode) {
-    const parent = titleNode?.parentElement;
-    if (!parent) return null;
-    if (parent.dataset?.codexThreadIdBadgeWrap === "true") return parent;
-    const wrapper = document.createElement("span");
-    wrapper.dataset.codexThreadIdBadgeWrap = "true";
-    parent.insertBefore(wrapper, titleNode);
-    wrapper.appendChild(titleNode);
-    return wrapper;
+  // issue #2180：过去这里把官方 React 管理的标题节点塞进自建的 wrapper 里
+  // （parent.insertBefore(wrapper, titleNode) + wrapper.appendChild(titleNode)）。
+  // 标题节点一旦被搬走，React 的移除链路就会对着自己记录的旧父节点做
+  // removeChild，抛 `NotFoundError: The node to be removed is not a child of this node`。
+  // 新建对话几分钟后标题从临时名转正式名、侧栏重排时正好命中，页面直接进错误页。
+  // 现在不搬动任何 React 节点：徽章作为 titleNode 的**兄弟**插在它前面，
+  // 行的 flex 布局本来就按顺序排（徽章自带 flex:0 0 auto + margin-right）。
+  function threadIdBadgeInsertBefore(titleNode) {
+    return titleNode?.parentElement || titleNode?.parentNode || null;
   }
 
-  function removeThreadIdBadges(root = document) {
-    root.querySelectorAll?.(`.${threadIdBadgeClass}`).forEach((badge) => badge.remove());
+  // 存量数据清理：旧版留下的 wrapper 需要还原一次，否则标题会一直被困在里面。
+  // 只做还原，不再新建任何 wrapper。
+  function unwrapThreadIdBadgeWrappers(root = document) {
     root.querySelectorAll?.('[data-codex-thread-id-badge-wrap="true"]').forEach((wrapper) => {
       const parent = wrapper.parentElement;
       if (!parent) return;
       while (wrapper.firstChild) parent.insertBefore(wrapper.firstChild, wrapper);
       wrapper.remove();
     });
+  }
+
+  function removeThreadIdBadges(root = document) {
+    root.querySelectorAll?.(`.${threadIdBadgeClass}`).forEach((badge) => badge.remove());
+    unwrapThreadIdBadgeWrappers(root);
     const rows = root.matches?.(selectors.sidebarThread) ? [root] : Array.from(root.querySelectorAll?.(selectors.sidebarThread) || []);
     rows.forEach((row) => {
       delete row.dataset.codexThreadIdBadge;
@@ -7328,14 +7387,19 @@
       return;
     }
 
-    const wrapper = wrapThreadTitleForBadge(row, titleNode);
-    if (!wrapper) return;
+    // 旧 wrapper 先还原，保证 badge 与 titleNode 在同一个父节点下做兄弟。
+    unwrapThreadIdBadgeWrappers(row);
 
-    let badge = wrapper.querySelector(`.${threadIdBadgeClass}`);
-    if (!badge) {
+    const parent = threadIdBadgeInsertBefore(titleNode);
+    if (!parent) return;
+
+    let badge = row.querySelector(`.${threadIdBadgeClass}`);
+    if (!badge || badge.parentElement !== parent) {
+      badge?.remove();
       badge = document.createElement("span");
       badge.className = threadIdBadgeClass;
-      wrapper.insertBefore(badge, titleNode);
+      // 只插自己的节点，不碰官方节点。
+      parent.insertBefore(badge, titleNode);
     }
 
     badge.dataset.codexThreadIdBadgeVersion = codexThreadIdBadgeVersion;
@@ -8193,13 +8257,37 @@
     if (assetPrefix.startsWith("app-initial-")) {
       return typeof module?.qut === "function" ? module.qut : null;
     }
+    if (assetPrefix.startsWith("app-shared-")) {
+      return codexStateCallByCapability(module);
+    }
     return null;
+  }
+
+  // issue #2399：26.930 起 state API 随 AppServerRequestClient 一起搬进 app-shared-*，
+  // 而这批产物每次构建都会重排压缩导出名（旧版是 qut），按字面量取必然落空。
+  // 改成按能力找：函数源码里带 get-global-state / set-global-state 的就是它。
+  function codexStateCallByCapability(module) {
+    const values = module && typeof module === "object" ? Object.values(module) : [];
+    return values.find((candidate) => {
+      if (typeof candidate !== "function") return false;
+      let source = "";
+      try {
+        source = String(candidate);
+      } catch {
+        return false;
+      }
+      return source.includes("get-global-state")
+        && source.includes("set-global-state")
+        && source.includes("params");
+    }) || null;
   }
 
   async function codexStateApi() {
     codexStateApiPromise = codexStateApiPromise || (async () => {
       const errors = [];
-      for (const assetPrefix of ["vscode-api-", "app-initial-"]) {
+      // 前三项是历史前缀（列表字面量本身是契约的一部分，不要改写）；
+      // app-shared- 是 26.930+ 的新位置，靠内容识别，不依赖压缩导出名。
+      for (const assetPrefix of [...["vscode-api-", "app-initial-"], "app-shared-"]) {
         try {
           const api = await loadCodexAppModule(assetPrefix);
           const call = codexStateApiFromModule(api, assetPrefix);
@@ -8872,29 +8960,85 @@
     return { lineNumber, columnNumber: braceIdx - lastNewline - 1 };
   }
 
+  // issue #2399：抓取目标不能再按 asset 文件名前缀写死。Codex 26.930 把
+  // AppServerRequestClient 从 `app-initial-*.js` 搬到了 `app-shared-*.js`，
+  // 按前缀找资产必然 anchor_missing，模型白名单解锁在整条 app-server 路径上失效。
+  // 加一项前缀只治当前这一版，下次改名又会失灵，所以改成**按内容找类定义**：
+  // 遍历已加载的 app asset，谁包含 marker 文本谁就是目标，两代产物都能覆盖。
+  // 排序只做「可能的更靠前」的启发式，不影响正确性；命中全靠文本匹配。
+  const codexAppServerClientBundleHints = ["app-shared-", "app-initial-", "app-main-", "chatg"];
+  const codexAppServerClientAssetFetchLimit = 24;
+
+  function codexAppServerClientAssetCandidateUrls() {
+    const urls = codexAppAssetCandidateUrls();
+    const rank = (url) => {
+      const name = (url.split("/").pop() || "").toLowerCase();
+      const hint = codexAppServerClientBundleHints.findIndex((part) => name.includes(part));
+      return hint < 0 ? codexAppServerClientBundleHints.length : hint;
+    };
+    // 按「像主 bundle」在前、体积（URL 长度做代理）大的在前排序，再截断。
+    // 全量 fetch 所有 app asset 会重蹈 #1960 的覆辙，所以限制尝试数量。
+    return urls
+      .slice()
+      .sort((left, right) => rank(left) - rank(right) || right.length - left.length)
+      .slice(0, codexAppServerClientAssetFetchLimit);
+  }
+
+  // 返回 { url, location }；找不到返回 null。diagnostics 由调用方按命中/未命中归类。
+  async function locateCodexAppServerClientInAssets() {
+    const urls = codexAppServerClientAssetCandidateUrls();
+    if (urls.length === 0) return { urls, hit: null };
+    // 先走廉价的 asset loader（有 30s 失败冷却与重试上限），脚本里已经内联了
+    // asset 名时能直接命中，省掉整轮 fetch；不可用就退回到全量文本匹配。
+    const hinted = resolveCodexAppServerClientHintedUrl();
+    const ordered = hinted
+      ? [hinted, ...urls.filter((url) => url !== hinted)]
+      : urls;
+    for (const url of ordered) {
+      try {
+        const text = await fetch(url).then((response) => response.ok ? response.text() : "");
+        if (!text) continue;
+        const location = locateCodexAppServerClientBreakpoint(text);
+        if (location) return { urls, hit: { url, location } };
+      } catch {
+        // 单个 asset 拉取失败不影响其余候选，继续下一个。
+      }
+    }
+    return { urls, hit: null };
+  }
+
+  // 兼容旧路径：asset 名确实内联在入口脚本里时，用 loader 的缓存直接拿到 URL，
+  // 不必为了它把所有 asset 拉一遍。找不到就返回空串，交给内容匹配兜底。
+  function resolveCodexAppServerClientHintedUrl() {
+    for (const prefix of codexAppServerClientBundleHints) {
+      const url = codexAppAssetUrl(prefix);
+      if (url) return url;
+    }
+    return "";
+  }
+
     let codexAppServerClientCaptureStarted = false;
   async function installCodexAppServerClientCapture() {
     if (codexAppServerClientCaptureStarted || window.__codexPlusAppServerClientCapture) return;
     codexAppServerClientCaptureStarted = true;
     try {
       if (typeof fetch !== "function") return;
-      const url = codexAppAssetUrl("app-initial-") || await codexAppAssetUrlFromScriptText("app-initial-");
-      if (!url) {
-        sendCodexPlusDiagnostic("app_server_client_capture_locate_failed", { reason: "asset_url_missing" });
+      const { urls, hit } = await locateCodexAppServerClientInAssets();
+      if (!hit) {
+        // 区分「一个候选资产都没有」和「有资产但没有类定义」：
+        // 前者是页面还没加载完，后者才是 Codex 真的改了产物形状。
+        sendCodexPlusDiagnostic("app_server_client_capture_locate_failed", {
+          reason: urls.length === 0 ? "asset_url_missing" : "anchor_missing",
+          candidateCount: urls.length,
+        });
         return;
       }
-      const response = await fetch(url);
-      const text = response.ok ? await response.text() : "";
-      const location = locateCodexAppServerClientBreakpoint(text);
-      if (!location) {
-        sendCodexPlusDiagnostic("app_server_client_capture_locate_failed", { reason: "anchor_missing" });
-        return;
-      }
-      const urlRegex = url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      window.__codexPlusAppServerClientCapture = { urlRegex, ...location };
+      const urlRegex = hit.url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      window.__codexPlusAppServerClientCapture = { urlRegex, ...hit.location };
       sendCodexPlusDiagnostic("app_server_client_capture_located", {
-        lineNumber: location.lineNumber,
-        columnNumber: location.columnNumber,
+        lineNumber: hit.location.lineNumber,
+        columnNumber: hit.location.columnNumber,
+        asset: (hit.url.split("/").pop() || "").split("?")[0],
       });
     } catch (error) {
       codexAppServerClientCaptureStarted = false;
