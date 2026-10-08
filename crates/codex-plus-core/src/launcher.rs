@@ -1238,6 +1238,10 @@ async fn handle_helper_connection(
     let request_user_agent = header_value_from_headers(&request_headers, "user-agent");
     let request_beta_features =
         header_value_from_headers(&request_headers, "x-codex-beta-features");
+    let request_session_id = header_value_from_headers(&request_headers, "session-id");
+    let request_thread_id = header_value_from_headers(&request_headers, "thread-id");
+    let request_opencode_session =
+        header_value_from_headers(&request_headers, "x-opencode-session");
     let request_content_type = header_value_from_headers(&request_headers, "content-type");
     let request_content_encoding = header_value_from_headers(&request_headers, "content-encoding");
     let remote_addr_text = remote_addr.map(|addr| addr.to_string());
@@ -1361,6 +1365,11 @@ async fn handle_helper_connection(
             &request_body,
             request_user_agent.as_deref(),
             request_beta_features.as_deref(),
+            crate::protocol_proxy::ProxySessionHeaders {
+                session_id: request_session_id.as_deref(),
+                thread_id: request_thread_id.as_deref(),
+                opencode_session: request_opencode_session.as_deref(),
+            },
             method,
             path,
             remote_addr_text,
@@ -1701,16 +1710,18 @@ async fn handle_protocol_proxy_connection(
     request_body: &str,
     request_user_agent: Option<&str>,
     request_beta_features: Option<&str>,
+    session_headers: crate::protocol_proxy::ProxySessionHeaders<'_>,
     method: &str,
     path: &str,
     remote_addr_text: Option<String>,
 ) -> anyhow::Result<()> {
     let request_json = serde_json::from_str::<serde_json::Value>(request_body).ok();
-    let upstream = match crate::protocol_proxy::open_responses_proxy_request_for_path_with_beta(
+    let upstream = match crate::protocol_proxy::open_responses_proxy_request_for_path_with_session_headers(
         request_body,
         request_user_agent,
         path,
         request_beta_features,
+        session_headers,
     )
     .await
     {
@@ -1796,15 +1807,26 @@ async fn handle_protocol_proxy_connection(
             stream.shutdown().await?;
             return Ok(());
         }
-        if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
-            let mut bytes_stream = upstream.response.bytes_stream();
-            while let Some(chunk) = bytes_stream.next().await {
-                if let Ok(bytes) = chunk {
-                    stream.write_all(&bytes).await?;
-                } else {
-                    break;
-                }
-            }
+        let failure = forward_protocol_proxy_stream(
+            stream,
+            upstream.response,
+            upstream.wire_api,
+            request_json.as_ref(),
+        )
+        .await?;
+        if let Some(reason) = failure {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "helper.protocol_proxy_stream_failed",
+                serde_json::json!({
+                    "method": method,
+                    "path": path,
+                    "status": "200 OK",
+                    "stream_outcome": "failed",
+                    "error": reason,
+                    "remote_addr": remote_addr_text
+                }),
+            );
+        } else {
             log_helper_response(
                 "helper.protocol_proxy_stream_ok",
                 method,
@@ -1812,49 +1834,7 @@ async fn handle_protocol_proxy_connection(
                 "200 OK",
                 remote_addr_text,
             );
-            stream.shutdown().await?;
-            return Ok(());
         }
-        let mut converter = request_json
-            .as_ref()
-            .map(crate::protocol_proxy::ChatSseToResponsesConverter::with_request)
-            .unwrap_or_default();
-        let mut bytes_stream = upstream.response.bytes_stream();
-        let mut stream_failed = false;
-        while let Some(chunk) = bytes_stream.next().await {
-            match chunk {
-                Ok(bytes) => {
-                    let converted = converter.push_bytes(&bytes);
-                    if !converted.is_empty() {
-                        stream.write_all(&converted).await?;
-                    }
-                }
-                Err(error) => {
-                    let failed = converter.fail(
-                        format!("Stream error: {error}"),
-                        Some("stream_error".to_string()),
-                    );
-                    if !failed.is_empty() {
-                        stream.write_all(&failed).await?;
-                    }
-                    stream_failed = true;
-                    break;
-                }
-            }
-        }
-        if !stream_failed {
-            let tail = converter.finish();
-            if !tail.is_empty() {
-                stream.write_all(&tail).await?;
-            }
-        }
-        log_helper_response(
-            "helper.protocol_proxy_stream_ok",
-            method,
-            path,
-            "200 OK",
-            remote_addr_text,
-        );
         stream.shutdown().await?;
         return Ok(());
     }
@@ -2351,6 +2331,58 @@ async fn write_http_stream_headers(
     );
     stream.write_all(response.as_bytes()).await?;
     Ok(())
+}
+
+// 返回流失败原因，HTTP 响应头已经发送，不能再把失败伪装成第二个 HTTP 502。
+async fn forward_protocol_proxy_stream(
+    stream: &mut tokio::net::TcpStream,
+    response: reqwest::Response,
+    wire_api: crate::protocol_proxy::UpstreamWireApi,
+    request: Option<&Value>,
+) -> anyhow::Result<Option<String>> {
+    let mut chunks = response.bytes_stream();
+    if wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
+        while let Some(chunk) = chunks.next().await {
+            match chunk {
+                Ok(bytes) => stream.write_all(&bytes).await?,
+                Err(error) => return Ok(Some(error.without_url().to_string())),
+            }
+        }
+        return Ok(None);
+    }
+    let mut converter = request
+        .map(crate::protocol_proxy::ChatSseToResponsesConverter::with_request)
+        .unwrap_or_default();
+    while let Some(chunk) = chunks.next().await {
+        match chunk {
+            Ok(bytes) => {
+                let converted = converter.push_bytes(&bytes);
+                stream.write_all(&converted).await?;
+                if converter.has_failed() {
+                    return Ok(Some("上游返回了流式错误事件".to_string()));
+                }
+            }
+            Err(error) => {
+                let failed = converter.fail(
+                    "上游响应流读取失败".to_string(),
+                    Some("stream_error".to_string()),
+                );
+                stream.write_all(&failed).await?;
+                return Ok(Some(error.without_url().to_string()));
+            }
+        }
+    }
+    // EOF 不是 Chat 协议的完成事件；已发出的文本和工具增量不能自动重放。
+    if !converter.has_terminal_event() {
+        let failed = converter.fail(
+            "上游在完成事件前结束了响应流".to_string(),
+            Some("stream_incomplete".to_string()),
+        );
+        stream.write_all(&failed).await?;
+        return Ok(Some("上游缺少完成事件".to_string()));
+    }
+    stream.write_all(&converter.finish()).await?;
+    Ok(None)
 }
 
 fn log_helper_response(
@@ -4243,7 +4275,7 @@ mod tests {
         });
         let mut client = tokio::net::TcpStream::connect(helper_addr).await.unwrap();
         let headers = format!(
-            "POST /v1/responses HTTP/1.1\r\nHost: {helper_addr}\r\nAuthorization: Bearer chatgpt-secret\r\nContent-Type: application/json\r\nContent-Encoding: zstd\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "POST /v1/responses HTTP/1.1\r\nHost: {helper_addr}\r\nAuthorization: Bearer chatgpt-secret\r\nSeSsIoN-Id: conversation-123\r\nTHREAD-ID: thread-123\r\nX-OpenCode-Session: opencode-123\r\nCookie: private-cookie\r\nX-Unrelated: private-value\r\nContent-Type: application/json\r\nContent-Encoding: zstd\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             compressed.len()
         );
         client.write_all(headers.as_bytes()).await.unwrap();
@@ -4260,6 +4292,11 @@ mod tests {
         assert!(upstream_headers.starts_with("post /v1/responses http/1.1"));
         assert!(upstream_headers.contains("authorization: bearer sk-upstream"));
         assert!(!upstream_headers.contains("chatgpt-secret"));
+        assert!(upstream_headers.contains("session-id: conversation-123"));
+        assert!(upstream_headers.contains("thread-id: thread-123"));
+        assert!(upstream_headers.contains("x-opencode-session: opencode-123"));
+        assert!(!upstream_headers.contains("private-cookie"));
+        assert!(!upstream_headers.contains("private-value"));
         let upstream_body: serde_json::Value =
             serde_json::from_slice(&upstream_request[header_end + 4..]).unwrap();
         assert_eq!(upstream_body["model"], "gpt-5.6-sol");
@@ -4384,5 +4421,89 @@ mod tests {
         helper.await.unwrap();
         assert_eq!(upstream.await.unwrap(), expected_body);
         crate::paths::set_settings_path_for_tests(previous_settings_path);
+    }
+}
+
+#[cfg(test)]
+mod proxy_stream_tests {
+    use super::forward_protocol_proxy_stream;
+    use crate::protocol_proxy::UpstreamWireApi;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn forward_fixture(body: &str, truncated: bool, wire: UpstreamWireApi) -> (Option<String>, String) {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let body = body.to_owned();
+        let upstream_task = tokio::spawn(async move {
+            let (mut socket, _) = upstream.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let byte = socket.read_u8().await.unwrap();
+                request.push(byte);
+                if request.ends_with(b"\r\n\r\n") { break; }
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
+            socket.write_all(format!("{:X}\r\n{}\r\n", body.len(), body).as_bytes()).await.unwrap();
+            if !truncated { socket.write_all(b"0\r\n\r\n").await.unwrap(); }
+            socket.shutdown().await.unwrap();
+        });
+        let response = reqwest::Client::builder().no_proxy().build().unwrap()
+            .get(format!("http://{address}/stream?key=fixture-secret")).send().await.unwrap();
+        let downstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut reader = tokio::net::TcpStream::connect(downstream.local_addr().unwrap()).await.unwrap();
+        let (mut writer, _) = downstream.accept().await.unwrap();
+        let forwarded = tokio::spawn(async move {
+            let result = forward_protocol_proxy_stream(&mut writer, response, wire, None).await.unwrap();
+            writer.shutdown().await.unwrap();
+            result
+        });
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        let result = forwarded.await.unwrap();
+        upstream_task.await.unwrap();
+        (result, String::from_utf8(bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn transport_errors_are_failures_for_native_and_chat_streams() {
+        for wire in [UpstreamWireApi::Responses, UpstreamWireApi::ChatCompletions] {
+            let (failure, output) = forward_fixture(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n", true, wire,
+            ).await;
+            let failure = failure.expect("truncated transfer must not log stream_ok");
+            assert!(!failure.contains("fixture-secret"));
+            assert!(!output.contains("event: response.completed"));
+            if wire == UpstreamWireApi::ChatCompletions {
+                assert!(output.contains("event: response.failed"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_eof_and_error_events_are_not_completed_or_replayed() {
+        for body in [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            "event: error\ndata: {\"error\":{\"message\":\"failed\"}}\n\n",
+        ] {
+            let (failure, output) = forward_fixture(body, false, UpstreamWireApi::ChatCompletions).await;
+            assert!(failure.is_some());
+            assert!(output.contains("event: response.failed"));
+            assert!(!output.contains("event: response.completed"));
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_native_passthrough_and_chat_completion_are_preserved() {
+        let native = "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
+        let (failure, output) = forward_fixture(native, false, UpstreamWireApi::Responses).await;
+        assert!(failure.is_none());
+        assert_eq!(output, native);
+        let (failure, output) = forward_fixture(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            false, UpstreamWireApi::ChatCompletions,
+        ).await;
+        assert!(failure.is_none());
+        assert!(output.contains("event: response.completed"));
+        assert!(!output.contains("event: response.failed"));
     }
 }
