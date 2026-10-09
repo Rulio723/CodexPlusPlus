@@ -109,6 +109,9 @@ import {
   suffixWindowString,
   normalizeTokenCountInput,
   modelMetadataKey,
+  modelFastSupportMode,
+  synchronizeModelMetadataFastSupport,
+  type ModelFastSupportMode,
   parseModelMetadataDocument,
   parseModelMetadataMap,
   remapModelMetadataSlugs,
@@ -259,11 +262,11 @@ type BackendSettings = WhaleBalanceSettings & {
   codexAppModelWhitelistUnlock: boolean;
   codexAppSessionDelete: boolean;
   codexAppMarkdownExport: boolean;
+  codexAppSessionShare: boolean;
   codexAppPasteFix: boolean;
   codexAppTypingEffect: TypingEffect;
   codexAppThreadIdBadge: boolean;
   codexAppConversationView: boolean;
-  codexAppCustomLayoutEnabled: boolean;
   codexAppThreadScrollRestore: boolean;
   codexAppNativeMenuPlacement: boolean;
   codexAppNativeBrowserRequireIdentification: boolean;
@@ -1015,11 +1018,11 @@ const defaultSettings: BackendSettings = {
   codexAppModelWhitelistUnlock: true,
   codexAppSessionDelete: true,
   codexAppMarkdownExport: true,
+  codexAppSessionShare: true,
   codexAppPasteFix: false,
   codexAppTypingEffect: "off",
   codexAppThreadIdBadge: false,
   codexAppConversationView: false,
-  codexAppCustomLayoutEnabled: false,
   codexAppThreadScrollRestore: true,
   codexAppNativeMenuPlacement: true,
   codexAppNativeBrowserRequireIdentification: false,
@@ -5171,6 +5174,7 @@ function EnhanceScreen({
               <FeatureGroup title={t("对话与输入")} detail={t("调整会话管理、输入行为和对话阅读体验。")}>
                 <FeatureToggle title={t("会话删除")} detail={t("在会话列表悬停显示删除按钮，并支持撤销。")} checked={form.codexAppSessionDelete} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppSessionDelete", value)} />
                 <FeatureToggle title={t("Markdown 导出")} detail={t("在会话列表显示导出按钮，导出带时间戳的 Markdown。")} checked={form.codexAppMarkdownExport} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppMarkdownExport", value)} />
+                <FeatureToggle title={t("分享会话按钮")} detail={t("在当前会话工具栏显示分享按钮，保存后更新显示，无需重启 Codex。")} checked={form.codexAppSessionShare} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppSessionShare", value)} />
                 <FeatureToggle title={t("粘贴修复")} detail={t("从 Word 等富文本粘贴到 Codex composer 时只保留纯文本，避免被识别为图片/文件附件。需重启 Codex 才生效。")} checked={form.codexAppPasteFix} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppPasteFix", value)} />
                 <div className={`feature-toggle ${!masterEnabled ? "disabled" : ""}`}>
                   <span>
@@ -5192,7 +5196,6 @@ function EnhanceScreen({
                 </div>
                 <FeatureToggle title={t("会话 ID 标识")} detail={t("在侧边栏会话标题前显示短 ID 和 UUIDv7 创建时间，方便定位历史会话。")} checked={form.codexAppThreadIdBadge} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppThreadIdBadge", value)} />
                 <FeatureToggle title={t("对话居中宽度")} detail={t("把主对话和输入框限制到固定最大宽度，适合大屏阅读。")} checked={form.codexAppConversationView} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppConversationView", value)} />
-                <FeatureToggle title={t("自定义布局")} detail={t("在 Codex++ 页面点击“编辑布局”，拖动面板时其他区域会弹性让位；支持磁吸和下次打开恢复。")} checked={form.codexAppCustomLayoutEnabled} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppCustomLayoutEnabled", value)} />
                 <FeatureToggle title={t("切换对话保留位置")} detail={t("切换 thread 时恢复上一次浏览位置。")} checked={form.codexAppThreadScrollRestore} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppThreadScrollRestore", value)} />
               </FeatureGroup>
               <FeatureGroup title={t("挂件与桌宠")} detail={t("在 Codex 中查看用量，设置自己的角色和互动方式。")}>
@@ -7750,15 +7753,41 @@ function SortableModelWindowEntry({ id, children }: SortableModelWindowEntryProp
   );
 }
 
-function RelayFold({ title, children, className = "", bodyClassName = "", issue }: {
+function RelayFold({ title, children, className = "", bodyClassName = "", issue, sectionId, defaultOpen = false }: {
   title: string;
   children: ReactNode;
   className?: string;
   bodyClassName?: string;
   issue?: string | null;
+  sectionId?: string;
+  defaultOpen?: boolean;
 }) {
+  const preferenceKey = sectionId ? `codex-plus-relay-fold:${sectionId}` : null;
+  const [open, setOpen] = useState(() => {
+    if (issue) return true;
+    try {
+      const stored = preferenceKey ? window.localStorage.getItem(preferenceKey) : null;
+      if (stored === "true" || stored === "false") return stored === "true";
+    } catch {
+      // 无法使用本地存储时仍可展开、编辑并保存供应商草稿。
+    }
+    return defaultOpen;
+  });
+  const previousIssue = useRef(issue);
+  useEffect(() => {
+    // 同一项错误更新文字时不抢回用户刚收起的面板，新出现的错误才展开。
+    if (issue && !previousIssue.current) setOpen(true);
+    previousIssue.current = issue;
+  }, [issue]);
   return (
-    <details className={`relay-fold ${className}`.trim()}>
+    <details className={`relay-fold ${className}`.trim()} open={open} onToggle={(event) => {
+      const next = event.currentTarget.open;
+      if (next === open) return;
+      setOpen(next);
+      if (preferenceKey) {
+        try { window.localStorage.setItem(preferenceKey, String(next)); } catch { /* 偏好不可写不影响编辑。 */ }
+      }
+    }}>
       <summary className="relay-fold-summary">
         <ChevronDown aria-hidden="true" className="relay-fold-chevron h-4 w-4" />
         <strong>{title}</strong>
@@ -8120,7 +8149,8 @@ function RelayProfileEditor({
       imported: Boolean(importedModelMetadata[key]),
       // 内容与内置全字段一致时目标态就是「用内置」，不写自定义覆盖——
       // 否则「重新匹配后保存」会把内置数据复制成一份自定义配置。
-      matchesBuiltin: metadataImportPreview
+      matchesBuiltin: metadataImportPreview && !(importPrefillSource === "existing"
+        && modelFastSupportMode(metadataImportPreview.metadata) !== "inherit")
         ? metadataMatchesBuiltin(metadataImportPreview.documentEntry, builtinMetadata)
         : false,
     });
@@ -8156,6 +8186,7 @@ function RelayProfileEditor({
   };
   // 「重新匹配」：按当前模型名重查内置元数据并重填下方内容（含实时写回行窗口）。
   const rematchBuiltinImport = async (slug: string) => {
+    setImportPrefillSource("builtin");
     if (!slug.trim()) return;
     const querySeq = ++builtinQuerySeqRef.current;
     let match: BuiltinModelMetadataMatch | null = null;
@@ -8339,6 +8370,8 @@ function RelayProfileEditor({
         ) : null}
         <RelayFold
           className="relay-config-section relay-model-settings"
+          sectionId="models"
+          defaultOpen
           issue={modelRowsError || relayModelRoutesSettingsValidation(relaySettingsWithDraft(form, profile.id, profile, isNew))}
           title={t("模型配置")}
         >
@@ -8566,7 +8599,7 @@ function RelayProfileEditor({
                             disabled={!slug}
                             onClick={() => (importing ? cancelModelMetadataImport() : beginModelMetadataImport(index, slug))}
                             size="icon"
-                            title={imported ? t("查看或重新导入 models.json") : t("导入 models.json")}
+                            title={t("模型配置：元数据与 Fast 支持")}
                             type="button"
                             variant="ghost"
                           >
@@ -8586,11 +8619,35 @@ function RelayProfileEditor({
                         </div>
                         {importing ? (
                           <section className="relay-model-import-workbench">
+                            <Field label={t("Fast（priority）支持")}>
+                              <AppSelect
+                                ariaLabel={t("Fast（priority）支持")}
+                                value={importPrefillSource === "builtin" ? "inherit" : modelFastSupportMode(metadataImportPreview?.metadata)}
+                                onChange={(value) => {
+                                  const changed = synchronizeModelMetadataFastSupport(metadataImportDocument, slug, value as ModelFastSupportMode);
+                                  if (!changed) {
+                                    setMetadataImportError(t("请先修正当前模型的 JSON 配置，再设置 Fast 支持。"));
+                                    return;
+                                  }
+                                  setMetadataImportDocument(changed.document);
+                                  setMetadataImportPreview(changed.preview);
+                                  setImportPrefillSource("existing");
+                                  setMetadataImportError("");
+                                }}
+                                options={[
+                                  { value: "inherit", label: t("继承模型默认能力") },
+                                  { value: "supported", label: t("明确支持 priority") },
+                                  { value: "unsupported", label: t("不支持 priority") },
+                                ]}
+                              />
+                              <p className="field-hint">{t("按当前供应商逐模型声明。仅在上游支持 service_tier=priority 时选择支持；继承会清除自定义声明，取消不会保存修改。")}</p>
+                            </Field>
                             <Textarea
                               autoFocus
                               value={metadataImportDocument}
                               onChange={(event) => {
                                 const document = event.currentTarget.value;
+                                setImportPrefillSource("existing");
                                 setMetadataImportDocument(document);
                                 setMetadataImportError("");
                                 const parsed = parseModelMetadataDocument(document, slug);
@@ -8702,6 +8759,7 @@ function RelayProfileEditor({
                 {modelRowsError ? <div className="relay-model-metadata-import-error" role="alert">{modelRowsError}</div> : null}
                 <p className="field-hint">
                   {t("自动压缩留空时沿用 Codex 默认行为；填写百分比后会按该模型的上下文窗口重新计算阈值。")}
+                  {" "}{t("需要自定义 Fast 白名单时，打开对应模型的配置按钮，设置 Fast（priority）支持并保存此模型与供应商。")}
                 </p>
               </section>
             ) : null}
@@ -8819,6 +8877,7 @@ function RelayProfileEditor({
         </RelayFold>
         <RelayFold
           className="relay-config-section relay-request-settings"
+          sectionId="requests"
           issue={customHeadersError || relaySessionProviderValidation(profile)}
           title={t("请求设置")}
         >
@@ -8875,6 +8934,8 @@ function RelayProfileEditor({
                   <strong>{t("纯标准协议")}</strong>
                   <small>
                     {t("强制走标准 OpenAI 协议，不注入厂商私有 reasoning 参数。面向只认标准 OpenAI 字段、拒绝厂商私有参数的第三方网关。")}
+                    {" "}
+                    {t("若网关提示 thinking type: adaptive 无效，可启用此项后重试；这会停用厂商私有推理参数。")}
                   </small>
                 </span>
                 <ToggleVisual />
@@ -8970,7 +9031,7 @@ function RelayProfileEditor({
         </RelayFold>
       </div>
       <div className="relay-bottom-options">
-        <RelayFold className="relay-config-section relay-channel-protection" title={t("渠道保护")}>
+        <RelayFold className="relay-config-section relay-channel-protection" sectionId="channel-protection" title={t("渠道保护")}>
           <p className="relay-fold-description">
             {t("仅作用于当前供应商；可降低共享渠道触发 429、500 或 RPM 限制的概率。")}
           </p>
@@ -9056,7 +9117,7 @@ function RelayProfileEditor({
             </section>
           </div>
         </RelayFold>
-        <RelayFold className="relay-advanced-block" title={t("更多选项")}>
+        <RelayFold className="relay-advanced-block" sectionId="advanced" title={t("更多选项")}>
           <p className="relay-fold-description">
             {t("包含测试模型、上下文大小与压缩阈值；留空即沿用全局默认值。")}
           </p>
@@ -9863,7 +9924,7 @@ function RelayFileEditors({
   const entries = contextEntriesForProfile(form, contextProfile);
   return (
     <div className="relay-file-grid">
-      <RelayFold className="relay-file-panel relay-config-preview" title={t("config.toml 预览")}>
+      <RelayFold className="relay-file-panel relay-config-preview" sectionId="config-preview" title={t("config.toml 预览")}>
         <p className="relay-fold-description">
           {isActive ? t("当前供应商切换后会写入的预览；上下文开关变化会立即反映") : t("切换到此供应商时会写入的预览；上下文开关变化会立即反映")}
         </p>
@@ -9886,6 +9947,7 @@ function RelayFileEditors({
       <RelayFold
         bodyClassName="relay-common-config-body"
         className="relay-file-panel relay-common-config-panel"
+        sectionId="common-config"
         title={t("通用配置文件")}
       >
         <p className="relay-fold-description">
@@ -9927,7 +9989,7 @@ function RelayFileEditors({
             onValueChange={(value) => onFormChange({ ...form, relayCommonConfigContents: value })}
           />
       </RelayFold>
-      <RelayFold className="relay-file-panel relay-auth-preview" title="auth.json">
+      <RelayFold className="relay-file-panel relay-auth-preview" sectionId="auth-preview" title="auth.json">
         <p className="relay-fold-description">
           {isActive
             ? profile.relayMode === "pureApi"
@@ -11622,9 +11684,12 @@ function applyContextLimitPreview(configContents: string, profile: RelayProfile)
 function removeRootTomlKey(contents: string, key: string): string {
   const lines: string[] = [];
   let inRoot = true;
-  for (const line of contents.split(/\r?\n/)) {
-    if (/^\s*\[[^\]]+\]\s*$/.test(line)) inRoot = false;
-    if (inRoot && new RegExp(`^\\s*${key}\\s*=`).test(line)) continue;
+  const sourceLines = contents.split(/\r?\n/);
+  const structural = tomlStructureMask(sourceLines);
+  for (const [index, line] of sourceLines.entries()) {
+    if (structural[index] && tomlSectionName(line) !== null) inRoot = false;
+    const assignment = tomlKeyAssignment(line);
+    if (structural[index] && inRoot && assignment?.path.length === 1 && assignment.path[0] === key) continue;
     lines.push(line);
   }
   return ensureTrailingNewline(lines.join("\n").trimEnd());
@@ -11694,7 +11759,8 @@ function dedupeTomlRootLines(rootParts: string[]): string[] {
 
 function splitTomlRootAndTables(section: string): { root: string; tables: string } {
   const lines = section.trim().split(/\r?\n/);
-  const firstTable = lines.findIndex((line) => /^\s*\[[^\]]+\]\s*$/.test(line));
+  const structural = tomlStructureMask(lines);
+  const firstTable = lines.findIndex((line, index) => structural[index] && tomlSectionName(line) !== null);
   if (firstTable < 0) return { root: lines.join("\n"), tables: "" };
   return {
     root: lines.slice(0, firstTable).join("\n"),
@@ -11896,7 +11962,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
     ccsDbPath: (settings.ccsDbPath || "").trim(),
     dictation: normalizeDictationSettings(settings.dictation),
     codexAppTypingEffect: normalizeTypingEffect(settings.codexAppTypingEffect),
-    codexAppCustomLayoutEnabled: settings.codexAppCustomLayoutEnabled === true,
+    codexAppSessionShare: settings.codexAppSessionShare !== false,
     relayProfilesEnabled: settings.relayProfilesEnabled !== false,
     codexAppImageOverlayOpacity: clampNumber(settings.codexAppImageOverlayOpacity || 35, 1, 100),
     codexAppImageOverlayFitMode: normalizeImageOverlayFitMode(settings.codexAppImageOverlayFitMode),
@@ -12238,7 +12304,7 @@ function withGeneratedRelayFiles(profile: RelayProfile): RelayProfile {
   }
   return {
     ...profile,
-    configContents: buildRelayConfigToml(profile, { includeBearerToken: false, requiresOpenAiAuth: true }),
+    configContents: buildRelayConfigToml(profile, { includeBearerToken: !profile.noAuth, requiresOpenAiAuth: false }),
     authContents: buildRelayAuthJson(profile),
   };
 }
@@ -12292,13 +12358,24 @@ function deriveRelayProfileFromFiles(profile: RelayProfile): RelayProfile {
   if (isAggregateRelayProfile(profile)) {
     return normalizeAggregateRelayProfile(profile, null);
   }
-  const configContents = profile.configContents || "";
+  let configContents = profile.configContents || "";
   const authContents = profile.relayMode === "official" ? buildOfficialRelayAuthJson(profile.authContents || "") : profile.authContents || "";
   const configBaseUrl = codexBaseUrlFromConfig(configContents);
   const chatUpstreamBaseUrl = rootTomlStringValue(configContents, CHAT_UPSTREAM_BASE_URL_KEY);
   const isProxyConfig = configBaseUrl === PROTOCOL_PROXY_BASE_URL;
   const upstreamBaseUrl = profile.upstreamBaseUrl || chatUpstreamBaseUrl || (configBaseUrl && !isProxyConfig ? configBaseUrl : profile.baseUrl || "");
   const configApiKey = codexExperimentalBearerTokenFromConfig(configContents);
+  const apiKey = profile.relayMode === "official"
+    ? configApiKey || profile.apiKey || ""
+    : codexApiKeyFromAuth(authContents) || configApiKey || "";
+  if (profile.relayMode === "pureApi") {
+    // 旧 false/缺省模板也需要显式 provider 认证；保留用户已有的 true/false。
+    configContents = profile.noAuth
+      ? removeCodexExperimentalBearerToken(configContents)
+      : apiKey && configContents.trim()
+        ? setCodexExperimentalBearerToken(configContents, apiKey, { requiresOpenAiAuth: false })
+        : configContents;
+  }
   const configModel = codexModelFromConfig(configContents);
   // 如果用户输入了带后缀的模型名，优先保留在界面的「配置模型」字段中；
   // config.toml 里实际写的是剥离后缀的 slug（由 applyRelayProfilePatchToFiles 处理）。
@@ -12309,9 +12386,7 @@ function deriveRelayProfileFromFiles(profile: RelayProfile): RelayProfile {
     sessionProvider: relaySessionProviderFromConfig(configContents),
     baseUrl: upstreamBaseUrl,
     upstreamBaseUrl,
-    apiKey: profile.relayMode === "official"
-      ? configApiKey || profile.apiKey || ""
-      : codexApiKeyFromAuth(authContents) || configApiKey || "",
+    apiKey,
     contextWindow: codexTopLevelIntFromConfig(configContents, "model_context_window"),
     autoCompactLimit: codexTopLevelIntFromConfig(configContents, "model_auto_compact_token_limit"),
     configContents,
@@ -12359,7 +12434,7 @@ function applyRelayProfilePatchToFiles(
   if ("apiKey" in patch) {
     if (next.relayMode === "pureApi") {
       next.authContents = setAuthOpenAiApiKey(next.authContents, patch.apiKey || "");
-      next.configContents = removeCodexExperimentalBearerToken(next.configContents);
+      next.configContents = setCodexExperimentalBearerToken(next.configContents, patch.apiKey || "", { requiresOpenAiAuth: false });
     } else {
       next.configContents = setCodexExperimentalBearerToken(next.configContents, patch.apiKey || "");
     }
@@ -12401,7 +12476,10 @@ function applyRelayProfilePatchToFiles(
 }
 
 function codexModelFromConfig(contents: string): string {
-  for (const line of contents.split(/\r?\n/)) {
+  const lines = contents.split(/\r?\n/);
+  const structural = tomlStructureMask(lines);
+  for (const [index, line] of lines.entries()) {
+    if (!structural[index]) continue;
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
     if (trimmed.startsWith("[")) break;
@@ -12431,13 +12509,17 @@ function codexExperimentalBearerTokenFromConfig(contents: string): string {
 
 function codexProviderStringFromConfig(contents: string, key: string): string {
   const provider = rootTomlStringValue(contents, "model_provider");
-  const targetSection = provider ? `model_providers.${provider}` : "";
+  const targetSection = codexProviderSectionName(provider || "custom");
+  const fallbackSection = provider === "openai" && rootTomlStringValue(contents, "openai_base_url") === PROTOCOL_PROXY_BASE_URL
+    ? codexProviderSectionName("custom") : "";
   const lines = contents.split(/\r?\n/);
+  const structural = tomlStructureMask(lines);
   let currentSection = "";
-  const matches: string[] = [];
-  const providerMatches: string[] = [];
+  let rootValue = "";
+  let fallbackValue = "";
 
-  for (const line of lines) {
+  for (const [index, line] of lines.entries()) {
+    if (!structural[index]) continue;
     const section = tomlSectionName(line);
     if (section !== null) {
       currentSection = section;
@@ -12445,13 +12527,13 @@ function codexProviderStringFromConfig(contents: string, key: string): string {
     }
     const value = tomlStringAssignmentValue(line, key);
     if (value === null) continue;
-    if (targetSection && currentSection === targetSection) return value;
-    if (currentSection.startsWith("model_providers.")) providerMatches.push(value);
-    else matches.push(value);
+    if (currentSection === targetSection) return value;
+    if (fallbackSection && currentSection === fallbackSection) fallbackValue = value;
+    if (!provider && currentSection === "") rootValue = value;
   }
 
-  if (matches.length === 1) return matches[0];
-  return providerMatches.length === 1 ? providerMatches[0] : "";
+  // 不借用 inactive provider 的 Key；仅托管 OpenAI 会话允许回落 custom transport。
+  return fallbackValue || rootValue;
 }
 
 function codexApiKeyFromAuth(contents: string): string {
@@ -12466,7 +12548,10 @@ function codexApiKeyFromAuth(contents: string): string {
 function codexTopLevelIntFromConfig(contents: string, key: string): string {
   const topLevel = splitTomlRootAndTables(contents).root;
   const pattern = new RegExp(`^\\s*${key}\\s*=\\s*(\\d+)\\s*(?:#.*)?$`);
-  for (const line of topLevel.split(/\r?\n/)) {
+  const lines = topLevel.split(/\r?\n/);
+  const structural = tomlStructureMask(lines);
+  for (const [index, line] of lines.entries()) {
+    if (!structural[index]) continue;
     const match = pattern.exec(line);
     if (match) return match[1];
   }
@@ -12475,22 +12560,166 @@ function codexTopLevelIntFromConfig(contents: string, key: string): string {
 
 function rootTomlStringValue(contents: string, key: string): string {
   const topLevel = splitTomlRootAndTables(contents).root;
-  for (const line of topLevel.split(/\r?\n/)) {
+  const lines = topLevel.split(/\r?\n/);
+  const structural = tomlStructureMask(lines);
+  for (const [index, line] of lines.entries()) {
+    if (!structural[index]) continue;
     const value = tomlStringAssignmentValue(line, key);
     if (value !== null) return value;
   }
   return "";
 }
 
+function tomlStructureMask(lines: string[]): boolean[] {
+  // 提示词里的伪表头/赋值只是字符串正文，不能参与 provider 鉴权读写。
+  let multiline: string | null = null;
+  return lines.map((line) => {
+    const structural = multiline === null;
+    for (let index = 0; index < line.length; index += 1) {
+      if (multiline !== null) {
+        if (multiline === '"' && line[index] === "\\") {
+          index += 1;
+        } else if (line[index] === multiline) {
+          let end = index;
+          while (line[end] === multiline) end += 1;
+          if (end - index >= 3) multiline = null;
+          index = end - 1;
+        }
+      } else if (line[index] === "#") {
+        break;
+      } else if (line[index] === '"' || line[index] === "'") {
+        if (line[index + 1] === line[index] && line[index + 2] === line[index]) {
+          multiline = line[index];
+          index += 2;
+        } else {
+          const quoted = tomlQuotedValue(line, index);
+          if (!quoted) break;
+          index = quoted.end - 1;
+        }
+      }
+    }
+    return structural;
+  });
+}
+
 function tomlSectionName(line: string): string | null {
-  const match = /^\s*\[([^\]]+)\]\s*$/.exec(line);
-  return match ? match[1].trim() : null;
+  const text = line.trim();
+  if (!text.startsWith("[")) return null;
+  const array = text.startsWith("[[");
+  const start = array ? 2 : 1;
+  for (let index = start; index < text.length; index += 1) {
+    if (text[index] === '"' || text[index] === "'") {
+      const quoted = tomlQuotedValue(text, index);
+      if (!quoted) return null;
+      index = quoted.end - 1;
+    } else if (text[index] === "]") {
+      const end = index + (array ? 2 : 1);
+      if (array && text[index + 1] !== "]") return null;
+      const rest = text.slice(end).trim();
+      if (rest && !rest.startsWith("#")) return null;
+      const path = tomlDottedKeyPath(text.slice(start, index));
+      // 数组表也是前一个表的边界，但不能与同名普通表混为一谈。
+      return path ? (array ? "[]" : "") + tomlKeyPathName(path) : null;
+    }
+  }
+  return null;
+}
+
+function tomlQuotedValue(text: string, start: number): { value: string; end: number } | null {
+  const quote = text[start];
+  if (quote !== '"' && quote !== "'") return null;
+  let value = "";
+  for (let index = start + 1; index < text.length; index += 1) {
+    const character = text[index];
+    if (character === quote) return { value, end: index + 1 };
+    if ((character.charCodeAt(0) < 32 && character !== "\t") || character.charCodeAt(0) === 127) return null;
+    if (quote === '"' && character === "\\") {
+      const escape = text[++index];
+      const escapes: Record<string, string> = { '"': '"', "\\": "\\", b: "\b", t: "\t", n: "\n", f: "\f", r: "\r" };
+      if (Object.prototype.hasOwnProperty.call(escapes, escape)) value += escapes[escape];
+      else if (escape === "u" || escape === "U") {
+        const length = escape === "u" ? 4 : 8;
+        const digits = text.slice(index + 1, index + 1 + length);
+        if (digits.length !== length || !/^[0-9a-f]+$/i.test(digits)) return null;
+        const codepoint = Number.parseInt(digits, 16);
+        if (codepoint > 0x10ffff || (codepoint >= 0xd800 && codepoint <= 0xdfff)) return null;
+        value += String.fromCodePoint(codepoint);
+        index += length;
+      } else return null;
+    } else value += character;
+  }
+  return null;
+}
+
+function tomlDottedKeyPath(text: string): string[] | null {
+  const path: string[] = [];
+  let index = 0;
+  while (index < text.length) {
+    while (text[index] === " " || text[index] === "\t") index += 1;
+    if (text[index] === '"' || text[index] === "'") {
+      const quoted = tomlQuotedValue(text, index);
+      if (!quoted) return null;
+      path.push(quoted.value);
+      index = quoted.end;
+    } else {
+      const bare = /^[A-Za-z0-9_-]+/.exec(text.slice(index));
+      if (!bare) return null;
+      path.push(bare[0]);
+      index += bare[0].length;
+    }
+    while (text[index] === " " || text[index] === "\t") index += 1;
+    if (index === text.length) return path;
+    if (text[index] !== ".") return null;
+    index += 1;
+  }
+  return null;
+}
+
+function tomlKeyPathName(path: string[]): string {
+  return path.map((part) => /^[A-Za-z0-9_-]+$/.test(part) ? part : JSON.stringify(part)).join(".");
+}
+
+function codexProviderSectionName(provider: string): string {
+  return tomlKeyPathName(["model_providers", provider]);
+}
+
+function tomlKeyAssignment(line: string): { path: string[]; valueStart: number } | null {
+  for (let index = 0; index < line.length; index += 1) {
+    if (line[index] === '"' || line[index] === "'") {
+      const quoted = tomlQuotedValue(line, index);
+      if (!quoted) return null;
+      index = quoted.end - 1;
+    } else if (line[index] === "#") return null;
+    else if (line[index] === "=") {
+      const path = tomlDottedKeyPath(line.slice(0, index));
+      return path ? { path, valueStart: index + 1 } : null;
+    }
+  }
+  return null;
+}
+
+function tomlInlineComment(line: string, start: number): string {
+  for (let index = start; index < line.length; index += 1) {
+    if (line[index] === '"' || line[index] === "'") {
+      const quoted = tomlQuotedValue(line, index);
+      if (!quoted) return "";
+      index = quoted.end - 1;
+    } else if (line[index] === "#") {
+      const spacing = /[ \t]*$/.exec(line.slice(start, index))?.[0] || "";
+      return spacing + line.slice(index);
+    }
+  }
+  return "";
 }
 
 function tomlStringAssignmentValue(line: string, key: string): string | null {
-  const match = new RegExp(`^\\s*${key}\\s*=\\s*([\"'])(.*)\\1\\s*(?:#.*)?$`).exec(line.trim());
-  if (!match) return null;
-  return match[2].replace(/\\(["'\\])/g, "$1");
+  const assignment = tomlKeyAssignment(line);
+  if (!assignment || assignment.path.length !== 1 || assignment.path[0] !== key) return null;
+  const text = line.slice(assignment.valueStart).trimStart();
+  const quoted = tomlQuotedValue(text, 0);
+  if (!quoted) return null;
+  const rest = text.slice(quoted.end).trimStart();
+  return !rest || rest.startsWith("#") ? quoted.value : null;
 }
 
 function setAuthOpenAiApiKey(contents: string, apiKey: string): string {
@@ -12529,11 +12758,17 @@ function setRootTomlIntKey(contents: string, key: string, value: string): string
 
 function setRootTomlLine(contents: string, key: string, lineText: string): string {
   const lines = contents.split(/\r?\n/);
-  const firstTable = lines.findIndex((line) => /^\s*\[[^\]]+\]\s*$/.test(line));
+  const structural = tomlStructureMask(lines);
+  const firstTable = lines.findIndex((line, index) => structural[index] && tomlSectionName(line) !== null);
   const rootEnd = firstTable >= 0 ? firstTable : lines.length;
   for (let index = 0; index < rootEnd; index += 1) {
-    if (new RegExp(`^\\s*${key}\\s*=`).test(lines[index])) {
-      lines[index] = lineText;
+    if (!structural[index]) continue;
+    const assignment = tomlKeyAssignment(lines[index]);
+    if (assignment?.path.length === 1 && assignment.path[0] === key) {
+      const replacement = tomlKeyAssignment(lineText);
+      lines[index] = replacement
+        ? lines[index].slice(0, assignment.valueStart) + " " + lineText.slice(replacement.valueStart).trimStart() + tomlInlineComment(lines[index], assignment.valueStart)
+        : lineText;
       return ensureTrailingNewline(lines.join("\n").trimEnd());
     }
   }
@@ -12544,12 +12779,15 @@ function setRootTomlLine(contents: string, key: string, lineText: string): strin
 
 function codexRequiresOpenAiAuthFromConfig(contents: string): boolean {
   const provider = rootTomlStringValue(contents, "model_provider");
-  const targetSection = provider ? `model_providers.${provider}` : "";
+  const targetSection = provider ? codexProviderSectionName(provider) : "";
   const lines = contents.split(/\r?\n/);
+  const structural = tomlStructureMask(lines);
   let currentSection = "";
   let sawProviderSection = false;
+  let rootRequiresAuth = false;
 
-  for (const line of lines) {
+  for (const [index, line] of lines.entries()) {
+    if (!structural[index]) continue;
     const section = tomlSectionName(line);
     if (section !== null) {
       currentSection = section;
@@ -12557,6 +12795,7 @@ function codexRequiresOpenAiAuthFromConfig(contents: string): boolean {
       continue;
     }
     const match = /^\s*requires_openai_auth\s*=\s*(true|false)\s*(?:#.*)?$/i.exec(line);
+    if (match && currentSection === "") rootRequiresAuth = match[1].toLowerCase() === "true";
     if (!match || !currentSection.startsWith("model_providers.")) continue;
     if (targetSection) {
       if (currentSection === targetSection) return match[1].toLowerCase() === "true";
@@ -12565,7 +12804,7 @@ function codexRequiresOpenAiAuthFromConfig(contents: string): boolean {
     if (match[1].toLowerCase() === "true") return true;
   }
 
-  return !sawProviderSection && /^\s*requires_openai_auth\s*=\s*true\s*(?:#.*)?$/im.test(contents);
+  return !sawProviderSection && rootRequiresAuth;
 }
 
 function setCodexProviderStringKey(
@@ -12581,20 +12820,29 @@ function setCodexProviderStringKey(
     next = setRootTomlStringKey(next, "model_provider", sessionProvider);
   }
   next = ensureCodexProviderDefaults(next, provider, { requiresOpenAiAuth: options.requiresOpenAiAuth !== false });
-  return setTomlSectionStringKey(next, `model_providers.${provider}`, key, value);
+  return setTomlSectionStringKey(next, codexProviderSectionName(provider), key, value);
 }
 
-function setCodexExperimentalBearerToken(contents: string, apiKey: string): string {
+function setCodexExperimentalBearerToken(contents: string, apiKey: string, options: { requiresOpenAiAuth?: boolean } = {}): string {
   const trimmed = apiKey.trim();
+  if (trimmed && options.requiresOpenAiAuth === false) {
+    // 补纯 API 鉴权时只改目标字段，不覆盖导入模板的名称、协议或登录要求。
+    const sessionProvider = rootTomlStringValue(contents, "model_provider") || "custom";
+    const provider = sessionProvider === "openai" ? "custom" : sessionProvider;
+    const next = rootTomlStringValue(contents, "model_provider")
+      ? contents
+      : setRootTomlStringKey(contents, "model_provider", sessionProvider);
+    return setTomlSectionStringKey(next, codexProviderSectionName(provider), "experimental_bearer_token", trimmed);
+  }
   return trimmed
-    ? setCodexProviderStringKey(contents, "experimental_bearer_token", trimmed)
+    ? setCodexProviderStringKey(contents, "experimental_bearer_token", trimmed, options)
     : removeCodexExperimentalBearerToken(contents);
 }
 
 function removeCodexExperimentalBearerToken(contents: string): string {
   const sessionProvider = rootTomlStringValue(contents, "model_provider") || "custom";
   const provider = sessionProvider === "openai" ? "custom" : sessionProvider;
-  return removeTomlSectionKey(contents, `model_providers.${provider}`, "experimental_bearer_token");
+  return removeTomlSectionKey(contents, codexProviderSectionName(provider), "experimental_bearer_token");
 }
 
 function ensureCodexProviderDefaults(
@@ -12603,7 +12851,7 @@ function ensureCodexProviderDefaults(
   options: { requiresOpenAiAuth?: boolean } = {},
 ): string {
   let next = contents;
-  const section = `model_providers.${provider}`;
+  const section = codexProviderSectionName(provider);
   next = setTomlSectionStringKey(next, section, "name", provider);
   next = setTomlSectionStringKey(next, section, "wire_api", "responses");
   return options.requiresOpenAiAuth === false ? next : setTomlSectionBoolKey(next, section, "requires_openai_auth", true);
@@ -12619,9 +12867,11 @@ function setTomlSectionStringKey(contents: string, sectionName: string, key: str
 
 function setTomlSectionRawKey(contents: string, sectionName: string, key: string, value: string): string {
   const lines = contents.split(/\r?\n/);
+  const structural = tomlStructureMask(lines);
   let sectionStart = -1;
   let sectionEnd = lines.length;
   for (let index = 0; index < lines.length; index += 1) {
+    if (!structural[index]) continue;
     const section = tomlSectionName(lines[index]);
     if (section === null) continue;
     if (sectionStart >= 0) {
@@ -12636,8 +12886,10 @@ function setTomlSectionRawKey(contents: string, sectionName: string, key: string
   }
   const replacement = `${key} = ${value}`;
   for (let index = sectionStart + 1; index < sectionEnd; index += 1) {
-    if (new RegExp(`^\\s*${key}\\s*=`).test(lines[index])) {
-      lines[index] = replacement;
+    if (!structural[index]) continue;
+    const assignment = tomlKeyAssignment(lines[index]);
+    if (assignment?.path.length === 1 && assignment.path[0] === key) {
+      lines[index] = lines[index].slice(0, assignment.valueStart) + " " + value + tomlInlineComment(lines[index], assignment.valueStart);
       return ensureTrailingNewline(lines.join("\n").trimEnd());
     }
   }
@@ -12649,9 +12901,11 @@ function setTomlSectionRawKey(contents: string, sectionName: string, key: string
 
 function removeTomlSectionKey(contents: string, sectionName: string, key: string): string {
   const lines = contents.split(/\r?\n/);
+  const structural = tomlStructureMask(lines);
   let sectionStart = -1;
   let sectionEnd = lines.length;
   for (let index = 0; index < lines.length; index += 1) {
+    if (!structural[index]) continue;
     const section = tomlSectionName(lines[index]);
     if (section === null) continue;
     if (sectionStart >= 0) {
@@ -12662,8 +12916,9 @@ function removeTomlSectionKey(contents: string, sectionName: string, key: string
   }
   if (sectionStart < 0) return contents;
   const next = lines.filter((line, index) => {
-    if (index <= sectionStart || index >= sectionEnd) return true;
-    return !new RegExp(`^\\s*${key}\\s*=`).test(line);
+    if (index <= sectionStart || index >= sectionEnd || !structural[index]) return true;
+    const assignment = tomlKeyAssignment(line);
+    return assignment?.path.length !== 1 || assignment.path[0] !== key;
   });
   return ensureTrailingNewline(next.join("\n").trimEnd());
 }

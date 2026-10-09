@@ -5,6 +5,14 @@
 
 // Plain strings: t("中文") -> EN_PLAIN["中文"].
 export const EN_PLAIN: Record<string, string> = {
+  "Fast（priority）支持": "Fast (priority) support",
+  "模型配置：元数据与 Fast 支持": "Model settings: metadata and Fast support",
+  "继承模型默认能力": "Inherit model defaults",
+  "明确支持 priority": "Supports priority",
+  "不支持 priority": "Does not support priority",
+  "请先修正当前模型的 JSON 配置，再设置 Fast 支持。": "Fix this model's JSON before configuring Fast support.",
+  "按当前供应商逐模型声明。仅在上游支持 service_tier=priority 时选择支持；继承会清除自定义声明，取消不会保存修改。": "Declare support per model for this provider. Select support only when its upstream accepts service_tier=priority. Inherit clears the custom declaration; Cancel leaves saved settings unchanged.",
+  "需要自定义 Fast 白名单时，打开对应模型的配置按钮，设置 Fast（priority）支持并保存此模型与供应商。": "To customize the Fast allowlist, open the model's settings, configure Fast (priority) support, and save the model and provider.",
   "挂件与桌宠": "Widgets and pets",
   "在 Codex 中查看用量，设置自己的角色和互动方式。": "View usage in Codex and customize your character and interactions.",
   "Codex 用量挂件": "Codex usage widget",
@@ -244,6 +252,9 @@ export const EN_PLAIN: Record<string, string> = {
   "复制链接": "Copy link",
   "连接设置": "Connection settings",
   "请求设置": "Request settings",
+  "分享会话按钮": "Session sharing button",
+  "在当前会话工具栏显示分享按钮，保存后更新显示，无需重启 Codex。": "Show the sharing button in the current conversation toolbar. Saving updates its visibility without restarting Codex.",
+  "若网关提示 thinking type: adaptive 无效，可启用此项后重试；这会停用厂商私有推理参数。": "If your gateway rejects thinking type: adaptive, enable this option and retry. Vendor-specific reasoning parameters will be disabled.",
   "需要检查": "Check settings",
   "每个微信联系人会映射到独立的 Codex 会话。": "Each WeChat contact maps to a separate Codex session.",
   "iLink API 地址": "iLink API URL",
@@ -724,8 +735,6 @@ export const EN_PLAIN: Record<string, string> = {
   "官方登录": "Official login",
   "官方登录模式": "Official login mode",
   "对话居中宽度": "Centered conversation width",
-  "自定义布局": "Custom layout",
-  "在 Codex++ 页面点击“编辑布局”，拖动面板时其他区域会弹性让位；支持磁吸和下次打开恢复。": "Click Edit layout on the Codex++ page. Dragging a panel pushes nearby panels aside with spring motion. Positions snap to edges and are restored next time.",
   "导入 Codex++ 供应商": "Import Codex++ provider",
   "尚未刷新": "Not refreshed yet",
   "尚未加载推荐内容": "Recommendations not loaded yet",
