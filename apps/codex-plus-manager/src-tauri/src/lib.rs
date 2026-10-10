@@ -107,6 +107,8 @@ pub fn run() {
             commands::launch_codex_plus,
             commands::restart_codex_plus,
             commands::load_settings,
+            commands::dictation_local_model_status,
+            commands::download_dictation_local_model,
             commands::native_browser_status,
             commands::save_settings,
             commands::list_tools,
@@ -151,9 +153,6 @@ pub fn run() {
             commands::confirm_pending_provider_import,
             commands::dismiss_pending_provider_import,
             commands::list_local_sessions,
-            commands::import_local_session,
-            commands::load_pending_session_share,
-            commands::import_session_url,
             commands::delete_local_session,
             commands::load_provider_sync_targets,
             commands::repair_session_index,
@@ -258,8 +257,7 @@ pub fn run() {
             match event {
                 tauri::RunEvent::Opened { urls } => {
                     for url in urls {
-                        if handle_session_share_url(url.as_str())
-                            || handle_dream_skin_url(url.as_str())
+                        if handle_dream_skin_url(url.as_str())
                         {
                             show_main_window(app_handle);
                         }
@@ -300,28 +298,6 @@ pub fn handle_dream_skin_url(url: &str) -> bool {
         Err(error) => {
             let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
                 "manager.dream_skin_link.failed",
-                serde_json::json!({ "error": error.to_string() }),
-            );
-            false
-        }
-    }
-}
-
-pub fn handle_session_share_url(url: &str) -> bool {
-    if !url.starts_with("codexplusplus://session") {
-        return false;
-    }
-    match codex_plus_core::session_share::save_pending_session_share_from_protocol_url(url) {
-        Ok(_) => {
-            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-                "manager.session_share.pending",
-                serde_json::json!({}),
-            );
-            true
-        }
-        Err(error) => {
-            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-                "manager.session_share.failed",
                 serde_json::json!({ "error": error.to_string() }),
             );
             false

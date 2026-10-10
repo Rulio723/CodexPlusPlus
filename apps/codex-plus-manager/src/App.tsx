@@ -22,6 +22,7 @@ import {
   ArrowRight,
   Bell,
   Blocks,
+  BookOpen,
   CheckCircle2,
   ChevronDown,
   Camera,
@@ -69,8 +70,8 @@ import {
   Wrench,
   type LucideIcon,
 } from "lucide-react";
-import { ProviderPresetSelector } from "@/components/ProviderPresetSelector";
-import type { PresetPatch } from "@/components/ProviderPresetSelector";
+import { createPresetPatch } from "@/components/ProviderPresetSelector";
+import { PRESETS, type ProviderPreset } from "./presets";
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 
 import { Badge as UiBadge } from "@/components/ui/badge";
@@ -83,6 +84,8 @@ import { isGitHubRepositoryHomepage } from "./github-repository";
 import { NativeBrowserStatusView, nativeBrowserConsent } from "./native-browser-settings";
 import { AgentCachePanel } from "./agent-cache";
 import { PluginMarketScreen } from "./PluginMarketScreen";
+import { McpPage, PageHeader } from "./ManagementPages";
+import { SkillsPage, SessionPage } from "./ManagementExtra";
 import { ENHANCEMENT_SECTION_IDS, managerNavigationDestination, type EnhancementTab, type ManagerNavigationIntent } from "./enhancement-navigation";
 import { DEFAULT_AUTO_COMPACT_PERCENT, normalizeAutoCompactEditing, normalizeAutoCompactPercent } from "./auto-compact";
 import { defaultWhaleBalanceSettings, normalizeWhaleBalanceSettings, whaleBalanceSettingsIssue, type WhaleBalanceIssue, type WhaleBalanceProtocol, type WhaleBalanceSettings } from "./whale-settings";
@@ -134,6 +137,7 @@ import {
   findRelayModelRouteIssue,
   modelRouteSaveRequiresRestart,
   normalizeRelayModelRoutes,
+  webSearchHistoryCompatEnabled,
   PROTOCOL_PROXY_BASE_URL,
   type RelayModelRoute,
 } from "./model-routes";
@@ -265,7 +269,6 @@ type BackendSettings = WhaleBalanceSettings & {
   codexAppModelWhitelistUnlock: boolean;
   codexAppSessionDelete: boolean;
   codexAppMarkdownExport: boolean;
-  codexAppSessionShare: boolean;
   codexAppPasteFix: boolean;
   codexAppTypingEffect: TypingEffect;
   codexAppThreadIdBadge: boolean;
@@ -389,6 +392,7 @@ export type RelayProfile = {
   noAuth: boolean;
   modelRoutes?: RelayModelRoute[];
   standardOpenaiProtocol: boolean;
+  webSearchHistoryCompat: boolean;
   rateLimitCooldownEnabled: boolean;
   channelQueueEnabled: boolean;
   channelRequestsPerMinute: number;
@@ -546,15 +550,6 @@ type LocalSessionsResult = CommandResult<{
   limit: number;
   hasMore: boolean;
   totalCount: number;
-}>;
-
-type SessionImportResult = CommandResult<{
-  sessionId: string;
-  title: string;
-}>;
-
-type PendingSessionShareResult = CommandResult<{
-  url: string | null;
 }>;
 
 type DeleteLocalSessionResult = CommandResult<{
@@ -971,7 +966,8 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "relay", label: t("供应商配置"), icon: KeyRound, tool: "codex" },
   { id: "grok", label: t("Grok 配置"), icon: Blocks, tool: "grok" },
   { id: "sessions", label: t("会话管理"), icon: MessageCircle, tool: "codex" },
-  { id: "context", label: t("MCP&插件"), icon: Network, tool: "codex" },
+  { id: "context", label: "MCP", icon: Network, tool: "codex" },
+  { id: "skills", label: "Skills", icon: BookOpen, tool: "codex" },
   { id: "weixin", label: t("微信连接"), icon: ScanLine, tool: "codex" },
   { id: "enhance", label: t("Codex增强"), icon: Hammer, tool: "codex" },
   { id: "dreamSkin", label: t("皮肤管理"), icon: Palette, tool: "codex" },
@@ -989,7 +985,11 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
 const navigationSections: Array<{ label: string; routes: Route[]; placement?: "bottom" }> = [
   {
     label: t("工作区"),
-    routes: ["overview", "relay", "grok", "sessions", "context"],
+    routes: ["overview", "relay", "grok"],
+  },
+  {
+    label: t("全局管理"),
+    routes: ["context", "skills", "sessions"],
   },
   {
     label: t("扩展"),
@@ -1021,7 +1021,6 @@ const defaultSettings: BackendSettings = {
   codexAppModelWhitelistUnlock: true,
   codexAppSessionDelete: true,
   codexAppMarkdownExport: true,
-  codexAppSessionShare: true,
   codexAppPasteFix: false,
   codexAppTypingEffect: "off",
   codexAppThreadIdBadge: false,
@@ -1100,6 +1099,7 @@ const defaultSettings: BackendSettings = {
       noAuth: false,
       sub2apiMultiplier: "",
       standardOpenaiProtocol: false,
+      webSearchHistoryCompat: false,
       rateLimitCooldownEnabled: false,
       channelQueueEnabled: false,
       channelRequestsPerMinute: 20,
@@ -1144,7 +1144,6 @@ export function App() {
   const [ccsProviders, setCcsProviders] = useState<CcsProvidersResult | null>(null);
   const [pendingProviderImport, setPendingProviderImport] = useState<ProviderImportRequest | null>(null);
   const [localSessions, setLocalSessions] = useState<LocalSessionsResult | null>(null);
-  const [sessionShareUrl, setSessionShareUrl] = useState("");
   const [liveContextEntries, setLiveContextEntries] = useState<CodexContextEntries | null>(null);
   const [logs, setLogs] = useState<LogsResult | null>(null);
   const [diagnostics, setDiagnostics] = useState<DiagnosticsResult | null>(null);
@@ -1510,50 +1509,6 @@ export function App() {
     return result;
   };
 
-  const importLocalSession = async () => {
-    let selected: string | string[] | null;
-    try {
-      selected = await open({
-        title: t("导入 Codex 会话"),
-        multiple: false,
-        directory: false,
-        filters: [{ name: t("会话文件"), extensions: ["jsonl", "json", "txt"] }],
-      });
-    } catch (error) {
-      showNotice(t("会话导入"), tf("打开选择器失败：{0}", [stringifyError(error)]), "failed");
-      return;
-    }
-    const path = Array.isArray(selected) ? selected[0] : selected;
-    if (!path) return;
-    const result = await run(() => call<SessionImportResult>("import_local_session", { path }));
-    if (!result) return;
-    showResultNotice(t("会话导入"), result);
-    if (isSuccessStatus(result.status)) await refreshLocalSessions(true, 0);
-  };
-
-  const refreshPendingSessionShare = async (silent = true) => {
-    const result = await run(() => call<PendingSessionShareResult>("load_pending_session_share"));
-    if (result?.url) setSessionShareUrl(result.url);
-    if (result && (!silent || !isSuccessStatus(result.status))) {
-      showResultNotice(t("会话导入"), result, { silentSuccess: true });
-    }
-    return result;
-  };
-
-  const importSessionUrl = async (value = sessionShareUrl) => {
-    const url = value.trim();
-    if (!url) {
-      showNotice(t("会话导入"), t("请粘贴 Codex++ 分享链接。"), "failed");
-      return;
-    }
-    const result = await run(() => call<SessionImportResult>("import_session_url", { url }));
-    if (!result) return;
-    showResultNotice(t("会话导入"), result);
-    if (isSuccessStatus(result.status)) {
-      setSessionShareUrl("");
-      await refreshLocalSessions(true, 0);
-    }
-  };
 
   const requestDeleteLocalSession = (session: LocalSession) =>
     call<DeleteLocalSessionResult>("delete_local_session", {
@@ -2990,7 +2945,6 @@ export function App() {
       await refreshEnvConflicts(true);
       await refreshProviderSyncTargets(true);
       await refreshPendingProviderImport(true);
-      await refreshPendingSessionShare(true);
       await refreshPendingDreamSkinCommunity();
     })();
   }, []);
@@ -3058,7 +3012,6 @@ export function App() {
   useEffect(() => {
     const timer = window.setInterval(() => {
       void refreshPendingProviderImport(true);
-      void refreshPendingSessionShare(true);
       void refreshPendingDreamSkinCommunity();
     }, 1200);
     return () => window.clearInterval(timer);
@@ -3360,10 +3313,6 @@ export function App() {
       setUserScriptEnabled,
       deleteUserScript,
       refreshLocalSessions,
-      importLocalSession,
-      importSessionUrl,
-      sessionShareUrl,
-      setSessionShareUrl,
       deleteLocalSession,
       deleteLocalSessions,
       openExternalUrl,
@@ -3403,7 +3352,7 @@ export function App() {
       disableWatcher: () => watcherAction("disable_watcher"),
       toggleTheme: () => setTheme((current) => (current === "dark" ? "light" : "dark")),
     }),
-    [route, launchForm, settingsForm, settings, overview, removeOwnedData, update, updateInstallProgress.active, logs, diagnostics, theme, relayFiles, localSessions, sessionShareUrl, importSessionUrl, selectedProviderSyncTarget, envConflicts, relayEnvironment, ccsProviders, dreamSkinLibrary, dreamSkinMarket, dreamSkinCommunity, selectedDreamSkinTheme, savedDreamSkinThemeDraft, dreamSkinThemeDraft, dreamSkinDraftDirty, pendingDreamSkinRestart],
+    [route, launchForm, settingsForm, settings, overview, removeOwnedData, update, updateInstallProgress.active, logs, diagnostics, theme, relayFiles, localSessions, selectedProviderSyncTarget, envConflicts, relayEnvironment, ccsProviders, dreamSkinLibrary, dreamSkinMarket, dreamSkinCommunity, selectedDreamSkinTheme, savedDreamSkinThemeDraft, dreamSkinThemeDraft, dreamSkinDraftDirty, pendingDreamSkinRestart],
   );
   const isGlobalPage = globalNavigationRoutes.includes(route);
   const codexAppRunning = overview?.runtime_health?.codex_app?.status === "running";
@@ -3517,29 +3466,25 @@ export function App() {
             <GrokScreen settings={settings} form={settingsForm} actions={actions} />
           ) : null}
           {route === "sessions" ? (
-            <SessionsScreen
-              settings={settings}
-              form={settingsForm}
+            <SessionPage
               sessions={localSessions}
-              providerSyncProgress={providerSyncProgress}
-              sessionIndexRepairActive={sessionIndexRepairActive}
-              sessionIndexRepairReport={sessionIndexRepairReport}
-              sessionIndexRepairReportError={sessionIndexRepairReportError}
-              providerSyncTargets={providerSyncTargets}
-              selectedProviderSyncTarget={selectedProviderSyncTarget}
-              onFormChange={setSettingsForm}
-              actions={actions}
+              onRefresh={async (offset) => { await actions.refreshLocalSessions(false, offset ?? 0); }}
+              onDelete={actions.deleteLocalSession}
+              onDeleteMany={actions.deleteLocalSessions}
+              notify={actions.showMessage}
             />
           ) : null}
           {route === "context" ? (
-            <ContextScreen
-              form={settingsForm}
-              liveEntries={liveContextEntries}
-              relayFiles={relayFiles}
-              onFormChange={setSettingsForm}
-              actions={actions}
+            <McpPage
+              entries={[...contextEntriesByKind(contextEntriesWithLiveEntries(settingsForm, liveContextEntries), "mcp"), ...contextEntriesByKind(contextEntriesWithLiveEntries(settingsForm, liveContextEntries), "plugin")]}
+              onSave={async (kind, id, body) => Boolean(await actions.upsertContextEntry(settingsForm, kind, id, body))}
+              onDelete={async (entry) => Boolean(await actions.deleteContextEntry(settingsForm, entry.kind, entry.id))}
+              onRefresh={async () => { await actions.refreshLiveContextEntries(); await actions.refreshRelayFiles(); }}
+              onImport={async (json) => Boolean(await actions.importMcpServersJson(settingsForm, json))}
+              notify={actions.showMessage}
             />
           ) : null}
+          {route === "skills" ? <SkillsPage notify={actions.showMessage} /> : null}
           {route === "weixin" ? (
             <WeixinConnectScreen
               form={settingsForm}
@@ -3760,10 +3705,6 @@ type Actions = {
   setUserScriptEnabled: (key: string, enabled: boolean) => Promise<void>;
   deleteUserScript: (key: string) => Promise<void>;
   refreshLocalSessions: (silent?: boolean, offset?: number) => Promise<LocalSessionsResult | null>;
-  importLocalSession: () => Promise<void>;
-  importSessionUrl: (url?: string) => Promise<void>;
-  sessionShareUrl: string;
-  setSessionShareUrl: (url: string) => void;
   deleteLocalSession: (session: LocalSession) => Promise<void>;
   deleteLocalSessions: (sessions: LocalSession[]) => Promise<void>;
   openExternalUrl: (url: string) => Promise<void>;
@@ -4542,6 +4483,7 @@ function RelayScreen({
   const normalized = normalizeSettings(form);
   const [detailProfileId, setDetailProfileId] = useState<string | null>(null);
   const [newProfileDraft, setNewProfileDraft] = useState<RelayProfile | null>(null);
+  const [providerCatalogOpen, setProviderCatalogOpen] = useState(false);
   const [thirdPartyImportOpen, setThirdPartyImportOpen] = useState(false);
   const [ccsDbPathDraft, setCcsDbPathDraft] = useState(normalized.ccsDbPath);
   const [ccsPathSaving, setCcsPathSaving] = useState(false);
@@ -4655,11 +4597,35 @@ function RelayScreen({
     );
   }
 
+  if (providerCatalogOpen) {
+    return (
+      <ProviderCatalogScreen
+        form={normalized}
+        onBack={() => setProviderCatalogOpen(false)}
+        onSelect={(profile) => {
+          setNewProfileDraft(profile);
+          setProviderCatalogOpen(false);
+        }}
+      />
+    );
+  }
+
   return (
-    <>
-      <Panel>
-        <CardHead title={t("供应商列表")} detail={tf("{0} 个供应商配置；可拖动排序，点编辑进入详情", [normalized.relayProfiles.length])} />
-        <CardContent>
+    <div className="mg-page relay-management-page">
+      <PageHeader
+        icon={<KeyRound className="h-5 w-5" />}
+        title={t("供应商列表")}
+        help={t("管理 Codex 的 API 供应商；选择供应商后会写入当前 Codex 配置。")}
+        actions={(
+          <Button onClick={() => { setNewProfileDraft(null); setDetailProfileId(null); setProviderCatalogOpen(true); }}>
+            <Plus className="h-4 w-4" />
+            {t("添加供应商")}
+          </Button>
+        )}
+      />
+      <div className="mg-content">
+        <Panel className="relay-management-panel">
+          <CardContent>
           <EnvConflictNotice envConflicts={envConflicts} actions={actions} />
           <label className="switch-row relay-master-switch">
             <input
@@ -4677,16 +4643,6 @@ function RelayScreen({
             <ToggleVisual />
           </label>
           <div className="relay-add-row">
-            <Button
-              variant="secondary"
-              onClick={() => {
-                setNewProfileDraft(createRelayProfile(normalized));
-                setDetailProfileId(null);
-              }}
-            >
-              <Plus className="h-4 w-4" />
-              {t("添加供应商")}
-            </Button>
             <Button
               variant="secondary"
               onClick={createNewAggregateProfile}
@@ -4758,9 +4714,76 @@ function RelayScreen({
             disabled={!normalized.relayProfilesEnabled || actions.relaySwitching}
             actions={actions}
           />
-        </CardContent>
-      </Panel>
-    </>
+          </CardContent>
+        </Panel>
+      </div>
+    </div>
+  );
+}
+
+function ProviderCatalogScreen({
+  form,
+  onBack,
+  onSelect,
+}: {
+  form: BackendSettings;
+  onBack: () => void;
+  onSelect: (profile: RelayProfile) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const quickPresets = PRESETS.slice(0, 5);
+  const filtered = PRESETS.filter((preset) => {
+    const haystack = `${preset.name} ${preset.baseUrl} ${preset.model}`.toLowerCase();
+    return !query.trim() || haystack.includes(query.trim().toLowerCase());
+  });
+  const selectPreset = (preset?: ProviderPreset) => {
+    const draft = createRelayProfile(form);
+    const patch = preset ? createPresetPatch(preset) : { name: t("自定义供应商") };
+    onSelect(applyRelayProfilePatchToFiles(draft, patch as unknown as Partial<RelayProfile>, { allowGenerateFiles: true }));
+  };
+  return (
+    <div className="provider-catalog-screen provider-add-simple">
+      <header className="provider-catalog-header" data-tauri-drag-region>
+        <Button onClick={onBack} size="icon" variant="ghost" title={t("返回供应商列表")}>
+          <ArrowLeft className="h-5 w-5" />
+        </Button>
+        <h2>{t("添加新供应商")}</h2>
+        <span>Codex</span>
+      </header>
+      <main className="provider-add-simple-body">
+        <section className="provider-quick-templates">
+          <strong>{t("快速选择模板：")}</strong>
+          <div className="provider-quick-template-list">
+            {quickPresets.map((preset) => (
+              <button key={preset.id} onClick={() => selectPreset(preset)} type="button">
+                {preset.name}
+              </button>
+            ))}
+            <button className="outline" onClick={() => selectPreset()} type="button">{t("自定义配置")}</button>
+          </div>
+        </section>
+        <div className="provider-add-divider" />
+        <div className="provider-add-search">
+          <Search className="h-4 w-4" />
+          <Input
+            aria-label={t("搜索供应商")}
+            onChange={(event) => setQuery(event.currentTarget.value)}
+            placeholder={t("搜索更多供应商名称或网址")}
+            value={query}
+          />
+        </div>
+        <div className="provider-add-results">
+          {filtered.slice(0, 12).map((preset) => (
+            <button className="provider-add-result" key={preset.id} onClick={() => selectPreset(preset)} type="button">
+              <strong>{preset.name}</strong>
+              <small>{preset.websiteUrl ? new URL(preset.websiteUrl).host : preset.baseUrl}</small>
+            </button>
+          ))}
+        </div>
+        {!filtered.length ? <div className="empty">{t("没有匹配的供应商")}</div> : null}
+        <p className="provider-add-hint">{t("选择模板后会进入编辑页；API Key 和本地配置只在保存时写入当前 Codex。")}</p>
+      </main>
+    </div>
   );
 }
 
@@ -4866,12 +4889,47 @@ function WhaleBalanceSettingsFields({ form, onFormChange }: {
   );
 }
 
+type DictationLocalModelState = {
+  phase: string;
+  modelReady: boolean;
+  completedBytes?: number;
+  totalBytes: number;
+  message?: string;
+};
+
 function DictationSettingsPanel({ form, onFormChange }: {
   form: BackendSettings;
   onFormChange: (value: BackendSettings) => void;
 }) {
   const [dictationPresetSelection, setDictationPresetSelection] = useState<DictationPreset>(() => dictationPreset(form.dictation));
   useEffect(() => setDictationPresetSelection(dictationPreset(form.dictation)), [form.dictation.baseUrl]);
+  const [localModelState, setLocalModelState] = useState<DictationLocalModelState | null>(null);
+  const [localModelDownloading, setLocalModelDownloading] = useState(false);
+  const [localModelError, setLocalModelError] = useState("");
+  useEffect(() => {
+    if (form.dictation.provider !== "sensevoice") return;
+    let active = true;
+    const refresh = () => invoke<DictationLocalModelState>("dictation_local_model_status")
+      .then((state) => { if (active) { setLocalModelState(state); } })
+      .catch(() => { if (active) setLocalModelError(t("无法读取本地模型状态，请重试。")); });
+    void refresh();
+    const timer = window.setInterval(() => { void refresh(); }, 1000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [form.dictation.provider]);
+  const downloadLocalModel = async () => {
+    setLocalModelDownloading(true);
+    setLocalModelError("");
+    try {
+      const result = await invoke<CommandResult<DictationLocalModelState>>("download_dictation_local_model");
+      if (result.status !== "ok") setLocalModelError(result.message);
+      else setLocalModelState(result);
+    } catch {
+      setLocalModelError(t("本地模型下载失败，请重试。"));
+    } finally {
+      setLocalModelDownloading(false);
+    }
+  };
+  const downloading = localModelDownloading || localModelState?.phase === "downloading";
   const updateDictation = (patch: Partial<DictationSettings>) => onFormChange({
     ...form,
     dictation: { ...form.dictation, ...patch },
@@ -4883,7 +4941,7 @@ function DictationSettingsPanel({ form, onFormChange }: {
       <CardContent className="settings-content">
         <div className="settings-block enhance-service-block" id={ENHANCEMENT_SECTION_IDS.dictation}>
           <FeatureToggle
-            title={t("启用 API Key 语音输入")}
+            title={t("启用语音输入")}
             detail={t("停止录音后，可将转写文字插入或发送到当前会话。")}
             disabled={!form.enhancementsEnabled}
             checked={form.dictation.enabled}
@@ -4898,6 +4956,7 @@ function DictationSettingsPanel({ form, onFormChange }: {
                   onFormChange({ ...form, dictation: applyDictationPreset(form.dictation, value) });
                 }}
                 options={[
+                  { value: "sensevoice", label: t("本地 SenseVoice（离线）") },
                   { value: "groq", label: "Groq" },
                   { value: "openai", label: t("OpenAI 兼容") },
                   { value: "local", label: t("本地服务") },
@@ -4914,24 +4973,40 @@ function DictationSettingsPanel({ form, onFormChange }: {
               />
             </Field>
           </div>
-          <Field label="Base URL">
-            <Input
-              value={form.dictation.baseUrl}
-              onChange={(event) => updateDictation({ baseUrl: event.currentTarget.value })}
-              placeholder="https://api.groq.com/openai/v1"
-              spellCheck={false}
-            />
-          </Field>
-          <p className="field-hint">{t("填写服务的 API 基础地址，转写请求会发送到 /audio/transcriptions。可修改预设地址和模型。")}</p>
-          <Field label="API Key">
-            <Input
-              type="password"
-              autoComplete="off"
-              value={form.dictation.apiKey}
-              onChange={(event) => updateDictation({ apiKey: event.currentTarget.value })}
-            />
-          </Field>
-          <p className="field-hint">{t("可填写 API Key 或环境变量名称。本地服务不要求认证时可留空。")}</p>
+          {form.dictation.provider === "sensevoice" ? <>
+            <p className="field-hint">{t("SenseVoiceSmall 在本机 CPU 上运行。请手动下载约 229 MiB 模型，下载并校验完成后才可录音转写；音频不会离开本机。")}</p>
+            <div className="form-row">
+              <Button type="button" disabled={downloading} onClick={() => { void downloadLocalModel(); }}>
+                <Download className="h-4 w-4" />
+                {downloading ? t("正在下载并校验…") : localModelState?.modelReady ? t("校验或重新下载模型") : t("下载本地模型")}
+              </Button>
+              <span className="field-hint" role="status">
+                {downloading
+                  ? `${Math.min(100, Math.floor((localModelState?.completedBytes || 0) / (localModelState?.totalBytes || 239549735) * 100))}%`
+                  : localModelState?.modelReady ? t("本地模型已下载") : t("本地模型尚未下载")}
+              </span>
+            </div>
+            {localModelError || localModelState?.phase === "failed" ? <p className="field-hint" role="alert">{localModelError || localModelState?.message}</p> : null}
+          </> : <>
+            <Field label="Base URL">
+              <Input
+                value={form.dictation.baseUrl}
+                onChange={(event) => updateDictation({ baseUrl: event.currentTarget.value })}
+                placeholder="https://api.groq.com/openai/v1"
+                spellCheck={false}
+              />
+            </Field>
+            <p className="field-hint">{t("填写服务的 API 基础地址，转写请求会发送到 /audio/transcriptions。可修改预设地址和模型。")}</p>
+            <Field label="API Key">
+              <Input
+                type="password"
+                autoComplete="off"
+                value={form.dictation.apiKey}
+                onChange={(event) => updateDictation({ apiKey: event.currentTarget.value })}
+              />
+            </Field>
+            <p className="field-hint">{t("可填写 API Key 或环境变量名称。本地服务不要求认证时可留空。")}</p>
+          </>}
           <details className="stepwise-advanced enhance-service-advanced">
             <summary>{t("高级参数")}</summary>
             <Field label={t("API Key 环境变量")}>
@@ -4965,7 +5040,9 @@ function DictationSettingsPanel({ form, onFormChange }: {
           {dictationIssue ? <p className="field-hint" role="alert">{dictationIssue}</p> : null}
           <div className="hint-line enhance-service-note">
             <Info className="h-4 w-4" />
-            <span>{t("保存后 Codex 输入框会显示「语音输入」按钮，停止录音后可插入或发送文字。录音会发送到上面填写的服务地址，无需重启。")}</span>
+            <span>{form.dictation.provider === "sensevoice"
+              ? t("下载模型并保存配置后，可在 Codex 输入框录音，停止后在本机转写并插入文字。")
+              : t("保存后 Codex 输入框会显示「语音输入」按钮，停止录音后可插入或发送文字。录音会发送到上面填写的服务地址，无需重启。")}</span>
           </div>
         </div>
       </CardContent>
@@ -5206,7 +5283,6 @@ function EnhanceScreen({
               <FeatureGroup title={t("对话与输入")} detail={t("调整会话管理、输入行为和对话阅读体验。")}>
                 <FeatureToggle title={t("会话删除")} detail={t("在会话列表悬停显示删除按钮，并支持撤销。")} checked={form.codexAppSessionDelete} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppSessionDelete", value)} />
                 <FeatureToggle title={t("Markdown 导出")} detail={t("在会话列表显示导出按钮，导出带时间戳的 Markdown。")} checked={form.codexAppMarkdownExport} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppMarkdownExport", value)} />
-                <FeatureToggle title={t("分享会话按钮")} detail={t("在当前会话工具栏显示分享按钮，保存后更新显示，无需重启 Codex。")} checked={form.codexAppSessionShare} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppSessionShare", value)} />
                 <FeatureToggle title={t("粘贴修复")} detail={t("从 Word 等富文本粘贴到 Codex composer 时只保留纯文本，避免被识别为图片/文件附件。需重启 Codex 才生效。")} checked={form.codexAppPasteFix} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppPasteFix", value)} />
                 <div className={`feature-toggle ${!masterEnabled ? "disabled" : ""}`}>
                   <span>
@@ -6581,10 +6657,6 @@ function SessionsScreen({
                 <RefreshCw className="h-4 w-4" />
                 {t("刷新会话")}
               </Button>
-              <Button onClick={() => void actions.importLocalSession()} variant="outline">
-                <PackageOpen className="h-4 w-4" />
-                {t("导入文件")}
-              </Button>
               <Button
                 disabled={providerSyncProgress.active || sessionIndexRepairActive || !canRepairProviderSessions}
                 onClick={() => void actions.syncProvidersNow()}
@@ -6604,18 +6676,6 @@ function SessionsScreen({
               <Button onClick={() => void actions.saveSettings()}>
                 <Save className="h-4 w-4" />
                 {t("保存设置")}
-              </Button>
-            </div>
-            <div className="session-share-import">
-              <Input
-                aria-label={t("会话分享链接")}
-                onChange={(event) => actions.setSessionShareUrl(event.currentTarget.value)}
-                placeholder={t("粘贴 Codex++ 会话分享链接")}
-                value={actions.sessionShareUrl}
-              />
-              <Button disabled={!actions.sessionShareUrl.trim()} onClick={() => void actions.importSessionUrl()} variant="outline">
-                <Download className="h-4 w-4" />
-                {t("导入链接")}
               </Button>
             </div>
           </div>
@@ -7602,7 +7662,7 @@ function RelayProfileDetail({
         next,
         activeLiveBaseUrl,
       );
-      if (requiresRestart && !window.confirm(t("首次启用单模型路由需要启动本地协议代理。保存后将立即重启 Codex，使路由安全生效。是否继续？"))) {
+      if (requiresRestart && !window.confirm(t("此请求设置需要启动本地协议代理。保存后将立即重启 Codex，使设置安全生效。是否继续？"))) {
         return;
       }
       const savedSettings = await onFormChange(next);
@@ -8331,13 +8391,6 @@ function RelayProfileEditor({
   };
   return (
     <div className="relay-profile-editor">
-      {isNew ? (
-        <ProviderPresetSelector
-          onSelect={(patch: PresetPatch) => {
-            updateDraft(patch as unknown as Partial<RelayProfile>);
-          }}
-        />
-      ) : null}
       <div className="relay-fields">
         <section className="relay-config-section relay-basic-section">
           <div className="relay-config-section-head">
@@ -8980,6 +9033,26 @@ function RelayProfileEditor({
                   placeholder={t("留空使用默认值")}
                 />
               </Field>
+            ) : null}
+            {showApiFields ? (
+              <label
+                className={`switch-row compact relay-switch-row relay-field-search-history${profile.protocol === "responses" ? "" : " is-disabled"}`}
+                title={profile.protocol === "responses" ? undefined : t("仅限 Responses API。")}
+              >
+                <input
+                  checked={profile.webSearchHistoryCompat}
+                  disabled={profile.protocol !== "responses"}
+                  onChange={(event) =>
+                    updateDraft({ webSearchHistoryCompat: event.currentTarget.checked })
+                  }
+                  type="checkbox"
+                />
+                <span>
+                  <strong>{t("搜索历史压缩兼容（实验）")}</strong>
+                  <small>response protection is unavailable</small>
+                </span>
+                <ToggleVisual />
+              </label>
             ) : null}
             {showApiFields ? (
               <Field className="relay-field-custom-headers" label={t("自定义请求头")}>
@@ -11973,6 +12046,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
             noAuth: false,
             sub2apiMultiplier: "",
             standardOpenaiProtocol: false,
+            webSearchHistoryCompat: false,
             rateLimitCooldownEnabled: false,
             channelQueueEnabled: false,
             channelRequestsPerMinute: 20,
@@ -11989,7 +12063,6 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
     ccsDbPath: (settings.ccsDbPath || "").trim(),
     dictation: normalizeDictationSettings(settings.dictation),
     codexAppTypingEffect: normalizeTypingEffect(settings.codexAppTypingEffect),
-    codexAppSessionShare: settings.codexAppSessionShare !== false,
     relayProfilesEnabled: settings.relayProfilesEnabled !== false,
     codexAppImageOverlayOpacity: clampNumber(settings.codexAppImageOverlayOpacity || 35, 1, 100),
     codexAppImageOverlayFitMode: normalizeImageOverlayFitMode(settings.codexAppImageOverlayFitMode),
@@ -12101,6 +12174,7 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
         noAuth: false,
         sub2apiMultiplier: "",
         standardOpenaiProtocol: false,
+        webSearchHistoryCompat: false,
         rateLimitCooldownEnabled: profile.rateLimitCooldownEnabled === true,
         channelQueueEnabled: profile.channelQueueEnabled === true,
         channelRequestsPerMinute: clampNumber(profile.channelRequestsPerMinute ?? 20, 1, 10000),
@@ -12142,6 +12216,7 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
     sub2apiEnabled: profile.noAuth ? false : profile.sub2apiEnabled === true,
     sub2apiMultiplier: !profile.noAuth && profile.sub2apiEnabled === true ? profile.sub2apiMultiplier || "" : "",
     standardOpenaiProtocol: profile.standardOpenaiProtocol === true,
+    webSearchHistoryCompat: profile.webSearchHistoryCompat === true,
     rateLimitCooldownEnabled: profile.rateLimitCooldownEnabled === true,
     channelQueueEnabled: profile.channelQueueEnabled === true,
     channelRequestsPerMinute: clampNumber(profile.channelRequestsPerMinute ?? 20, 1, 10000),
@@ -12337,10 +12412,16 @@ function withGeneratedRelayFiles(profile: RelayProfile): RelayProfile {
 }
 
 function buildRelayConfigToml(
-  profile: Pick<RelayProfile, "model" | "baseUrl" | "upstreamBaseUrl" | "apiKey" | "protocol" | "sessionProvider">,
+  profile: Pick<RelayProfile, "model" | "baseUrl" | "upstreamBaseUrl" | "apiKey" | "protocol" | "sessionProvider" | "relayMode" | "officialMixApiKey" | "webSearchHistoryCompat">,
   options: { includeBearerToken: boolean; requiresOpenAiAuth?: boolean },
 ): string {
-  const baseUrl = profile.protocol === "chatCompletions" ? PROTOCOL_PROXY_BASE_URL : profile.baseUrl.trim();
+  const searchHistoryCompat = profile.webSearchHistoryCompat === true
+    && profile.protocol === "responses"
+    && profile.relayMode !== "aggregate"
+    && (profile.relayMode !== "official" || profile.officialMixApiKey);
+  const baseUrl = profile.protocol === "chatCompletions" || searchHistoryCompat
+    ? PROTOCOL_PROXY_BASE_URL
+    : profile.baseUrl.trim();
   const apiKey = profile.apiKey.trim();
   const sessionProvider = normalizeRelaySessionProvider(profile.sessionProvider);
   const rootLines = [
@@ -12472,8 +12553,12 @@ function applyRelayProfilePatchToFiles(
   if ("upstreamBaseUrl" in patch) {
     next.baseUrl = patch.upstreamBaseUrl || "";
   }
-  if ("baseUrl" in patch || "upstreamBaseUrl" in patch || "protocol" in patch || "modelRoutes" in patch) {
-    const baseUrlForConfig = next.protocol === "chatCompletions" || normalizeRelayModelRoutes(next.modelRoutes).length > 0
+  if ("baseUrl" in patch || "upstreamBaseUrl" in patch || "protocol" in patch || "modelRoutes" in patch || "webSearchHistoryCompat" in patch) {
+    const searchHistoryCompat = next.webSearchHistoryCompat === true
+      && next.protocol === "responses"
+      && next.relayMode !== "aggregate"
+      && (next.relayMode !== "official" || next.officialMixApiKey);
+    const baseUrlForConfig = next.protocol === "chatCompletions" || normalizeRelayModelRoutes(next.modelRoutes).length > 0 || searchHistoryCompat
       ? PROTOCOL_PROXY_BASE_URL
       : next.upstreamBaseUrl || next.baseUrl;
     next.configContents = setCodexProviderStringKey(next.configContents, "base_url", baseUrlForConfig, {
@@ -13141,6 +13226,7 @@ function createRelayProfile(settings: BackendSettings): RelayProfile {
     sub2apiMultiplier: "",
     modelRoutes: [],
     standardOpenaiProtocol: false,
+    webSearchHistoryCompat: false,
     rateLimitCooldownEnabled: false,
     channelQueueEnabled: false,
     channelRequestsPerMinute: 20,
@@ -13189,6 +13275,7 @@ function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
       sub2apiMultiplier: "",
       modelRoutes: [],
       standardOpenaiProtocol: false,
+      webSearchHistoryCompat: false,
       rateLimitCooldownEnabled: false,
       channelQueueEnabled: false,
       channelRequestsPerMinute: 20,
@@ -13323,6 +13410,7 @@ function normalizeAggregateRelayProfile(profile: RelayProfile, settings: Backend
     noAuth: false,
     sub2apiMultiplier: "",
     standardOpenaiProtocol: false,
+    webSearchHistoryCompat: false,
     aggregate,
   };
 }
