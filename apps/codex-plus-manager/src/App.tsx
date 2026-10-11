@@ -22,6 +22,7 @@ import {
   ArrowRight,
   Bell,
   Blocks,
+  Cable,
   BookOpen,
   CheckCircle2,
   ChevronDown,
@@ -34,9 +35,11 @@ import {
   Info,
   ImagePlus,
   Github,
+  GitBranch,
   ExternalLink,
   Hammer,
   KeyRound,
+  Layers3,
   Languages,
   LayoutGrid,
   LayoutDashboard,
@@ -944,9 +947,10 @@ type ToolId = string;
 const TOOL_ICONS: Record<string, string> = {
   codex: new URL("./assets/agents/chatgpt.svg", import.meta.url).href,
   grok: new URL("./assets/agents/grok.svg", import.meta.url).href,
+  claude: new URL("./assets/agents/claude.svg", import.meta.url).href,
 };
 
-type Route = "overview" | "relay" | "grok" | "relayEnvironment" | "sessions" | "context" | "skills" | "weixin" | "enhance" | "dreamSkin" | "userScripts" | "pluginMarket" | "recommendations" | "agentCache" | "maintenance" | "about" | "settings";
+type Route = "overview" | "relay" | "grok" | "claude" | "relayEnvironment" | "sessions" | "context" | "skills" | "weixin" | "enhance" | "dreamSkin" | "userScripts" | "pluginMarket" | "recommendations" | "agentCache" | "maintenance" | "about" | "settings";
 type Theme = "dark" | "light";
 
 const MANAGER_NAVIGATION_EVENT = "manager-navigation-requested";
@@ -965,6 +969,7 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "overview", label: t("概览"), icon: LayoutDashboard },
   { id: "relay", label: t("供应商配置"), icon: KeyRound, tool: "codex" },
   { id: "grok", label: t("Grok 配置"), icon: Blocks, tool: "grok" },
+  { id: "claude", label: t("Claude 汉化"), icon: Languages, tool: "claude" },
   { id: "sessions", label: t("会话管理"), icon: MessageCircle, tool: "codex" },
   { id: "context", label: "MCP", icon: Network, tool: "codex" },
   { id: "skills", label: "Skills", icon: BookOpen, tool: "codex" },
@@ -985,7 +990,7 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
 const navigationSections: Array<{ label: string; routes: Route[]; placement?: "bottom" }> = [
   {
     label: t("工作区"),
-    routes: ["overview", "relay", "grok"],
+    routes: ["overview", "relay", "grok", "claude"],
   },
   {
     label: t("全局管理"),
@@ -1250,7 +1255,9 @@ export function App() {
     setSettingsForm(next);
     // 供应商页是跟着工具走的，切工具后如果当前页不属于新工具就跳到它自己的页。
     const currentRoute = routes.find((candidate) => candidate.id === route);
-    if (currentRoute?.tool && currentRoute.tool !== toolId) {
+    if (toolId === "claude") {
+      setRoute("claude");
+    } else if (currentRoute?.tool && currentRoute.tool !== toolId) {
       setRoute(toolId === "grok" ? "grok" : "relay");
     }
     const result = await run(() => call<SettingsResult>("save_settings", { settings: next }));
@@ -3465,6 +3472,7 @@ export function App() {
           {route === "grok" ? (
             <GrokScreen settings={settings} form={settingsForm} actions={actions} />
           ) : null}
+          {route === "claude" ? <ClaudeLocalizationScreen /> : null}
           {route === "sessions" ? (
             <SessionPage
               sessions={localSessions}
@@ -4484,6 +4492,7 @@ function RelayScreen({
   const [detailProfileId, setDetailProfileId] = useState<string | null>(null);
   const [newProfileDraft, setNewProfileDraft] = useState<RelayProfile | null>(null);
   const [providerCatalogOpen, setProviderCatalogOpen] = useState(false);
+  const [providerView, setProviderView] = useState<"direct" | "routing" | "aggregate">("direct");
   const [thirdPartyImportOpen, setThirdPartyImportOpen] = useState(false);
   const [ccsDbPathDraft, setCcsDbPathDraft] = useState(normalized.ccsDbPath);
   const [ccsPathSaving, setCcsPathSaving] = useState(false);
@@ -4527,11 +4536,35 @@ function RelayScreen({
     setNewProfileDraft(draft);
     if (!normalizeAggregateConfig(draft.aggregate, aggregateMemberCandidates(normalized, draft.id)).members.length) {
       void actions.showMessage(
-        t("添加聚合供应商"),
+        t("创建聚合供应商"),
         t("已打开聚合供应商详情；请先添加或完善至少 1 个普通 API 供应商的 Base URL / Key，再勾选为成员。"),
         "failed",
       );
     }
+  };
+  const visibleProfiles = normalized.relayProfiles.filter((profile) => (
+    relayProviderView(profile) === providerView
+  ));
+  useEffect(() => {
+    // 协议转换供应商归入独立分区；首次打开时如果没有直连项，直接展示该分区。
+    if (
+      providerView === "direct"
+      && normalized.relayProfiles.length > 0
+      && !normalized.relayProfiles.some((profile) => relayProviderView(profile) === "direct")
+      && normalized.relayProfiles.some((profile) => relayProviderView(profile) === "routing")
+    ) {
+      setProviderView("routing");
+    }
+  }, [normalized.relayProfiles, providerView]);
+  const listForm = syncLegacyRelayFields({ ...normalized, relayProfiles: visibleProfiles });
+  const saveVisibleRelaySettings = async (next: BackendSettings) => {
+    const hiddenProfiles = normalized.relayProfiles.filter((profile) => (
+      relayProviderView(profile) !== providerView
+    ));
+    return saveRelaySettings(syncLegacyRelayFields({
+      ...next,
+      relayProfiles: [...next.relayProfiles, ...hiddenProfiles],
+    }));
   };
   const editRelayProfile = async (profileId: string) => {
     setNewProfileDraft(null);
@@ -4553,29 +4586,6 @@ function RelayScreen({
     setThirdPartyImportOpen((open) => !open);
     if (!ccsProviders) void actions.refreshCcsProviders(true);
   };
-  /// issue #595：切到中转后没有回官方登录态的路。
-  ///
-  /// 直接调 `clear_relay_injection` 会丢掉切换所需的 profile 上下文（它读的是
-  /// 磁盘上 current 的那一份），而且在中转 profile 已经是 active 时不会把
-  /// settings 的 activeRelayId 拨回来。所以这里走既有的供应商切换链路：复用一个
-  /// 「官方登录（不混入 API）」profile，没有就建一个，再设为当前。清理由
-  /// relay_config 的 clear 路径完成，与手动选该 profile 完全一致。
-  const restoreOfficialRelayProfile = async () => {
-    if (actions.relaySwitching) return;
-    const existing = normalized.relayProfiles.find(
-      (profile) => profile.relayMode === "official" && !profile.officialMixApiKey && !isAggregateRelayProfile(profile),
-    );
-    const nextProfile = existing ?? createRelayProfile(normalized);
-    const next = syncLegacyRelayFields({
-      ...normalized,
-      relayProfiles: existing
-        ? normalized.relayProfiles
-        : [...normalized.relayProfiles, nextProfile],
-      activeRelayId: nextProfile.id,
-    });
-    await actions.switchRelayProfile(next, normalized.activeRelayId);
-  };
-
   if (detailProfile) {
     return (
       <RelayProfileDetail
@@ -4615,7 +4625,6 @@ function RelayScreen({
       <PageHeader
         icon={<KeyRound className="h-5 w-5" />}
         title={t("供应商列表")}
-        help={t("管理 Codex 的 API 供应商；选择供应商后会写入当前 Codex 配置。")}
         actions={(
           <Button onClick={() => { setNewProfileDraft(null); setDetailProfileId(null); setProviderCatalogOpen(true); }}>
             <Plus className="h-4 w-4" />
@@ -4643,30 +4652,6 @@ function RelayScreen({
             <ToggleVisual />
           </label>
           <div className="relay-add-row">
-            <Button
-              variant="secondary"
-              onClick={createNewAggregateProfile}
-            >
-              <Plus className="h-4 w-4" />
-              {t("添加聚合供应商")}
-            </Button>
-            {/* issue #595：缺一个「回到官方登录态」的显式入口。当前已经是官方登录
-                （无混入）时置灰，避免无意义的重写。 */}
-            <Button
-              disabled={!normalized.relayProfilesEnabled || actions.relaySwitching || isOfficialLoginActive(normalized)}
-              onClick={() => void restoreOfficialRelayProfile()}
-              title={
-                !normalized.relayProfilesEnabled
-                  ? t("供应商配置总开关已关闭")
-                  : isOfficialLoginActive(normalized)
-                    ? t("当前已是官方登录态")
-                    : t("清除中转 API 配置，切回 ChatGPT 官方登录")
-              }
-              variant="secondary"
-            >
-              <RotateCcw className="h-4 w-4" />
-              {t("恢复官方登录")}
-            </Button>
             <div className="third-party-import">
               <Button
                 onClick={openThirdPartyImport}
@@ -4707,10 +4692,31 @@ function RelayScreen({
               ) : null}
             </div>
           </div>
+          <div className="provider-view-tabs" role="tablist" aria-label={t("供应商配置模式")}>
+            <button aria-selected={providerView === "direct"} className={providerView === "direct" ? "active" : ""} onClick={() => setProviderView("direct")} role="tab" type="button">
+              <Cable className="h-4 w-4" />
+              <span>{t("直连")}</span>
+            </button>
+            <button aria-selected={providerView === "routing"} className={providerView === "routing" ? "active" : ""} onClick={() => setProviderView("routing")} role="tab" type="button">
+              <GitBranch className="h-4 w-4" />
+              <span>{t("需协议转换")}</span>
+            </button>
+            <button aria-selected={providerView === "aggregate"} className={providerView === "aggregate" ? "active" : ""} onClick={() => setProviderView("aggregate")} role="tab" type="button">
+              <Layers3 className="h-4 w-4" />
+              <span>{t("聚合")}</span>
+            </button>
+          </div>
+          {providerView === "aggregate" && !visibleProfiles.length ? (
+            <div className="provider-aggregate-empty">
+              <strong>{t("还没有聚合供应商")}</strong>
+              <span>{t("切换到聚合配置后，在编辑页选择成员供应商和路由规则。")}</span>
+              <Button onClick={createNewAggregateProfile}>{t("创建聚合配置")}</Button>
+            </div>
+          ) : null}
           <RelayProfileList
-            form={normalized}
+            form={listForm}
             onEdit={(profileId) => void editRelayProfile(profileId)}
-            onFormChange={saveRelaySettings}
+            onFormChange={saveVisibleRelaySettings}
             disabled={!normalized.relayProfilesEnabled || actions.relaySwitching}
             actions={actions}
           />
@@ -4731,8 +4737,13 @@ function ProviderCatalogScreen({
   onSelect: (profile: RelayProfile) => void;
 }) {
   const [query, setQuery] = useState("");
-  const quickPresets = PRESETS.slice(0, 5);
-  const filtered = PRESETS.filter((preset) => {
+  const categories: Array<{ id: ProviderPreset["category"]; label: string }> = [
+    { id: "official", label: t("账号登录") },
+    { id: "cn_official", label: t("模型厂商") },
+    { id: "aggregator", label: t("聚合/中转") },
+    { id: "third_party", label: t("第三方平台") },
+  ];
+  const filteredPresets = PRESETS.filter((preset) => {
     const haystack = `${preset.name} ${preset.baseUrl} ${preset.model}`.toLowerCase();
     return !query.trim() || haystack.includes(query.trim().toLowerCase());
   });
@@ -4750,38 +4761,41 @@ function ProviderCatalogScreen({
         <h2>{t("添加新供应商")}</h2>
         <span>Codex</span>
       </header>
-      <main className="provider-add-simple-body">
-        <section className="provider-quick-templates">
-          <strong>{t("快速选择模板：")}</strong>
-          <div className="provider-quick-template-list">
-            {quickPresets.map((preset) => (
-              <button key={preset.id} onClick={() => selectPreset(preset)} type="button">
-                {preset.name}
-              </button>
-            ))}
-            <button className="outline" onClick={() => selectPreset()} type="button">{t("自定义配置")}</button>
-          </div>
-        </section>
-        <div className="provider-add-divider" />
+      <main className="provider-add-simple-body provider-add-reference-layout">
         <div className="provider-add-search">
           <Search className="h-4 w-4" />
           <Input
             aria-label={t("搜索供应商")}
             onChange={(event) => setQuery(event.currentTarget.value)}
-            placeholder={t("搜索更多供应商名称或网址")}
+            placeholder={t("搜索名称或网址，例如 kimi、智谱、openrouter")}
             value={query}
           />
         </div>
         <div className="provider-add-results">
-          {filtered.slice(0, 12).map((preset) => (
-            <button className="provider-add-result" key={preset.id} onClick={() => selectPreset(preset)} type="button">
-              <strong>{preset.name}</strong>
-              <small>{preset.websiteUrl ? new URL(preset.websiteUrl).host : preset.baseUrl}</small>
-            </button>
-          ))}
+          <button className="provider-add-result provider-add-custom-result" onClick={() => selectPreset()} type="button">
+            <span className="provider-add-icon">✦</span>
+            <span><strong>{t("自定义配置")}</strong><small>{t("手动填写请求地址和 API Key")}</small></span>
+          </button>
         </div>
-        {!filtered.length ? <div className="empty">{t("没有匹配的供应商")}</div> : null}
-        <p className="provider-add-hint">{t("选择模板后会进入编辑页；API Key 和本地配置只在保存时写入当前 Codex。")}</p>
+        {categories.map((category) => {
+          const presets = filteredPresets.filter((preset) => preset.category === category.id);
+          if (!presets.length) return null;
+          return (
+            <section className="provider-add-section" key={category.id}>
+              <h3>{category.label}</h3>
+              <div className="provider-add-results">
+                {presets.map((preset) => (
+                  <button className="provider-add-result" key={preset.id} onClick={() => selectPreset(preset)} type="button">
+                    <span className="provider-add-icon">{preset.name.slice(0, 1).toUpperCase()}</span>
+                    <span><strong>{preset.name}</strong><small>{preset.websiteUrl ? new URL(preset.websiteUrl).host : preset.baseUrl}</small></span>
+                  </button>
+                ))}
+              </div>
+            </section>
+          );
+        })}
+        {!filteredPresets.length ? <div className="empty">{t("没有匹配的供应商")}</div> : null}
+        <p className="provider-add-hint">{t("选择供应商后会进入编辑页；API Key 和本地配置只在保存时写入当前 Codex。")}</p>
       </main>
     </div>
   );
@@ -8851,7 +8865,7 @@ function RelayProfileEditor({
               <section className="relay-config-section relay-field-model-routes">
                 <div className="relay-config-section-head">
                   <div>
-                    <strong>{t("单模型路由")}</strong>
+                    <strong>{t("单模型协议转换")}</strong>
                     <span>{t("仅在当前供应商启用时生效；精确匹配模型名并使用目标供应商的 URL 与 Key。目标必须是 Responses API，且需要从 Codex++ 启动。")}</span>
                   </div>
                   <div className="relay-model-list-tools">
@@ -8859,12 +8873,12 @@ function RelayProfileEditor({
                       disabled={modelRouteTargets.length === 0}
                       onClick={() => updateDraft({ modelRoutes: [...modelRoutes, { model: "", targetRelayId: "", targetModel: "" }] })}
                       size="sm"
-                      title={modelRouteTargets.length === 0 ? t("请先创建一个 Responses API 目标供应商") : t("添加模型路由")}
+                      title={modelRouteTargets.length === 0 ? t("请先创建一个 Responses API 目标供应商") : t("添加协议转换")}
                       type="button"
                       variant="secondary"
                     >
                       <Plus className="h-4 w-4" />
-                      {t("添加模型路由")}
+                      {t("添加协议转换")}
                     </Button>
                   </div>
                 </div>
@@ -8897,10 +8911,10 @@ function RelayProfileEditor({
                         placeholder={t("留空保持原模型名")}
                       />
                       <Button
-                        aria-label={t("删除模型路由")}
+                        aria-label={t("删除协议转换")}
                         onClick={() => updateDraft({ modelRoutes: modelRoutes.filter((_, routeIndex) => routeIndex !== index) })}
                         size="icon"
-                        title={t("删除模型路由")}
+                        title={t("删除协议转换")}
                         type="button"
                         variant="ghost"
                       >
@@ -10585,6 +10599,86 @@ function Panel({ children, fill = false, className = "" }: { children: React.Rea
   );
 }
 
+type ClaudeLocalizationStatus = {
+  supported: boolean;
+  sourceApp: string;
+  copyApp: string;
+  sourceVersion: string;
+  copyVersion: string;
+  prepared: boolean;
+  needsRebuild: boolean;
+  running: boolean;
+  nodeAvailable: boolean;
+  pythonAvailable: boolean;
+  shellLocale: string | null;
+  catalogEntries: number;
+};
+
+function ClaudeLocalizationScreen() {
+  const [status, setStatus] = useState<CommandResult<ClaudeLocalizationStatus> | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const refresh = async () => {
+    try { setStatus(await invoke<CommandResult<ClaudeLocalizationStatus>>("claude_localization_status")); }
+    catch (cause) { setError(stringifyError(cause)); }
+  };
+  useEffect(() => { void refresh(); }, []);
+  const act = async (action: "prepare" | "launch" | "restore" | "check") => {
+    setBusy(action); setError(null);
+    try {
+      const result = await invoke<CommandResult<ClaudeLocalizationStatus>>("claude_localization_action", { action });
+      setStatus(result);
+      if (result.status !== "ok") setError(result.message);
+    } catch (cause) { setError(stringifyError(cause)); }
+    finally { setBusy(null); }
+  };
+  const s = status;
+  const canLaunch = Boolean(s?.prepared && !s.needsRebuild && s.nodeAvailable);
+  return (
+    <div className="claude-localization-page">
+      <Panel>
+        <CardHead title={t("Claude Code 汉化") } detail={t("官方 Claude.app 与 app.asar 保持原样，中文通过受管副本和启动时注入实现。")} />
+        <CardContent>
+          <div className="claude-localization-status-grid">
+            <Metric label={t("官方版本")} value={s?.sourceVersion || t("未检测到")} />
+            <Metric label={t("副本状态")} value={!s ? t("读取中") : s.prepared ? (s.needsRebuild ? t("需要更新") : t("已准备")) : t("未准备")} />
+            <Metric label={t("外壳语言")} value={s?.shellLocale || t("未设置")} />
+            <Metric label={t("官方词条")} value={s ? `${s.catalogEntries.toLocaleString()} ${t("条")}` : t("读取中")} />
+          </div>
+          <div className="hint-line" role="note">
+            {t("首次准备会创建独立副本并重新签名；官方应用、登录态和 app.asar 不会被改写。启动副本时可能需要在钥匙串弹窗中选择“始终允许”。")}
+          </div>
+          {error ? <div className="inline-error">{error}</div> : null}
+          <Toolbar>
+            <Button disabled={busy !== null || !s?.supported} onClick={() => void act("prepare")}>
+              <PackageOpen className="h-4 w-4" />{busy === "prepare" ? t("准备中…") : t("准备汉化副本")}
+            </Button>
+            <Button disabled={busy !== null || !canLaunch} onClick={() => void act("launch")}>
+              <Play className="h-4 w-4" />{busy === "launch" ? t("启动中…") : t("启动中文 Claude")}
+            </Button>
+            <Button disabled={busy !== null || !s?.prepared} onClick={() => void act("check")} variant="secondary">
+              <RefreshCw className="h-4 w-4" />{t("检查副本")}
+            </Button>
+            <Button disabled={busy !== null || !s?.shellLocale} onClick={() => void act("restore")} variant="secondary">
+              <RotateCcw className="h-4 w-4" />{t("还原语言")}
+            </Button>
+          </Toolbar>
+        </CardContent>
+      </Panel>
+      <Panel>
+        <CardHead title={t("实现方式")} detail={t("安全边界") } />
+        <CardContent>
+          <ul className="claude-localization-list">
+            <li>{t("从官方应用克隆受管副本，只翻转副本的 Electron inspector 开关并做 ad-hoc 重签名。")}</li>
+            <li>{t("把官方 zh-Hans 词表装入副本的 ion-dist；启动器短暂连接本地 inspector，注入页面脚本后关闭端口。")}</li>
+            <li>{t("更新失败会保留当前可用副本；构建完成且校验 app.asar 一致后才替换旧副本。")}</li>
+          </ul>
+        </CardContent>
+      </Panel>
+    </div>
+  );
+}
+
 function CardHead({ title, detail }: { title: string; detail: string }) {
   return (
     <CardHeader className="panel-head">
@@ -11052,8 +11146,7 @@ function ApplicationRail({
  * 应用栏上方的 Agent 图标组：点击切换当前聚焦的工具。
  *
  * 这里的「工具」指 Codex / Grok / 后续接入的 CLI，每个工具在自己的供应商
- * 分区里，互相不串配置。未接入写盘能力的工具仍然展示（让用户知道后面会支持），
- * 但按钮禁用。
+ * 分区里，互相不串配置。未接入供应商写盘的工具仍可进入自己的管理页。
  */
 function ToolSwitcher({
   tools,
@@ -11308,6 +11401,7 @@ function routeSubtitle(route: Route) {
     overview: t("检查问题、启动与快速修复"),
     relay: t("管理 API 供应商、协议、Key 与配置文件"),
     grok: t("管理 Grok CLI 的模型与 API 端点"),
+    claude: t("保留官方 Claude.app 原样，通过受管副本动态应用中文界面"),
     relayEnvironment: t("排查可能干扰中转站配置的本机环境"),
     sessions: t("查看、删除和修复 Codex 本地会话"),
     context: t("独立管理 MCP 服务器与插件"),
@@ -12255,13 +12349,6 @@ function relayProtocolLabel(protocol: RelayProtocol): string {
   return protocol === "chatCompletions" ? t("Chat Completions 转 Responses") : "Responses API";
 }
 
-/// 当前 active 供应商是否就是「纯官方登录」（官方模式且不混入 API Key）。
-/// 用于给「恢复官方登录」按钮置灰（issue #595）。
-function isOfficialLoginActive(settings: BackendSettings): boolean {
-  const active = activeRelayProfile(settings);
-  return active.relayMode === "official" && !active.officialMixApiKey && !isAggregateRelayProfile(active);
-}
-
 function ccsProviderSummary(result: CcsProvidersResult | null): string {
   if (!result) return t("读取 ~/.cc-switch/cc-switch.db");
   if (!isSuccessStatus(result.status)) return result.message || t("读取 cc-switch 供应商失败。");
@@ -13081,7 +13168,7 @@ function relayModelRouteIssueMessage(issue: ReturnType<typeof findRelayModelRout
   if (!issue) return null;
   switch (issue.kind) {
     case "incomplete":
-      return t("单模型路由需要填写模型名称和目标供应商。");
+      return t("单模型协议转换需要填写模型名称和目标供应商。");
     case "duplicate":
       return tf("模型「{0}」存在重复路由。", [issue.model]);
     case "self":
@@ -13389,6 +13476,13 @@ const aggregateStrategyOptions: Array<{ value: RelayAggregateStrategy; label: st
 
 function isAggregateRelayProfile(profile: Pick<RelayProfile, "relayMode" | "aggregate">): boolean {
   return profile.relayMode === "aggregate" || !!profile.aggregate;
+}
+
+function relayProviderView(profile: RelayProfile): "direct" | "routing" | "aggregate" {
+  if (isAggregateRelayProfile(profile)) return "aggregate";
+  return profile.protocol === "chatCompletions" || normalizeRelayModelRoutes(profile.modelRoutes).length
+    ? "routing"
+    : "direct";
 }
 
 function normalizeAggregateRelayProfile(profile: RelayProfile, settings: BackendSettings | null): RelayProfile {

@@ -163,11 +163,15 @@ fn windows_installer_waits_for_normal_exit_and_cancels_without_writing_apps() {
 }
 
 #[test]
-fn macos_dmg_includes_applications_shortcut_and_only_one_app() {
+fn macos_dmg_includes_applications_shortcut_and_hidden_legacy_shim() {
     let script = std::fs::read_to_string("../../scripts/installer/macos/package-dmg.sh").unwrap();
     assert!(script.contains("ln -s /Applications \"$STAGE/Applications\""));
     assert!(script.contains("Codex++.app"));
-    assert!(!script.contains("Codex++ 管理工具.app"));
+    // The legacy updater still looks up this exact companion path. It is
+    // intentionally shipped as a hidden, self-exiting compatibility shim.
+    assert!(script.contains("Codex++ 管理工具.app"));
+    assert!(script.contains("codex-plus-legacy-shim"));
+    assert!(script.contains("chflags hidden \"$STAGE/Codex++ 管理工具.app\""));
 }
 
 #[test]
@@ -192,6 +196,7 @@ fn legacy_macos_layout_redirects_companions_to_unified_app() {
             assert!(
                 companion_binary_path_from_exe(Path::new(old), binary)
                     .to_string_lossy()
+                    .replace('\\', "/")
                     .eq_ignore_ascii_case("/Applications/Codex++.app/Contents/MacOS/CodexPlusPlus")
             );
             assert_eq!(
