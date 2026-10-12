@@ -5,50 +5,302 @@
   if (!codexPlusIsNodeTestHarness && (window.top !== window || window.self !== window || !window.electronBridge || !/^app:\/\/\-\//i.test(window.location.href))) return;
   const codexPlusIsWindowsPlatform = /\bWindows\b/i.test(navigator.userAgent || "");
 
-  // 撤下强制语言后的单次迁移：只撤回仍由旧版管理的设置，不干预用户后来选择的语言。
-  async function restoreCodexPlusManagedLocale() {
-    const managedKey = "codexPlus.forceChineseLocale.managed.v1";
-    const reloadKey = "codexPlus.forceChineseLocale.reload.v1";
-    let marker;
-    let managed;
-    try {
-      marker = window.localStorage.getItem(managedKey);
-      if (!marker) return true;
-      managed = JSON.parse(marker);
-      if (!managed || Array.isArray(managed) || typeof managed.appliedLocale !== "string" || !managed.appliedLocale) return false;
-    } catch {
-      return false;
-    }
-    if (window.__codexPlusRetiredLocaleCleanupPromise) return await window.__codexPlusRetiredLocaleCleanupPromise;
-    const restore = async () => {
+  function installCodexPlusForceChineseLocale() {
+    const config = window.__CODEX_PLUS_FORCE_CHINESE_LOCALE__;
+    if (!config) return;
+    const enabled = config.enabled === true;
+    const locale = typeof config.locale === "string" && config.locale ? config.locale : "zh-CN";
+    const installationKey = `2:${enabled ? "on" : "off"}:${locale}`;
+    if (window.__codexPlusForceChineseLocaleInstalled === installationKey) return;
+    window.__codexPlusForceChineseLocaleInstalled = installationKey;
+    const languages = [locale, "zh", "en-US", "en"];
+    const managedLocaleStorageKey = "codexPlus.forceChineseLocale.managed.v1";
+    const localeReloadStorageKey = "codexPlus.forceChineseLocale.reload.v1";
+
+    const readManagedLocale = () => {
       try {
-        const response = await codexStateCall("get-setting", { params: { key: "localeOverride" } });
-        if (!response || !Object.prototype.hasOwnProperty.call(response, "value")) return false;
-        if (window.localStorage.getItem(managedKey) !== marker) return false;
-        if (response.value === managed.appliedLocale) {
-          const previousValue = managed.previousValue ?? null;
-          if (previousValue !== null) {
-            if (typeof previousValue !== "string" || previousValue.length > 64 || previousValue.trim() !== previousValue) return false;
-            if (Intl.getCanonicalLocales(previousValue).length !== 1) return false;
-          }
-          await codexStateCall("set-setting", { params: { key: "localeOverride", value: previousValue } });
-        }
-        if (window.localStorage.getItem(managedKey) !== marker) return false;
-        window.sessionStorage.removeItem(reloadKey);
-        window.localStorage.removeItem(managedKey);
-        return true;
+        const value = JSON.parse(window.localStorage.getItem(managedLocaleStorageKey) || "null");
+        return value && typeof value === "object" ? value : null;
       } catch {
-        // 原生 API 或存储暂时不可用时保留标记，下一次注入继续撤回。
-        return false;
+        return null;
       }
     };
-    const pending = restore();
-    window.__codexPlusRetiredLocaleCleanupPromise = pending;
-    try {
-      return await pending;
-    } finally {
-      if (window.__codexPlusRetiredLocaleCleanupPromise === pending) delete window.__codexPlusRetiredLocaleCleanupPromise;
-    }
+
+    const writeManagedLocale = (value) => {
+      try {
+        if (value) {
+          window.localStorage.setItem(managedLocaleStorageKey, JSON.stringify(value));
+        } else {
+          window.localStorage.removeItem(managedLocaleStorageKey);
+        }
+      } catch {
+      }
+    };
+
+    // 走 codexStateCall（60-plugin-marketplace.js 的能力探测通道）：老版的
+    // electronBridge + vscode://codex/ 自定义消息在 issue #2399 后已不可靠，
+    // state API 会随构建换模块位置，按能力识别才能一直找到。
+    //
+    // 但 state API 的 promise 是永久缓存的，且 asset 加载失败会留下 30 秒冷却
+    // （见 20-menu.js 的 codexAppModuleRetryCooldownMs）。注入发生在 App 的
+    // asset 就绪之前时第一次调用必然失败，而那次失败会被一直记住——所以这里
+    // 必须有界重试，不能像老版等 electronBridge 那样一次不成就算了。
+    const localeSyncRetryDelaysMs = [500, 1500, 3000, 6000, 12000, 20000];
+    const callCodexSettingApiOnce = (method, params) => codexStateCall(method, { params });
+    const callCodexSettingApi = async (method, params) => {
+      let lastError;
+      for (let attempt = 0; attempt <= localeSyncRetryDelaysMs.length; attempt += 1) {
+        try {
+          return await callCodexSettingApiOnce(method, params);
+        } catch (error) {
+          lastError = error;
+          const delay = localeSyncRetryDelaysMs[attempt];
+          if (delay === undefined) break;
+          await new Promise((resolve) => window.setTimeout(resolve, delay));
+        }
+      }
+      throw lastError;
+    };
+    const reloadAfterLocaleChange = (value) => {
+      const marker = JSON.stringify(value);
+      try {
+        if (window.sessionStorage.getItem(localeReloadStorageKey) === marker) return;
+        window.sessionStorage.setItem(localeReloadStorageKey, marker);
+        // 标记写不进去就不要刷新，否则下次加载读不到标记，会再次刷新。
+        if (window.sessionStorage.getItem(localeReloadStorageKey) !== marker) return;
+      } catch {
+        return;
+      }
+      window.location.reload();
+    };
+
+    const clearLocaleReloadMarker = () => {
+      try {
+        window.sessionStorage.removeItem(localeReloadStorageKey);
+      } catch {
+      }
+    };
+
+    const syncOfficialLocaleSetting = async () => {
+      const managed = readManagedLocale();
+      if (!enabled && !managed) return;
+      const response = await callCodexSettingApi("get-setting", { key: "localeOverride" });
+      const currentValue = response?.value ?? null;
+
+      if (enabled) {
+        if (currentValue === locale) {
+          clearLocaleReloadMarker();
+          return;
+        }
+        if (!managed) {
+          writeManagedLocale({ appliedLocale: locale, previousValue: currentValue });
+        }
+        await callCodexSettingApi("set-setting", { key: "localeOverride", value: locale });
+        reloadAfterLocaleChange(locale);
+        return;
+      }
+
+      if (currentValue !== managed.appliedLocale) {
+        writeManagedLocale(null);
+        clearLocaleReloadMarker();
+        return;
+      }
+      const previousValue = managed.previousValue ?? null;
+      await callCodexSettingApi("set-setting", {
+        key: "localeOverride",
+        value: previousValue,
+      });
+      writeManagedLocale(null);
+      reloadAfterLocaleChange(previousValue);
+    };
+
+    syncOfficialLocaleSetting().catch(() => {});
+    if (!enabled) return;
+
+    const defineNavigatorGetter = (name, value) => {
+      try {
+        Object.defineProperty(Navigator.prototype, name, {
+          configurable: true,
+          get: () => value,
+        });
+      } catch {
+        try {
+          Object.defineProperty(navigator, name, {
+            configurable: true,
+            get: () => value,
+          });
+        } catch {
+        }
+      }
+    };
+
+    defineNavigatorGetter("language", locale);
+    defineNavigatorGetter("languages", languages);
+
+    const patchI18nConfig = (dynamicConfig) => {
+      if (!dynamicConfig || typeof dynamicConfig !== "object") return dynamicConfig;
+      const value = dynamicConfig.value && typeof dynamicConfig.value === "object" ? dynamicConfig.value : {};
+      const nextValue = {
+        ...value,
+        enable_i18n: true,
+        locale_source: "SYSTEM",
+      };
+      try {
+        dynamicConfig.value = nextValue;
+      } catch {
+      }
+      if (typeof dynamicConfig.get === "function" && !dynamicConfig.__codexPlusForceChineseLocaleGetPatched) {
+        const originalGet = dynamicConfig.get.bind(dynamicConfig);
+        dynamicConfig.get = (key, fallback) => {
+          if (key === "enable_i18n") return true;
+          if (key === "locale_source") return "SYSTEM";
+          return originalGet(key, fallback);
+        };
+        dynamicConfig.__codexPlusForceChineseLocaleGetPatched = true;
+      }
+      return dynamicConfig;
+    };
+
+    const statsigClients = () => {
+      const root = window.__STATSIG__ || globalThis.__STATSIG__;
+      if (!root || typeof root !== "object") return [];
+      const clients = [root.firstInstance, typeof root.instance === "function" ? root.instance() : null];
+      if (root.instances && typeof root.instances === "object") clients.push(...Object.values(root.instances));
+      return clients.filter((client, index, array) => client && typeof client === "object" && array.indexOf(client) === index);
+    };
+
+    // 语言包的加载 gate 读的是 Layer 而不是 DynamicConfig（issue #2329 根因 a）：
+    // 应用用 useLayer('72216192').get('enable_i18n', false) 取开关，Layer 的 memo
+    // 缓存键恒为 NoValues，于是即使 DynamicConfig 被补成 enable_i18n:true 也不生效。
+    // 这里给 layer 对象补上同样的取值覆盖；__value 是 Statsig 存原始值的字段，
+    // 一并 assign，避免应用直接从 __value 读时绕过 get。
+    const patchI18nLayer = (layer) => {
+      if (!layer || typeof layer !== "object") return layer;
+      const value = layer.__value && typeof layer.__value === "object" ? layer.__value : {};
+      const nextValue = {
+        ...value,
+        enable_i18n: true,
+        locale_source: "SYSTEM",
+      };
+      try {
+        layer.__value = nextValue;
+      } catch {
+      }
+      try {
+        layer.value = nextValue;
+      } catch {
+      }
+      if (typeof layer.get === "function" && !layer.__codexPlusForceChineseLocaleLayerPatched) {
+        const originalGet = layer.get.bind(layer);
+        layer.get = (key, fallback) => {
+          if (key === "enable_i18n") return true;
+          if (key === "locale_source") return "SYSTEM";
+          return originalGet(key, fallback);
+        };
+        layer.__codexPlusForceChineseLocaleLayerPatched = true;
+      }
+      return layer;
+    };
+
+    const patchStatsigClient = (client) => {
+      if (!client || typeof client !== "object") return;
+      if (typeof client.getLayer === "function" && !client.__codexPlusForceChineseLocaleLayerChannelPatched) {
+        const originalGetLayer = client.getLayer.bind(client);
+        client.getLayer = (name, options) => {
+          const result = originalGetLayer(name, options);
+          return name === "72216192" ? patchI18nLayer(result) : result;
+        };
+        client.__codexPlusForceChineseLocaleLayerChannelPatched = true;
+      }
+      if (typeof client._getLayerImpl === "function" && !client.__codexPlusForceChineseLocaleLayerImplPatched) {
+        const originalGetLayerImpl = client._getLayerImpl.bind(client);
+        client._getLayerImpl = function (name, ...rest) {
+          const result = originalGetLayerImpl(name, ...rest);
+          return name === "72216192" ? patchI18nLayer(result) : result;
+        };
+        client.__codexPlusForceChineseLocaleLayerImplPatched = true;
+      }
+      if (typeof client.getDynamicConfig !== "function") return;
+      if (!client.__codexPlusForceChineseLocalePatched) {
+        const originalGetDynamicConfig = client.getDynamicConfig.bind(client);
+        client.getDynamicConfig = (name, options) => {
+          const result = originalGetDynamicConfig(name, options);
+          return name === "72216192" ? patchI18nConfig(result) : result;
+        };
+        client.__codexPlusForceChineseLocalePatched = true;
+      }
+      try {
+        patchI18nConfig(client.getDynamicConfig("72216192", { disableExposureLog: true }));
+      } catch {
+      }
+      try {
+        if (typeof client.getLayer === "function") {
+          patchI18nLayer(client.getLayer("72216192", { disableExposureLog: true }));
+        }
+      } catch {
+      }
+    };
+
+    const patchStatsigRoot = (root) => {
+      if (!root || typeof root !== "object" || root.__codexPlusForceChineseLocaleRootPatched) return;
+      root.__codexPlusForceChineseLocaleRootPatched = true;
+      ["firstInstance", "instance"].forEach((key) => {
+        let current;
+        try {
+          current = root[key];
+        } catch {
+          return;
+        }
+        patchStatsigClient(typeof current === "function" && key === "instance" ? current.call(root) : current);
+        try {
+          Object.defineProperty(root, key, {
+            configurable: true,
+            get: () => current,
+            set: (next) => {
+              current = next;
+              patchStatsigClient(typeof next === "function" && key === "instance" ? next.call(root) : next);
+            },
+          });
+        } catch {
+        }
+      });
+    };
+
+    const installStatsigRootSetter = () => {
+      const descriptor = Object.getOwnPropertyDescriptor(window, "__STATSIG__");
+      if (descriptor && descriptor.configurable === false) return;
+      let currentRoot = window.__STATSIG__;
+      patchStatsigRoot(currentRoot);
+      try {
+        Object.defineProperty(window, "__STATSIG__", {
+          configurable: true,
+          get: () => currentRoot,
+          set: (next) => {
+            currentRoot = next;
+            patchStatsigRoot(next);
+            statsigClients().forEach(patchStatsigClient);
+          },
+        });
+      } catch {
+      }
+    };
+
+    const patchStatsigI18nConfig = () => {
+      installStatsigRootSetter();
+      const root = window.__STATSIG__ || globalThis.__STATSIG__;
+      patchStatsigRoot(root);
+      statsigClients().forEach((client) => {
+        if (typeof client.getDynamicConfig !== "function") return;
+        patchStatsigClient(client);
+      });
+    };
+
+    patchStatsigI18nConfig();
+    const startedAt = Date.now();
+    const timer = window.setInterval(() => {
+      patchStatsigI18nConfig();
+      if (Date.now() - startedAt > 5000) window.clearInterval(timer);
+    }, 50);
   }
 
   const helperBase = window.__CODEX_SESSION_DELETE_HELPER__ || "http://127.0.0.1:57321";
@@ -64,6 +316,15 @@
   const conversationViewMaxAllowedWidth = 4000;
   const conversationViewDefaultWidth = 900;
   const conversationViewLegacyWidthKey = "codexPlus.threadCenter.maxWidth";
+  // 模型容量错误自动重试的次数上下限。放在 prelude 是因为默认设置
+  // （10-style.js 的 defaultCodexPlusSettings）和运行逻辑（81-capacity-auto-retry.js）
+  // 都要用，而后者的 const 在 IIFE 里初始化得更晚。
+  const capacityAutoRetryDefaultMaxAttempts = 15;
+  const capacityAutoRetryMaxAttemptsCeiling = 200;
+  // 默认 0 秒 = 上一轮失败后立刻重试（与手动点击的手感一致），
+  // 运行逻辑里另有 1 秒地板值防热循环。
+  const capacityAutoRetryDefaultIntervalSeconds = 0;
+  const capacityAutoRetryIntervalCeilingSeconds = 600;
   // 已发布的旧类名保留兼容；对应功能不再安装。
   const zedRemoteButtonClass = "codex-zed-remote-button";
   const zedRemoteOpenInMenuItemClass = "codex-zed-open-in-menu-item";
@@ -2294,7 +2555,12 @@
   }
 
   function defaultCodexPlusSettings() {
-    return { pluginMarketplaceUnlock: true, modelWhitelistUnlock: true, sessionDelete: true, markdownExport: true, sessionShare: true, pasteFix: false, typingEffect: "off", threadIdBadge: false, conversationView: false, whaleWidget: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, nativeMenuPlacement: true, serviceTierControls: false, petRealMouseLook: false, stepwise: false, answerOutline: false, dreamSkinEnabled: false, dreamSkinPaused: false, dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {}, dreamSkinImagePath: "" };
+    // capacityAutoRetry* 必须写成字面量：多个测试（typing-effects-settings、whale-widget、
+    // session-share-runtime…）把 defaultCodexPlusSettings 切片到不带 prelude 的沙箱里执行，
+    // 引用 prelude 常量会直接 ReferenceError。与 00-prelude.js 里
+    // capacityAutoRetryDefaultMaxAttempts / capacityAutoRetryDefaultIntervalSeconds 的一致性
+    // 由 capacity-auto-retry.test.ts 的防漂移用例守住。
+    return { pluginMarketplaceUnlock: true, modelWhitelistUnlock: true, sessionDelete: true, markdownExport: true, sessionShare: true, pasteFix: false, typingEffect: "off", threadIdBadge: false, conversationView: false, whaleWidget: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, nativeMenuPlacement: true, serviceTierControls: false, petRealMouseLook: false, activityOverlayRight: false, stepwise: false, answerOutline: false, capacityAutoRetry: false, capacityAutoRetryMaxAttempts: 15, capacityAutoRetryIntervalSeconds: 0, dreamSkinEnabled: false, dreamSkinPaused: false, dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {}, dreamSkinImagePath: "" };
   }
 
   const codexPlusBackendSettingMap = {
@@ -2310,8 +2576,10 @@
     nativeMenuPlacement: "codexAppNativeMenuPlacement",
     serviceTierControls: "codexAppServiceTierControls",
     petRealMouseLook: "codexAppPetRealMouseLook",
+    activityOverlayRight: "codexAppActivityOverlayRight",
     stepwise: "codexAppStepwiseEnabled",
     answerOutline: "codexAppAnswerOutlineEnabled",
+    capacityAutoRetry: "codexAppCapacityAutoRetry",
     pasteFix: "codexAppPasteFix",
     typingEffect: "codexAppTypingEffect",
     dreamSkinEnabled: "codexAppDreamSkinEnabled",
@@ -2350,8 +2618,12 @@
         nativeMenuPlacement: false,
         serviceTierControls: false,
         petRealMouseLook: false,
+        activityOverlayRight: false,
         stepwise: false,
         answerOutline: false,
+        capacityAutoRetry: false,
+        capacityAutoRetryMaxAttempts: 15,
+        capacityAutoRetryIntervalSeconds: 0,
         dreamSkinEnabled: false,
         dreamSkinPaused: false,
         dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {},
@@ -3118,6 +3390,8 @@
         if (key === "stepwise" || key === "answerOutline") {
           Promise.resolve(window.__codexStepwisePanel?.loadSettings?.()).then(() => syncStepwisePanel());
         }
+        // 容量错误自动重试：开关落库后立即启停轮询，不必等下一次心跳。
+        if (key === "capacityAutoRetry") syncCodexPlusCapacityAutoRetry();
       }).catch(() => {
         void loadBackendSettings();
       });
@@ -4823,6 +5097,10 @@
     if (loaded) syncOfficialUsagePolicy();
     if (loaded) runScanStep(syncCodexPlusTypingEffects);
     if (loaded && typeof syncCodexPlusWhaleWidget === "function") runScanStep(syncCodexPlusWhaleWidget);
+    // typeof 守卫：这两个函数会被 session-share-runtime / typing-effects-settings
+    // 之类的用例切片到不带其它分片的沙箱里执行，缺函数时不能直接 ReferenceError。
+    if (loaded && typeof syncCodexPlusCapacityAutoRetry === "function") runScanStep(syncCodexPlusCapacityAutoRetry);
+    globalThis.__CODEX_PLUS_ACTIVITY_OVERLAY_SYNC__?.();
     return loaded;
   }
 
@@ -4849,6 +5127,8 @@
         syncOfficialUsagePolicy();
         runScanStep(syncCodexPlusTypingEffects);
         if (typeof syncCodexPlusWhaleWidget === "function") runScanStep(syncCodexPlusWhaleWidget);
+        if (typeof syncCodexPlusCapacityAutoRetry === "function") runScanStep(syncCodexPlusCapacityAutoRetry);
+        globalThis.__CODEX_PLUS_ACTIVITY_OVERLAY_SYNC__?.();
         renderCodexPlusMenu();
         if (previousConversationView !== !!codexPlusSettings().conversationView) {
           refreshConversationView();
@@ -4863,11 +5143,13 @@
     const seq = ++codexPlusBackendSettingsSeq;
     codexPlusBackendSettings = { ...codexPlusBackendSettings, [key]: value };
     codexPlusBackendSettingsLoaded = true;
+    globalThis.__CODEX_PLUS_ACTIVITY_OVERLAY_SYNC__?.();
     refreshCodexPlusBackendToggles();
     try {
       const settings = await postJson("/settings/set", { [key]: value });
       if (seq === codexPlusBackendSettingsSeq) {
         codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
+        globalThis.__CODEX_PLUS_ACTIVITY_OVERLAY_SYNC__?.();
       }
     } finally {
       refreshCodexPlusBackendToggles();
@@ -4875,6 +5157,7 @@
   }
 
   function refreshCodexPlusBackendToggles() {
+    globalThis.__CODEX_PLUS_ACTIVITY_OVERLAY_SYNC__?.();
     document.querySelectorAll(".codex-plus-toggle[data-codex-backend-setting]").forEach((button) => {
       const key = button.getAttribute("data-codex-backend-setting");
       button.dataset.enabled = String(!!codexPlusBackendSettings[key]);
@@ -6038,6 +6321,14 @@
                   <button type="button" class="codex-plus-toggle" data-codex-plus-setting="answerOutline"><span></span></button>
                 </div>
                 <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">容量错误自动重试</div><div class="codex-plus-row-description">模型容量不足时（横幅文案如 “Selected model is at capacity”），自动点「重试」。Codex 原生只会自动重试 4 次，之后只剩手动按钮；开启后由 Codex++ 立刻接管（原生倒计时也一并接管，前 4 次同样不等它），直到成功或达到次数上限。间隔 0 秒表示失败后立刻重试（内部最小 1 秒，避免连发）。</div></div>
+                  <div class="codex-plus-width-control">
+                    <input class="codex-plus-width-input" data-codex-plus-capacity-retry-interval="true" min="0" max="${capacityAutoRetryIntervalCeilingSeconds}" step="1" type="number" value="${capacityAutoRetryIntervalSeconds()}" title="重试间隔（秒），0 表示立刻重试" aria-label="重试间隔（秒）">
+                    <input class="codex-plus-width-input" data-codex-plus-capacity-retry-max-attempts="true" min="1" max="${capacityAutoRetryMaxAttemptsCeiling}" step="1" type="number" value="${capacityAutoRetryMaxAttempts()}" title="最大自动重试次数" aria-label="最大自动重试次数">
+                    <button type="button" class="codex-plus-toggle" data-codex-plus-setting="capacityAutoRetry"><span></span></button>
+                  </div>
+                </div>
+                <div class="codex-plus-row">
                   <div><div class="codex-plus-row-title">会话删除</div><div class="codex-plus-row-description">在会话列表悬停显示删除按钮，并支持撤销。</div></div>
                   <button type="button" class="codex-plus-toggle" data-codex-plus-setting="sessionDelete"><span></span></button>
                 </div>
@@ -6199,6 +6490,16 @@
         const width = normalizeConversationViewWidth(widthInput.value);
         widthInput.value = String(width || conversationViewWidth());
         setConversationViewWidth(widthInput.value);
+      }
+      // 次数/间隔输入只在 change（失焦/回车）时提交：input 事件逐字符提交会把
+      // 用户输入 "15" 的过程保存成 1。
+      const attemptsInput = target?.closest("[data-codex-plus-capacity-retry-max-attempts]");
+      if (attemptsInput) {
+        attemptsInput.value = String(setCapacityAutoRetryMaxAttempts(attemptsInput.value));
+      }
+      const intervalInput = target?.closest("[data-codex-plus-capacity-retry-interval]");
+      if (intervalInput) {
+        intervalInput.value = String(setCapacityAutoRetryIntervalSeconds(intervalInput.value));
       }
     }, true);
     overlay.addEventListener("click", (event) => {
@@ -11237,6 +11538,445 @@
     row.style.setProperty("--codex-session-title-max-width", `${titleMaxWidth}px`);
     group.dataset.codexActionLayoutStable = "true";
   }
+  /**
+   * 模型容量错误自动重试。
+   *
+   * 背景（本功能要解决的问题）：
+   *   Codex 应用把「模型容量不足」的失败轮次渲染成一条带「重试」按钮的横幅，
+   *   文案由服务端下发（例如 Selected model is at capacity. Please try a different
+   *   model.）。应用本身自带自动重试（app-primary 的 yGe + SGe），但有两个门槛：
+   *     1. 需要特性开关 2899820207 打开；
+   *     2. 需要 SGe 选出的 retryDelaySeconds 非空。
+   *   而 SGe 的延迟阶梯是 `vL = [10, 30, 120, 300]`，循环守卫 `i < vL.length`
+   *   让计数最多到 4：第 5 次连续容量失败时返回 null，倒计时和自动重试同时消失，
+   *   只剩一个必须手点的「重试」按钮。用户看到的现象就是「重试很多次之后就不再
+   *   自动重试了」。
+   *
+   *   本分片补上的就是这一段：横幅还在、原生又不再自动重试时，替用户点按钮。
+   *   节奏默认与手动点击一致——上一轮失败后立刻重试（0 秒间隔，内部有 1 秒地板值
+   *   防热循环），间隔和次数上限都可以在 Codex++ 设置里改。
+   *
+   *   原生那 4 档阶梯（10/30/120/300 秒）不是我们复刻的对象，也不等待：倒计时显示
+   *   「10 秒后重试」时本功能同样在下一秒就把按钮点掉，等于把原生那 4 次也压成 0 秒。
+   *   倒计时只用来在浮标上标注「已接管原生倒计时」。代价是原生定时器到点后可能再触发
+   *   一次它自己的重试：两条路径走的是同一个处理函数（yGe 里的 Fv(...)），进入前都会
+   *   检查 thread 是否 ready、是否已在重试中，所以重复触发最多被 Codex 自己拒一次。
+   *
+   * 选择器策略（刻意不依赖 Codex 的 hash 类名，只依赖语义结构）：
+   *   1. 横幅是 <aside>——Callout 组件的根元素（app-initial 里的 qR），源码已确认
+   *      所有变体都以 <aside> 收尾；
+   *   2. 只有 errorInfo === 'serverOverloaded' 且最后一轮 failed 时才渲染重试按钮
+   *      （app-primary 的 hGe → vGe），所以「aside 里出现重试按钮」本身就等价于
+   *      「模型容量错误」，不需要匹配服务端文案——中转站/聚合模型的文案各不相同，
+   *      按文案匹配一定漏；
+   *   3. 按钮文案来自 localConversation.serverOverloaded.retry（重试 / Retry），
+   *      倒计时变体是 localConversation.serverOverloaded.retryCountdown
+   *      （{seconds} 秒后重试 / Retry in {seconds}s）。
+   */
+  const capacityAutoRetryChipId = "codex-plus-capacity-auto-retry";
+  const capacityAutoRetryIdlePollMs = 2000;
+  const capacityAutoRetryWaitingPollMs = 1000;
+  const capacityAutoRetryAbsenceTicksBeforeReset = 3;
+  // 默认「上一轮失败后立刻重试」：用户观察到的原生行为就是 0s 就重试。
+  // 但 0 间隔会变成热循环（一轮失败→立刻再点→立刻再失败），所以内部留 1 秒地板值，
+  // 既保持「点了就重试」的手感，又不会把请求打成连发。想要退避就在设置里把间隔调大。
+  const capacityAutoRetryMinIntervalMs = 1000;
+  const capacityAutoRetryCountdownPattern = /(?:\d+\s*(?:秒|s|S)\s*后\s*(?:重试|再试)|Retry\s+in\s+\d+\s*s)/;
+  const capacityAutoRetryLabelPattern = /^(?:重试|再试一次|重新尝试|Retry|Try again)$/;
+  const capacityAutoRetryState = {
+    timer: null,
+    attempts: 0,
+    nextAttemptAt: 0,
+    absenceTicks: 0,
+    nativeCountdown: false,
+    exhausted: false,
+    userPaused: false,
+    note: "",
+  };
+
+  function capacityAutoRetrySettings() {
+    try {
+      return codexPlusSettings() || {};
+    } catch {
+      return {};
+    }
+  }
+
+  function capacityAutoRetryEnabled() {
+    return capacityAutoRetrySettings().capacityAutoRetry === true;
+  }
+
+  function capacityAutoRetryMaxAttempts() {
+    return normalizeCapacityAutoRetryMaxAttempts(capacityAutoRetrySettings().capacityAutoRetryMaxAttempts);
+  }
+
+  function normalizeCapacityAutoRetryMaxAttempts(value) {
+    const raw = Number(value);
+    if (!Number.isFinite(raw)) return capacityAutoRetryDefaultMaxAttempts;
+    return Math.min(capacityAutoRetryMaxAttemptsCeiling, Math.max(1, Math.round(raw)));
+  }
+
+  function normalizeCapacityAutoRetryIntervalSeconds(value) {
+    const raw = Number(value);
+    if (!Number.isFinite(raw)) return capacityAutoRetryDefaultIntervalSeconds;
+    return Math.min(capacityAutoRetryIntervalCeilingSeconds, Math.max(0, Math.round(raw)));
+  }
+
+  function capacityAutoRetryIntervalSeconds() {
+    return normalizeCapacityAutoRetryIntervalSeconds(capacityAutoRetrySettings().capacityAutoRetryIntervalSeconds);
+  }
+
+  function setCapacityAutoRetryMaxAttempts(value) {
+    const next = normalizeCapacityAutoRetryMaxAttempts(value);
+    setCodexPlusSetting("capacityAutoRetryMaxAttempts", next);
+    return next;
+  }
+
+  function setCapacityAutoRetryIntervalSeconds(value) {
+    const next = normalizeCapacityAutoRetryIntervalSeconds(value);
+    setCodexPlusSetting("capacityAutoRetryIntervalSeconds", next);
+    return next;
+  }
+
+  /**
+   * 两次重试之间的等待时间。
+   *
+   * 间隔设 0 表示「立刻重试」，但仍然套 1 秒地板值：按钮在重试请求期间本来就是
+   * disabled，真正的热循环风险来自「点完发现没生效又马上再点」，所以下限必须是
+   * 一个能容纳一次请求往返的值。
+   */
+  function capacityAutoRetryWaitMs() {
+    return Math.max(capacityAutoRetryMinIntervalMs, capacityAutoRetryIntervalSeconds() * 1000);
+  }
+
+  /**
+   * 找一个当前可点的容量错误重试按钮。
+   *
+   * 从后往前找：历史轮次的横幅没有重试按钮（vGe 在没有 retryTurnId 时只渲染文案），
+   * 只有最新那一条才有，但反向遍历同时也避开了「旧横幅先被点到」的可能。
+   */
+  function findCapacityAutoRetryBanner() {
+    const roots = [];
+    const main = document.querySelector("main");
+    if (main) roots.push(main);
+    roots.push(document.body);
+    for (const root of roots) {
+      if (!root) continue;
+      const asides = root.querySelectorAll("aside");
+      for (let index = asides.length - 1; index >= 0; index -= 1) {
+        const aside = asides[index];
+        // 对话框/菜单里的 aside 不是对话横幅，别误点。
+        if (aside.closest?.('[role="dialog"], [role="menu"], [aria-modal="true"]')) continue;
+        const button = Array.from(aside.querySelectorAll("button"))
+          .find((node) => capacityAutoRetryLabelPattern.test((node.textContent || "").trim()));
+        if (button) return { aside, button };
+      }
+    }
+    return null;
+  }
+
+  function capacityAutoRetryNativeCountdownRunning(aside) {
+    return capacityAutoRetryCountdownPattern.test(aside.textContent || "");
+  }
+
+  function capacityAutoRetryChip() {
+    let chip = document.getElementById(capacityAutoRetryChipId);
+    if (chip) return chip;
+    if (!document.body) return null;
+    chip = document.createElement("div");
+    chip.id = capacityAutoRetryChipId;
+    // 归属标记：扫描调度器据此忽略我们自己插入的节点，避免自喂扫描循环（issue #1960）。
+    chip.setAttribute("data-codex-plus-ext", "capacity-auto-retry");
+    chip.setAttribute("role", "status");
+    chip.style.cssText = [
+      "position:fixed",
+      "z-index:2147483600",
+      "inset-inline-end:24px",
+      "bottom:148px",
+      "display:none",
+      "align-items:center",
+      "gap:8px",
+      "max-width:min(60vw,420px)",
+      "padding:6px 10px",
+      "border:1px solid color-mix(in srgb,currentColor 22%,transparent)",
+      "border-radius:999px",
+      "background:color-mix(in srgb,var(--color-token-bg-primary,#202020) 92%,transparent)",
+      "color:var(--color-token-text-secondary,rgba(210,210,220,.9))",
+      "font:12px/16px ui-sans-serif,system-ui,-apple-system,'PingFang SC',sans-serif",
+      "box-shadow:0 4px 16px rgba(0,0,0,.28)",
+      "user-select:none",
+    ].join(";");
+    const text = document.createElement("span");
+    text.setAttribute("data-codex-plus-capacity-retry-text", "true");
+    const resume = document.createElement("button");
+    resume.type = "button";
+    resume.setAttribute("data-codex-plus-capacity-retry-resume", "true");
+    resume.textContent = "继续";
+    resume.style.cssText = "display:none;cursor:pointer;color:inherit;background:transparent;border:0;font:inherit;text-decoration:underline;padding:0";
+    const stop = document.createElement("button");
+    stop.type = "button";
+    stop.setAttribute("data-codex-plus-capacity-retry-stop", "true");
+    stop.textContent = "停止";
+    stop.style.cssText = "display:none;cursor:pointer;color:inherit;background:transparent;border:0;font:inherit;text-decoration:underline;padding:0";
+    resume.addEventListener("click", () => {
+      capacityAutoRetryState.userPaused = false;
+      capacityAutoRetryState.exhausted = false;
+      capacityAutoRetryState.attempts = 0;
+      capacityAutoRetryState.nextAttemptAt = 0;
+      capacityAutoRetryTick();
+    });
+    stop.addEventListener("click", () => {
+      capacityAutoRetryState.userPaused = true;
+      capacityAutoRetryState.nextAttemptAt = 0;
+      capacityAutoRetryRenderChip();
+    });
+    // 用 appendChild 而不是 append(...)：cdp_bridge.rs 的 Node 注入 harness 里
+    // 元素 stub 只实现了 appendChild，用 append 会在那里直接崩。
+    for (const child of [text, resume, stop]) chip.appendChild(child);
+    document.body.appendChild(chip);
+    return chip;
+  }
+
+  /**
+   * 刷新状态浮标。
+   *
+   * `mode` 为空字符串表示本轮已结束——直接隐藏，不留常驻节点。
+   */
+  function capacityAutoRetryRenderChip(mode, detail) {
+    const chip = capacityAutoRetryChip();
+    if (!chip) return;
+    if (!mode) {
+      chip.style.display = "none";
+      return;
+    }
+    const text = chip.querySelector("[data-codex-plus-capacity-retry-text]");
+    const resume = chip.querySelector("[data-codex-plus-capacity-retry-resume]");
+    const stop = chip.querySelector("[data-codex-plus-capacity-retry-stop]");
+    // 取不到子节点说明浮标被 Codex 的重渲染搬走了；这种情况下宁可只更新容器，
+    // 也不要抛错中断整条重试链（注入层任何未捕获异常都会记进 scan 失败列表）。
+    if (!text || !resume || !stop) {
+      chip.style.display = "inline-flex";
+      return;
+    }
+    const max = capacityAutoRetryMaxAttempts();
+    const remaining = capacityAutoRetryState.nextAttemptAt > Date.now()
+      ? Math.max(0, Math.ceil((capacityAutoRetryState.nextAttemptAt - Date.now()) / 1000))
+      : 0;
+    let label = "";
+    if (mode === "paused") {
+      label = `自动重试已暂停（已试 ${capacityAutoRetryState.attempts}/${max} 次）`;
+    } else if (mode === "exhausted") {
+      label = `自动重试已达上限 ${max} 次`;
+    } else if (mode === "waiting") {
+      label = `模型容量不足 · 自动重试第 ${Math.min(capacityAutoRetryState.attempts + 1, max)}/${max} 次${remaining > 0 ? ` · ${remaining} 秒后` : ""}${capacityAutoRetryState.nativeCountdown ? " · 已接管原生倒计时" : ""}`;
+    } else {
+      label = detail || "模型容量不足 · 自动重试中";
+    }
+    text.textContent = label;
+    resume.style.display = mode === "paused" || mode === "exhausted" ? "inline" : "none";
+    stop.style.display = mode === "paused" || mode === "exhausted" ? "none" : "inline";
+    chip.style.display = "inline-flex";
+  }
+
+  function capacityAutoRetrySchedule(delayMs) {
+    clearTimeout(capacityAutoRetryState.timer);
+    capacityAutoRetryState.timer = window.setTimeout(capacityAutoRetryTick, Math.max(200, delayMs));
+  }
+
+  function capacityAutoRetryResetRun() {
+    capacityAutoRetryState.attempts = 0;
+    capacityAutoRetryState.nextAttemptAt = 0;
+    capacityAutoRetryState.exhausted = false;
+    capacityAutoRetryState.userPaused = false;
+  }
+
+  function capacityAutoRetryTick() {
+    capacityAutoRetryState.timer = null;
+    if (!capacityAutoRetryEnabled()) {
+      capacityAutoRetryResetRun();
+      capacityAutoRetryState.absenceTicks = 0;
+      capacityAutoRetryRenderChip("");
+      return;
+    }
+    const banner = findCapacityAutoRetryBanner();
+    if (!banner) {
+      // 横幅消失 = 本轮容量错误结束（重试成功、或用户换了模型/新开了对话）。
+      // 不立刻清零：点击到新横幅渲染之间会有短暂空档，按 tick 数确认后再复位。
+      capacityAutoRetryState.absenceTicks += 1;
+      if (capacityAutoRetryState.absenceTicks >= capacityAutoRetryAbsenceTicksBeforeReset) {
+        capacityAutoRetryResetRun();
+        capacityAutoRetryRenderChip("");
+      }
+      capacityAutoRetrySchedule(capacityAutoRetryIdlePollMs);
+      return;
+    }
+    capacityAutoRetryState.absenceTicks = 0;
+    // 原生倒计时（10/30/120/300 秒）在跑时也照样立刻接管——用户要的是「每次都是 0 秒
+    // 就重试」，不是等原生那套阶梯。这里只把它记下来显示在浮标上，让用户知道
+    // Codex 自己也排了一次重试。代价是原生定时器到点后可能再触发一次它自己的重试：
+    // 两条路径走同一个处理函数、同一道 ready/重试中守卫，最多被 Codex 自己拒一次。
+    capacityAutoRetryState.nativeCountdown = capacityAutoRetryNativeCountdownRunning(banner.aside);
+    if (capacityAutoRetryState.userPaused) {
+      capacityAutoRetryRenderChip("paused");
+      capacityAutoRetrySchedule(capacityAutoRetryIdlePollMs);
+      return;
+    }
+    if (capacityAutoRetryState.exhausted) {
+      capacityAutoRetryRenderChip("exhausted");
+      capacityAutoRetrySchedule(capacityAutoRetryIdlePollMs * 2);
+      return;
+    }
+    if (banner.button.disabled) {
+      // 重试请求在途（yGe 的 isRetrying 会禁用按钮），等它结束。
+      capacityAutoRetryRenderChip("waiting");
+      capacityAutoRetrySchedule(capacityAutoRetryIdlePollMs);
+      return;
+    }
+    const max = capacityAutoRetryMaxAttempts();
+    if (capacityAutoRetryState.attempts >= max) {
+      capacityAutoRetryState.exhausted = true;
+      // showToast 在 80-session-share.js；切片沙箱里可能没有它，缺了就静默跳过。
+      if (typeof showToast === "function") {
+        showToast(`自动重试已达上限 ${max} 次，仍未抢到模型容量；可点浮标上的「继续」再试。`, { type: "warn" });
+      }
+      capacityAutoRetryRenderChip("exhausted");
+      capacityAutoRetrySchedule(capacityAutoRetryIdlePollMs * 2);
+      return;
+    }
+    const now = Date.now();
+    if (now < capacityAutoRetryState.nextAttemptAt) {
+      capacityAutoRetryRenderChip("waiting");
+      capacityAutoRetrySchedule(Math.min(capacityAutoRetryWaitingPollMs, capacityAutoRetryState.nextAttemptAt - now));
+      return;
+    }
+    // 到点了：点按钮。Codex 的按钮是 React onClick，根容器上的委托监听会收到
+    // 冒泡事件，所以原生 click() 与真实点击等价。
+    try {
+      banner.button.click();
+    } catch {
+      // 点击抛错不该打断循环，等下一轮再试。
+    }
+    capacityAutoRetryState.attempts += 1;
+    capacityAutoRetryState.nextAttemptAt = Date.now() + capacityAutoRetryWaitMs();
+    capacityAutoRetryRenderChip("waiting");
+    capacityAutoRetrySchedule(capacityAutoRetryWaitingPollMs);
+  }
+
+  /**
+   * 按当前设置启停自动重试。
+   *
+   * 幂等：开启时确保有一个定时器在跑，关闭时清干净（含浮标），可以随时重复调用。
+   */
+  function syncCodexPlusCapacityAutoRetry() {
+    if (!capacityAutoRetryEnabled()) {
+      clearTimeout(capacityAutoRetryState.timer);
+      capacityAutoRetryState.timer = null;
+      capacityAutoRetryResetRun();
+      capacityAutoRetryState.absenceTicks = 0;
+      capacityAutoRetryRenderChip("");
+      return;
+    }
+    if (capacityAutoRetryState.timer) return;
+    capacityAutoRetrySchedule(capacityAutoRetryIdlePollMs);
+  }
+
+  // 诊断/联调入口：出问题时可在控制台直接看状态或强制走一轮。
+  window.__codexPlusCapacityAutoRetry = {
+    state: capacityAutoRetryState,
+    tick: capacityAutoRetryTick,
+    sync: syncCodexPlusCapacityAutoRetry,
+    find: findCapacityAutoRetryBanner,
+    intervalSeconds: capacityAutoRetryIntervalSeconds,
+    maxAttempts: capacityAutoRetryMaxAttempts,
+  };
+
+  syncCodexPlusCapacityAutoRetry();
+  /**
+   * Codex 启动壳自救。
+   *
+   * 现象（本机实测，2026-10-12）：Codex 的原生启动画面有时会一直停住——DOM 里
+   * 只剩 splash 容器（`div.flex.items-center.justify-center.relative.size-full`），
+   * `#root` 的 innerText 始终为空、`<main>` 始终不出现；而注入层一切正常
+   * （`window.codexPlus` 已挂载、设置浮标在位、零异常），启动器侧
+   * `latest-status.json` 也一直是 `running` / `progress:100`。
+   * 也就是说宿主没有任何信号能发现「页面没渲染出来」，用户只能自己按刷新。
+   * 实测手动 reload 一次即恢复。
+   *
+   * 这里把「手动刷新」这一下自动化，并严格限次：
+   *   - 只认空壳：`#root` 存在、innerText 为空、且没有 `<main>`。正常的启动画面
+   *     渲染几秒内就会长出 `<main>`，所以宽限期足够长即可区分「慢」与「卡死」。
+   *   - 只在主页面做。带 `initialRoute=` 的活动悬浮层与 quick-chat 是独立页面，
+   *     它们本来就没有 `<main>`，刷新只会丢上下文。
+   *   - 每次加载最多刷一次，且与上次刷新间隔不足冷却时间就不再刷；
+   *     写不进 sessionStorage 时宁可不刷，避免退化成刷新循环。
+   */
+  const bootShellRecoveryStorageKey = "codexPlus.bootShellRecoveryAt";
+  const bootShellRecoveryGraceMs = 20000;
+  const bootShellRecoveryCooldownMs = 60000;
+  const bootShellRecoveryPollMs = 1000;
+
+  // 带 initialRoute 的是活动悬浮层 / quick-chat 等独立页面，它们本来就没有
+  // <main>，刷它们只会丢上下文，必须跳过。
+  function bootShellRecoveryAppliesHere() {
+    return !/[?&]initialRoute=/.test(window.location.search);
+  }
+
+  // 页面是否已经「有东西」了：挂上 <main>，或 #root 里渲染出了任何文字。
+  function bootShellRecoverySettled() {
+    if (document.querySelector("main")) return true;
+    const root = document.getElementById("root");
+    if (!root) return false;
+    return root.innerText.trim() !== "";
+  }
+
+  function bootShellRecoveryStuck() {
+    const root = document.getElementById("root");
+    if (!root) return false;
+    if (document.querySelector("main")) return false;
+    return root.innerText.trim() === "";
+  }
+
+  function bootShellRecoveryMayReload() {
+    try {
+      const last = Number(window.sessionStorage.getItem(bootShellRecoveryStorageKey)) || 0;
+      return Date.now() - last >= bootShellRecoveryCooldownMs;
+    } catch {
+      // 记不下时间就无法限次，宁可不刷。
+      return false;
+    }
+  }
+
+  /**
+   * 起一个不常驻的看门定时器：页面正常渲染就收工，空壳超时才限次刷新一次。
+   * 只在模块末尾调一次。
+   */
+  function installBootShellRecovery() {
+    if (!bootShellRecoveryAppliesHere()) return;
+    const startedAt = Date.now();
+    const timer = window.setInterval(() => {
+      if (bootShellRecoverySettled()) {
+        window.clearInterval(timer);
+        return;
+      }
+      if (Date.now() - startedAt < bootShellRecoveryGraceMs) return;
+      window.clearInterval(timer);
+      if (!bootShellRecoveryStuck() || !bootShellRecoveryMayReload()) return;
+      try {
+        window.sessionStorage.setItem(bootShellRecoveryStorageKey, String(Date.now()));
+      } catch {
+        return;
+      }
+      // 记一条诊断，事后能从 codex-plus.log 确认它真的触发过、卡了多久。
+      if (typeof sendCodexPlusDiagnostic === "function") {
+        sendCodexPlusDiagnostic("boot_shell_recovery_reload", {
+          waitedMs: Date.now() - startedAt,
+        });
+      }
+      window.location.reload();
+    }, bootShellRecoveryPollMs);
+  }
+
+  installBootShellRecovery();
   function syncActionGroupsLayout() {
     sessionRows().forEach((row) => {
       const group = actionGroupFromRow(row);
@@ -15342,7 +16082,7 @@
    */
   function isExtensionUiNode(node) {
     if (!node?.closest) return false;
-    if (node.closest(`.codex-delete-toast, .codex-delete-confirm-overlay, .codex-plus-modal-overlay, .${codexPlusPageClass}, #${codexPlusSidebarNavId}, #${codexPlusRailNavId}, #${codexPlusRailExtensionsId}, #${codexPlusRailSponsorId}, #${codexPlusRailNavId} > button, #${codexPlusRailExtensionsId} > button, #${codexPlusRailSponsorId} > button, .${codexServiceTierBadgeClass}, .${sessionShareButtonClass}, .${sessionCopyMenuItemClass}, #codex-plus-menu`)) {
+    if (node.closest(`.codex-delete-toast, .codex-delete-confirm-overlay, .codex-plus-modal-overlay, .${codexPlusPageClass}, #${codexPlusSidebarNavId}, #${codexPlusRailNavId}, #${codexPlusRailExtensionsId}, #${codexPlusRailSponsorId}, #${codexPlusRailNavId} > button, #${codexPlusRailExtensionsId} > button, #${codexPlusRailSponsorId} > button, .${codexServiceTierBadgeClass}, .${sessionShareButtonClass}, .${sessionCopyMenuItemClass}, #codex-plus-menu, #${capacityAutoRetryChipId}`)) {
       return true;
     }
     return isCodexPlusExtensionNode(node);
@@ -15461,6 +16201,60 @@
   syncOfficialUsagePolicy();
   scheduleSidebarNavStartupRetry();
   window.removeEventListener("resize", window.__codexPlusResizeHandler);
+  // Optional right-side layout for Codex's native message navigation rail.
+  // The native page recreates the rail and preview card during navigation, so
+  // this uses stable data attributes instead of retaining DOM node references.
+  (() => {
+    const styleId = "codex-plus-avatar-overlay-layout-style";
+    const root = document.documentElement;
+    const enabledAttribute = "data-codex-plus-activity-overlay-right";
+
+    function installStyle() {
+      const existing = document.getElementById(styleId);
+      if (existing) return;
+      const style = document.createElement("style");
+      style.id = styleId;
+      style.dataset.codexPlusExt = "builtin-avatar-overlay-layout";
+      style.textContent = `
+        /* The native rail is mounted inside an absolute nav with left-3. */
+        html[${enabledAttribute}="true"] nav:has([data-thread-user-message-navigation-rail-list]) {
+          left: auto !important;
+          right: max(12px, env(safe-area-inset-right, 0px)) !important;
+        }
+
+        /* Native marker lines grow from their left edge. Once the rail is on
+           the right, the same level indicator must grow toward the left. */
+        html[${enabledAttribute}="true"] [data-thread-user-message-navigation-rail-list] [data-thread-user-message-navigation-item-id] > span > span > span {
+          transform-origin: 100% 50% !important;
+        }
+
+        /* Floating preview cards are positioned by Radix beside the old left
+           rail. Use the individual translate property so Floating UI's own
+           transform stays intact while the card moves to the opposite side. */
+        html[${enabledAttribute}="true"] [data-radix-popper-content-wrapper]:has([data-thread-user-message-navigation-tooltip-preview]) {
+          translate: calc(-100% - 8px) 0 !important;
+        }
+      `;
+      document.head?.appendChild(style);
+    }
+
+    function sync() {
+      installStyle();
+      const enabled = typeof codexPlusSettings === "function"
+        && codexPlusSettings().activityOverlayRight === true;
+      root.toggleAttribute(enabledAttribute, enabled);
+      root.setAttribute(enabledAttribute, String(enabled));
+    }
+
+    installStyle();
+    sync();
+    globalThis.__CODEX_PLUS_ACTIVITY_OVERLAY_SYNC__ = sync;
+    let attempts = 0;
+    const timer = window.setInterval(() => {
+      sync();
+      if (++attempts >= 60 && codexPlusBackendSettingsLoaded) window.clearInterval(timer);
+    }, 250);
+  })();
   /**
    * 多开实例身份提示。
    *
@@ -15522,7 +16316,7 @@
     }
   }
 
-  void restoreCodexPlusManagedLocale();
+  installCodexPlusForceChineseLocale();
   installCodexPlusInstanceIdentity();
   runScanStep(installCodexPlusTypingEffects);
   runScanStep(syncCodexPlusWhaleWidget);

@@ -227,6 +227,9 @@ pub struct AggregateRelayProfile {
     pub name: String,
     #[serde(default)]
     pub session_provider: RelaySessionProvider,
+    /// 将成员模型合并到 Codex 模型目录，并按模型 ID 固定绑定成员。
+    #[serde(rename = "modelAggregationEnabled", default)]
+    pub model_aggregation_enabled: bool,
     #[serde(default)]
     pub strategy: AggregateRelayStrategy,
     #[serde(default)]
@@ -489,6 +492,14 @@ impl Default for DictationSettings {
 impl DictationSettings {
     pub fn normalize(&mut self) {
         self.base_url = self.base_url.trim().trim_end_matches('/').to_string();
+        // 兼容早期 SenseVoice 设置：旧版保存预设时可能只写入了
+        // `local://sensevoice`，没有保存 provider 字段。加载时恢复 provider，
+        // 否则离线标记会被语音服务按 HTTP(S) URL 校验并报错。
+        if self.provider == DictationProvider::Api
+            && self.base_url.eq_ignore_ascii_case("local://sensevoice")
+        {
+            self.provider = DictationProvider::SenseVoice;
+        }
         self.api_key = self.api_key.trim().to_string();
         self.api_key_env = self.api_key_env.trim().to_string();
         self.model = self.model.trim().to_string();
@@ -531,6 +542,10 @@ pub struct BackendSettings {
     pub codex_app_session_share: bool,
     #[serde(rename = "codexAppPasteFix", default)]
     pub codex_app_paste_fix: bool,
+    // 默认关闭：撤下的那版会主动从 settings.json 删掉这个键，老用户升级后读不到，
+    // 若默认开启等于替他们重新打开一个从没同意过的行为。要开请显式勾选。
+    #[serde(rename = "codexAppForceChineseLocale", default)]
+    pub codex_app_force_chinese_locale: bool,
     #[serde(
         rename = "codexAppTypingEffect",
         default = "default_typing_effect",
@@ -551,6 +566,10 @@ pub struct BackendSettings {
     pub codex_app_service_tier_controls: bool,
     #[serde(rename = "codexAppPetRealMouseLook", default)]
     pub codex_app_pet_real_mouse_look: bool,
+    #[serde(rename = "codexAppActivityOverlayRight", default)]
+    pub codex_app_activity_overlay_right: bool,
+    #[serde(rename = "codexAppCapacityAutoRetry", default)]
+    pub codex_app_capacity_auto_retry: bool,
     #[serde(rename = "codexAppWhaleWidgetEnabled", default)]
     pub codex_app_whale_widget_enabled: bool,
     #[serde(
@@ -730,6 +749,7 @@ impl Default for BackendSettings {
             codex_app_markdown_export: true,
             codex_app_session_share: true,
             codex_app_paste_fix: false,
+            codex_app_force_chinese_locale: false,
             codex_app_typing_effect: default_typing_effect(),
             codex_app_thread_id_badge: false,
             codex_app_conversation_view: false,
@@ -738,6 +758,8 @@ impl Default for BackendSettings {
             codex_app_native_browser_require_identification: false,
             codex_app_service_tier_controls: false,
             codex_app_pet_real_mouse_look: false,
+            codex_app_activity_overlay_right: false,
+            codex_app_capacity_auto_retry: false,
             codex_app_whale_widget_enabled: false,
             codex_app_whale_balance_protocol: default_whale_balance_protocol(),
             codex_app_whale_balance_path: String::new(),
@@ -1491,7 +1513,6 @@ impl SettingsStore {
         for key in [
             "launchMode",
             "codexAppFastStartup",
-            "codexAppForceChineseLocale",
             "codexAppZedRemoteOpen",
             "zedRemoteOpenStrategy",
             "zedRemoteProjectRegistryEnabled",
@@ -1609,7 +1630,7 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
             .cloned()
             .unwrap_or_default();
         merge_bool_setting(&mut dictation, patch, "enabled");
-        for key in ["baseUrl", "apiKey", "apiKeyEnv", "model", "language"] {
+        for key in ["provider", "baseUrl", "apiKey", "apiKeyEnv", "model", "language"] {
             if let Some(value) = patch.get(key).and_then(Value::as_str) {
                 dictation.insert(key.to_string(), Value::String(value.trim().to_string()));
             }
@@ -1664,6 +1685,7 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     merge_bool_setting(target, source, "codexAppMarkdownExport");
     merge_bool_setting(target, source, "codexAppSessionShare");
     merge_bool_setting(target, source, "codexAppPasteFix");
+    merge_bool_setting(target, source, "codexAppForceChineseLocale");
     if let Some(value @ ("off" | "rainbow" | "fireworks" | "stars")) =
         source.get("codexAppTypingEffect").and_then(Value::as_str)
     {
@@ -1679,6 +1701,8 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     merge_bool_setting(target, source, "codexAppNativeBrowserRequireIdentification");
     merge_bool_setting(target, source, "codexAppServiceTierControls");
     merge_bool_setting(target, source, "codexAppPetRealMouseLook");
+    merge_bool_setting(target, source, "codexAppActivityOverlayRight");
+    merge_bool_setting(target, source, "codexAppCapacityAutoRetry");
     merge_bool_setting(target, source, "codexAppWhaleWidgetEnabled");
     if let Some(value @ ("auto" | "custom" | "off")) =
         source.get("codexAppWhaleBalanceProtocol").and_then(Value::as_str)
@@ -2385,6 +2409,7 @@ mod tests {
         assert!(settings.relay_profiles_enabled);
         assert!(settings.enhancements_enabled);
         assert!(settings.codex_app_plugin_marketplace_unlock);
+        assert!(!settings.codex_app_force_chinese_locale);
         assert!(!settings.codex_app_thread_id_badge);
         assert!(!settings.codex_goals_enabled);
         assert!(settings.codex_app_path.is_empty());
@@ -3366,6 +3391,7 @@ experimental_bearer_token = "sk-existing""#
                 id: "agg".to_string(),
                 name: "聚合".to_string(),
                 session_provider: RelaySessionProvider::Openai,
+                model_aggregation_enabled: true,
                 strategy: AggregateRelayStrategy::WeightedRoundRobin,
                 members: vec![
                     AggregateRelayMember {
@@ -3399,6 +3425,7 @@ experimental_bearer_token = "sk-existing""#
             active_aggregate.session_provider,
             RelaySessionProvider::Openai
         );
+        assert!(active_aggregate.model_aggregation_enabled);
         assert_eq!(
             loaded.active_relay_session_provider(),
             RelaySessionProvider::Openai
@@ -3724,6 +3751,34 @@ experimental_bearer_token = "sk-existing""#
     }
 
     #[test]
+    fn settings_update_persists_dictation_provider_and_migrates_legacy_sensevoice_marker() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        let store = SettingsStore::new(path.clone());
+        let mut legacy = serde_json::to_value(BackendSettings::default()).unwrap();
+        legacy["dictation"]["enabled"] = json!(true);
+        legacy["dictation"]["baseUrl"] = json!("local://sensevoice");
+        legacy["dictation"]["model"] = json!("SenseVoiceSmall (INT8)");
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.dictation.provider, DictationProvider::SenseVoice);
+
+        let updated = store
+            .update(json!({
+                "dictation": {
+                    "provider": "sensevoice",
+                    "baseUrl": "local://sensevoice",
+                    "enabled": true
+                }
+            }))
+            .unwrap();
+        assert_eq!(updated.dictation.provider, DictationProvider::SenseVoice);
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["dictation"]["provider"], "sensevoice");
+    }
+
+    #[test]
     fn settings_store_update_persists_relay_profiles_and_active_profile() {
         let dir = temp_dir();
         let store = SettingsStore::new(dir.join("settings.json"));
@@ -3865,6 +3920,7 @@ experimental_bearer_token = "sk-existing""#
                     {
                         "id": "agg",
                         "name": "聚合",
+                        "modelAggregationEnabled": true,
                         "strategy": "weightedRoundRobin",
                         "members": [
                             { "relayId": "relay-a", "weight": 1 },
@@ -3883,6 +3939,7 @@ experimental_bearer_token = "sk-existing""#
             active_aggregate.strategy,
             AggregateRelayStrategy::WeightedRoundRobin
         );
+        assert!(active_aggregate.model_aggregation_enabled);
         assert_eq!(active_aggregate.members.len(), 2);
         assert_eq!(active_aggregate.members[1].relay_id, "relay-b");
         assert_eq!(active_aggregate.members[1].weight, 4);

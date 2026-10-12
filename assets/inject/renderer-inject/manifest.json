@@ -61,6 +61,16 @@
       "lines": 1458
     },
     {
+      "name": "81-capacity-auto-retry.js",
+      "description": "模型容量错误自动重试：识别容量横幅并按阶梯延迟代点「重试」",
+      "lines": 305
+    },
+    {
+      "name": "82-boot-shell-recovery.js",
+      "description": "Codex 启动壳自救：启动画面久不挂载时限次自动刷新",
+      "lines": 86
+    },
+    {
       "name": "90-action-groups.js",
       "description": "会话行操作按钮布局、更多菜单、工具提示",
       "lines": 808
@@ -104,6 +114,11 @@
       "name": "98-scan-schedule.js",
       "description": "扫描相关性判定与调度，启动重试",
       "lines": 120
+    },
+    {
+      "name": "98-avatar-overlay-layout.js",
+      "description": "Codex 原生活动悬浮层右侧布局与波形镜像",
+      "lines": 73
     },
     {
       "name": "99-startup.js",
