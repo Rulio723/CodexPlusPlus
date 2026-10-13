@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -222,6 +223,11 @@ pub struct AggregateRelayProfile {
     pub members: Vec<AggregateRelayMember>,
     #[serde(default)]
     pub routes: Vec<AggregateRelayRoute>,
+    /// 默认供应商：解析不到成员的普通模型请求（旧会话/旧目录写下的模型名、
+    /// 回合前自动压缩用的模型名等）交给该聚合成员按请求里的模型名转发。
+    /// 空串表示未设置，此时保持原有的 400 报错行为。
+    #[serde(default)]
+    pub default_relay_id: String,
 }
 
 impl Default for RelayProfile {
@@ -496,6 +502,19 @@ pub struct BackendSettings {
     pub dictation: DictationSettings,
     #[serde(rename = "codexAppPath", default)]
     pub codex_app_path: String,
+    /// 自动接管官方 App：开启后用户自己双击启动官方 App 时由 Codex++ 接管并注入。
+    #[serde(rename = "codexAppAutoTakeover", default)]
+    pub codex_app_auto_takeover: bool,
+    /// 已在运行的官方 App 没有调试端口时、「疑似有人在用」的策略：
+    /// `defer`（默认：先不动，等空闲或用户手动触发）或 `immediate`（立即重启接管）。
+    ///
+    /// 显式写默认值而不是留空串：留空串虽然 `ActivePolicy::parse` 也按 `defer` 处理，
+    /// 但读配置的人（以及前端默认值）会以为「没设置」，两边容易漂移。
+    #[serde(
+        rename = "codexAppAutoTakeoverWhenActive",
+        default = "default_auto_takeover_when_active"
+    )]
+    pub codex_app_auto_takeover_when_active: String,
     #[serde(rename = "codexExtraArgs", default)]
     pub codex_extra_args: Vec<String>,
     #[serde(rename = "providerSyncEnabled", default)]
@@ -512,6 +531,8 @@ pub struct BackendSettings {
     pub relay_profiles_enabled: bool,
     #[serde(rename = "enhancementsEnabled", default = "default_true")]
     pub enhancements_enabled: bool,
+    #[serde(rename = "codexAppStandaloneQuotaUnlock", default)]
+    pub codex_app_standalone_quota_unlock: bool,
     #[serde(rename = "codexAppPluginMarketplaceUnlock", default = "default_true")]
     pub codex_app_plugin_marketplace_unlock: bool,
     #[serde(rename = "codexAppModelWhitelistUnlock", default = "default_true")]
@@ -522,6 +543,9 @@ pub struct BackendSettings {
     pub codex_app_markdown_export: bool,
     #[serde(rename = "codexAppSessionShare", default = "default_true")]
     pub codex_app_session_share: bool,
+    // 默认开启：纯展示层状态栏，不改变 Codex 的请求内容与本地数据，误开没有副作用。
+    #[serde(rename = "codexAppUsageStatusLine", default = "default_true")]
+    pub codex_app_usage_status_line: bool,
     #[serde(rename = "codexAppPasteFix", default)]
     pub codex_app_paste_fix: bool,
     // 默认关闭：撤下的那版会主动从 settings.json 删掉这个键，老用户升级后读不到，
@@ -717,6 +741,8 @@ impl Default for BackendSettings {
         Self {
             dictation: DictationSettings::default(),
             codex_app_path: String::new(),
+            codex_app_auto_takeover: false,
+            codex_app_auto_takeover_when_active: default_auto_takeover_when_active(),
             codex_extra_args: Vec::new(),
             provider_sync_enabled: false,
             provider_sync_saved_providers: Vec::new(),
@@ -725,11 +751,13 @@ impl Default for BackendSettings {
             ccs_db_path: String::new(),
             relay_profiles_enabled: true,
             enhancements_enabled: true,
+            codex_app_standalone_quota_unlock: false,
             codex_app_plugin_marketplace_unlock: true,
             codex_app_model_whitelist_unlock: true,
             codex_app_session_delete: true,
             codex_app_markdown_export: true,
             codex_app_session_share: true,
+            codex_app_usage_status_line: true,
             codex_app_paste_fix: false,
             codex_app_force_chinese_locale: false,
             codex_app_typing_effect: default_typing_effect(),
@@ -1163,6 +1191,11 @@ pub fn default_true() -> bool {
     true
 }
 
+/// 「疑似有人在用」的默认策略：先不动，等空闲或用户手动触发。
+pub fn default_auto_takeover_when_active() -> String {
+    crate::auto_takeover::ActivePolicy::Defer.as_str().to_string()
+}
+
 fn default_whale_balance_protocol() -> String {
     "auto".to_string()
 }
@@ -1364,11 +1397,44 @@ impl Default for SettingsStore {
     }
 }
 
+thread_local! {
+    /// 设置归一化的重入深度，见 [`SettingsStore::load`]。
+    static SETTINGS_NORMALIZE_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+fn settings_normalize_depth() -> u32 {
+    SETTINGS_NORMALIZE_DEPTH.with(Cell::get)
+}
+
+/// 归一化作用域：只要还在里面，嵌套的 `SettingsStore::load` 就只解析、不再归一化，
+/// 从而打断 `load → normalize → complete_relay_profile_config → load` 的递归。
+struct SettingsNormalizeGuard;
+
+impl SettingsNormalizeGuard {
+    fn enter() -> Self {
+        SETTINGS_NORMALIZE_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+        Self
+    }
+}
+
+impl Drop for SettingsNormalizeGuard {
+    fn drop(&mut self) {
+        SETTINGS_NORMALIZE_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
 impl SettingsStore {
     pub fn new(path: PathBuf) -> Self {
         Self { path }
     }
 
+    /// 读取设置。**嵌套调用只解析、不再归一化**。
+    ///
+    /// 归一化会走到 `complete_relay_profile_config`，它对聚合供应商会回头读全量设置
+    /// （拿聚合的 `session_provider`），而它本身又是在 `normalize_settings_config_sections`
+    /// 里被调用的——不挡就是 `load → 归一化 → load → …` 无限递归，主线程栈溢出、
+    /// 应用启动即崩。触发条件：聚合供应商的 `configContents` 非空（切换供应商时
+    /// `backfill_relay_profile_from_live` 会把 live 配置回填进聚合档案）。
     pub fn load(&self) -> anyhow::Result<BackendSettings> {
         let contents = match self.read_contents()? {
             Some(contents) => contents,
@@ -1385,6 +1451,11 @@ impl SettingsStore {
                 self.path.display()
             )
         })?;
+        if settings_normalize_depth() > 0 {
+            // 外层已经在归一化了：这里再归一化就会递归回本函数。
+            return Ok(parsed);
+        }
+        let _guard = SettingsNormalizeGuard::enter();
         Ok(normalize_settings_config_sections(parsed))
     }
 
@@ -1598,6 +1669,22 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     if let Some(value) = source.get("codexAppPath").and_then(Value::as_str) {
         target.insert("codexAppPath".to_string(), Value::String(value.to_string()));
     }
+    // 自动接管的开关与策略也走同一份 settings.json；漏掉这两行会让开关「保存了但没生效」。
+    if let Some(value) = source.get("codexAppAutoTakeover").and_then(Value::as_bool) {
+        target.insert(
+            "codexAppAutoTakeover".to_string(),
+            Value::Bool(value),
+        );
+    }
+    if let Some(value) = source
+        .get("codexAppAutoTakeoverWhenActive")
+        .and_then(Value::as_str)
+    {
+        target.insert(
+            "codexAppAutoTakeoverWhenActive".to_string(),
+            Value::String(value.to_string()),
+        );
+    }
     if let Some(value) = source.get("codexExtraArgs").and_then(Value::as_array) {
         let args = value
             .iter()
@@ -1629,11 +1716,13 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     if let Some(value) = source.get("enhancementsEnabled").and_then(Value::as_bool) {
         target.insert("enhancementsEnabled".to_string(), Value::Bool(value));
     }
+    merge_bool_setting(target, source, "codexAppStandaloneQuotaUnlock");
     merge_bool_setting(target, source, "codexAppPluginMarketplaceUnlock");
     merge_bool_setting(target, source, "codexAppModelWhitelistUnlock");
     merge_bool_setting(target, source, "codexAppSessionDelete");
     merge_bool_setting(target, source, "codexAppMarkdownExport");
     merge_bool_setting(target, source, "codexAppSessionShare");
+    merge_bool_setting(target, source, "codexAppUsageStatusLine");
     merge_bool_setting(target, source, "codexAppPasteFix");
     merge_bool_setting(target, source, "codexAppForceChineseLocale");
     if let Some(value @ ("off" | "rainbow" | "fireworks" | "stars")) =
@@ -3276,6 +3365,7 @@ experimental_bearer_token = "sk-existing""#
                     },
                 ],
                 routes: Vec::new(),
+                default_relay_id: String::new(),
             }],
             active_aggregate_relay_id: "agg".to_string(),
             ..BackendSettings::default()
@@ -4048,4 +4138,35 @@ experimental_bearer_token = "sk-existing""#
             assert_eq!(profile.web_search_history_compat_enabled(), expected);
         }
     }
+    // 自动接管的两个设置字段必须走既有 settings.json 链路持久化：
+    // 守护线程在另一个线程里读同一个文件，写不进就等于开关无效。
+    #[test]
+    fn auto_takeover_settings_round_trip_through_settings_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+
+        let initial = BackendSettings::default();
+        assert!(!initial.codex_app_auto_takeover);
+        assert_eq!(
+            initial.codex_app_auto_takeover_when_active,
+            default_auto_takeover_when_active()
+        );
+        assert_eq!(initial.codex_app_auto_takeover_when_active, "defer");
+        store.save(&initial).unwrap();
+
+        let updated = store
+            .update(json!({
+                "codexAppAutoTakeover": true,
+                "codexAppAutoTakeoverWhenActive": "immediate"
+            }))
+            .unwrap();
+        assert!(updated.codex_app_auto_takeover);
+        assert_eq!(updated.codex_app_auto_takeover_when_active, "immediate");
+
+        // 重新读盘：字段名必须与前端/守护线程约定的一致（camelCase）。
+        let reloaded = store.load().unwrap();
+        assert!(reloaded.codex_app_auto_takeover);
+        assert_eq!(reloaded.codex_app_auto_takeover_when_active, "immediate");
+    }
+
 }

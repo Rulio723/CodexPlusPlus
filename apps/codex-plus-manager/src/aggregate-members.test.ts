@@ -12,6 +12,8 @@ import {
   authContentsHaveChatgptTokens,
   isApiMemberProfile,
   isOfficialLoginMemberProfile,
+  normalizeAggregateDefaultRelayId,
+  normalizeAggregateMembers,
   type AggregateMemberProfileLike,
 } from "./aggregate-members.ts";
 
@@ -105,5 +107,67 @@ describe("aggregateMemberCandidates", () => {
     assert.strictEqual(isApiMemberProfile(apiMember), true);
     assert.strictEqual(isApiMemberProfile(noKey), false);
     assert.strictEqual(isApiMemberProfile(profile({ id: "blank", baseUrl: "  ", apiKey: " " })), false);
+  });
+});
+
+describe("normalizeAggregateDefaultRelayId", () => {
+  const members = new Set(["api", "official"]);
+
+  it("成员集合内的值原样保留（含 trim）", () => {
+    assert.strictEqual(normalizeAggregateDefaultRelayId("official", members), "official");
+    assert.strictEqual(normalizeAggregateDefaultRelayId("  api  ", members), "api");
+  });
+
+  it("空值/未设置清空为空串", () => {
+    assert.strictEqual(normalizeAggregateDefaultRelayId(undefined, members), "");
+    assert.strictEqual(normalizeAggregateDefaultRelayId(null, members), "");
+    assert.strictEqual(normalizeAggregateDefaultRelayId("   ", members), "");
+  });
+
+  it("成员被移出后默认值不再保留", () => {
+    assert.strictEqual(normalizeAggregateDefaultRelayId("removed", members), "");
+  });
+});
+
+describe("normalizeAggregateMembers", () => {
+  const member = (profileId: string, weight = 1) => ({ profileId, weight });
+
+  it("供应商还在就保留，去重并 trim", () => {
+    const kept = normalizeAggregateMembers(
+      [member("api"), member("  api  "), member("official")],
+      new Set(["api", "official"]),
+    );
+    assert.deepStrictEqual(kept, [member("api"), member("official")]);
+  });
+
+  it("供应商已被删除时丢掉", () => {
+    const kept = normalizeAggregateMembers([member("api"), member("ghost")], new Set(["api"]));
+    assert.deepStrictEqual(kept, [member("api")]);
+  });
+
+  it("拿不到完整供应商列表时一律保留成员（宁可留着也不替用户删配置）", () => {
+    const kept = normalizeAggregateMembers([member("api"), member("ghost")], null);
+    assert.deepStrictEqual(kept, [member("api"), member("ghost")]);
+  });
+
+  it("关键回归：成员没变、但供应商的 Key/凭据缺失时，成员不被清掉", () => {
+    // 历史事故：成员规范化直接拿"可勾选候选"过滤，而候选要求 URL+Key 齐备 / 官方
+    // 登录快照有 tokens。供应商编辑中或快照未回填时判定会翻转，于是一次普通保存就把
+    // 正在用的聚合成员删光，聚合当场报「成员供应商不存在」。
+    const editing = profile({ id: "api", baseUrl: "https://api.example/v1" });
+    const notReady = profile({ id: "official", relayMode: "official" });
+    assert.strictEqual(isApiMemberProfile(editing), false, "编辑中的供应商不是候选");
+    assert.strictEqual(isOfficialLoginMemberProfile(notReady), false, "未回填的官方成员不是候选");
+    assert.deepStrictEqual(
+      aggregateMemberCandidates([editing, notReady], "agg").map((item) => item.id),
+      [],
+      "两个都不是可勾选候选",
+    );
+    // 但它们仍然存在于供应商列表里 → 成员必须保留。
+    const kept = normalizeAggregateMembers(
+      [member("api"), member("official")],
+      new Set(["api", "official", "agg"]),
+    );
+    assert.deepStrictEqual(kept, [member("api"), member("official")]);
   });
 });

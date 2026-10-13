@@ -46,6 +46,7 @@ import {
   LayoutGrid,
   LayoutDashboard,
   List,
+  Loader2,
   Palette,
   Play,
   MessageCircle,
@@ -77,6 +78,7 @@ import {
 } from "lucide-react";
 import { createPresetPatch } from "@/components/ProviderPresetSelector";
 import { PRESETS, type ProviderPreset } from "./presets";
+import { createPortal } from "react-dom";
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 
 import { Badge as UiBadge } from "@/components/ui/badge";
@@ -164,10 +166,17 @@ import {
   setModelReasoningLevelsForSlug,
 } from "./model-reasoning";
 import { clampAggregateRoutePriority, normalizeAggregateRoutes, validateAggregateRoutes } from "./aggregate-routes";
-import { aggregateMemberCandidates, isAggregateProfile, isOfficialLoginMemberProfile } from "./aggregate-members";
+import {
+  aggregateMemberCandidates,
+  normalizeAggregateMembers,
+  isAggregateProfile,
+  isOfficialLoginMemberProfile,
+  normalizeAggregateDefaultRelayId,
+} from "./aggregate-members";
 import { relayAuthForLiveDraft, shouldBackfillRelayProfileBeforeSwitch } from "./relay-live-files";
 import { relayHeadersValidationMessage, serializeRelayHeaders } from "./relay-headers";
 import { sessionProviderForProtocol } from "./relay-session";
+import { usePopoverLayer } from "./use-popover-layer";
 import { resolveProviderName } from "./provider-name";
 import {
   providerSyncStreamPercent,
@@ -201,6 +210,7 @@ import {
 import { getLanguage, t, tf, toggleLanguage } from "@/i18n";
 import { vlmTestTranslation } from "./vlm-test-translation";
 import {
+  multiLaunchInstanceFailure,
   multiLaunchInstanceLabel as formatMultiLaunchInstanceLabel,
   multiLaunchInstanceRunning,
   multiLaunchInstanceStatus,
@@ -208,6 +218,10 @@ import {
 } from "./multi-launch-model";
 
 const isWindowsPlatform = /\bWindows\b/i.test(navigator.userAgent);
+
+/// 多开启动后轮询「就绪/失败」结论的节奏：worker 最长等 90 秒就绪，这里给到 2 分钟。
+const MULTI_LAUNCH_POLL_INTERVAL_MS = 3000;
+const MULTI_LAUNCH_POLL_TIMEOUT_MS = 120_000;
 const dreamSkinWindowsPreviewUrl = new URL("../../../assets/inject/upstream/dream-skin/windows/dream-reference.jpg", import.meta.url).href;
 const dreamSkinMacPreviewUrl = new URL("../../../assets/inject/upstream/dream-skin/macos/portal-hero.png", import.meta.url).href;
 const dreamSkinCompanionDataUrlLimit = 240_000;
@@ -291,6 +305,9 @@ type MultiLaunchInstancesResult = CommandResult<{
 
 type BackendSettings = WhaleBalanceSettings & {
   codexAppPath: string;
+  /** 自动接管官方 App（与 Rust `codex_app_auto_takeover` 对应）。 */
+  codexAppAutoTakeover: boolean;
+  codexAppAutoTakeoverWhenActive: string;
   codexExtraArgs: string[];
   dictation: DictationSettings;
   providerSyncEnabled: boolean;
@@ -300,10 +317,12 @@ type BackendSettings = WhaleBalanceSettings & {
   providerSyncLastSelectedProvider: string;
   relayProfilesEnabled: boolean;
   enhancementsEnabled: boolean;
+  codexAppStandaloneQuotaUnlock: boolean;
   codexAppPluginMarketplaceUnlock: boolean;
   codexAppModelWhitelistUnlock: boolean;
   codexAppSessionDelete: boolean;
   codexAppMarkdownExport: boolean;
+  codexAppUsageStatusLine: boolean;
   codexAppPasteFix: boolean;
   codexAppForceChineseLocale: boolean;
   codexAppTypingEffect: TypingEffect;
@@ -450,6 +469,8 @@ type RelayAggregateConfig = {
   members: RelayAggregateMember[];
   routes?: RelayAggregateRoute[];
   modelAggregationEnabled?: boolean;
+  /** 默认供应商：解析不到成员的普通模型请求交给该成员转发；空串表示未设置。 */
+  defaultRelayId?: string;
 };
 type AggregateRelayMember = {
   relayId: string;
@@ -463,6 +484,7 @@ type AggregateRelayProfile = {
   strategy: RelayAggregateStrategy;
   members: AggregateRelayMember[];
   routes?: { pattern: string; relayId: string; priority: number }[];
+  defaultRelayId?: string;
 };
 
 type RelayContextSelection = {
@@ -846,6 +868,26 @@ type WatcherResult = CommandResult<{
   disabled_flag: string;
 }>;
 
+// 与 Rust 侧 `auto_takeover::AutoTakeoverPayload`（rename_all = "camelCase"）逐字段对齐。
+// 少一个字段的表现是「状态行永远空白」，所以两边要一起改。
+type AutoTakeoverResult = CommandResult<{
+  state: string;
+  enabled: boolean;
+  platformSupported: boolean;
+  activePolicy: string;
+  lastTakeoverAtMs?: number | null;
+  lastReason?: string | null;
+  lastError?: string | null;
+  actualDebugPort?: number | null;
+  appRunning?: boolean | null;
+  sessionOwned: boolean;
+  sessionStatus?: string | null;
+  restartsLastHour: number;
+  restartsTotal: number;
+  pausedInstance?: string | null;
+  running: boolean;
+}>;
+
 type InstallResult = CommandResult<{
   silent_shortcut: { installed: boolean; path: string | null };
   management_shortcut: { installed: boolean; path: string | null };
@@ -1049,6 +1091,8 @@ const globalNavigationRoutes: Route[] = ["recommendations", "agentCache", "about
 const defaultSettings: BackendSettings = {
   ...defaultWhaleBalanceSettings(),
   codexAppPath: "",
+  codexAppAutoTakeover: false,
+  codexAppAutoTakeoverWhenActive: "defer",
   codexExtraArgs: [],
   dictation: defaultDictationSettings(),
   providerSyncEnabled: false,
@@ -1058,10 +1102,12 @@ const defaultSettings: BackendSettings = {
   providerSyncLastSelectedProvider: "",
   relayProfilesEnabled: true,
   enhancementsEnabled: true,
+  codexAppStandaloneQuotaUnlock: false,
   codexAppPluginMarketplaceUnlock: true,
   codexAppModelWhitelistUnlock: true,
   codexAppSessionDelete: true,
   codexAppMarkdownExport: true,
+  codexAppUsageStatusLine: true,
   codexAppPasteFix: false,
   codexAppForceChineseLocale: false,
   codexAppTypingEffect: "off",
@@ -1193,6 +1239,9 @@ export function App() {
   const [dreamSkinLibrary, setDreamSkinLibrary] = useState<DreamSkinThemeLibrary | null>(null);
   const [dreamSkinMarket, setDreamSkinMarket] = useState<DreamSkinMarketResult | null>(null);
   const [dreamSkinCommunity, setDreamSkinCommunity] = useState<DreamSkinCommunityResult | null>(null);
+  const [dreamSkinLibraryLoading, setDreamSkinLibraryLoading] = useState(false);
+  const [dreamSkinMarketLoading, setDreamSkinMarketLoading] = useState(false);
+  const [dreamSkinCommunityLoading, setDreamSkinCommunityLoading] = useState(false);
   const [pendingDreamSkinCommunity, setPendingDreamSkinCommunity] = useState("");
   const [selectedDreamSkinTheme, setSelectedDreamSkinTheme] = useState("builtin");
   const [savedDreamSkinThemeDraft, setSavedDreamSkinThemeDraft] = useState<DreamSkinThemeDraft | null>(null);
@@ -1240,7 +1289,7 @@ export function App() {
   const [sessionIndexRepairReport, setSessionIndexRepairReport] = useState<SessionIndexRepairReport | null>(null);
   const [sessionIndexRepairReportError, setSessionIndexRepairReportError] = useState<string | null>(null);
   const [selectedProviderSyncTarget, setSelectedProviderSyncTarget] = useState("");
-  const [removeOwnedData, setRemoveOwnedData] = useState(false);
+  const [autoTakeover, setAutoTakeoverState] = useState<AutoTakeoverResult | null>(null);
   const [relaySwitching, setRelaySwitching] = useState(false);
   const dreamSkinDraftDirty = Boolean(
     savedDreamSkinThemeDraft
@@ -1583,46 +1632,61 @@ export function App() {
   };
 
   const refreshDreamSkinLibrary = async (silent = false) => {
-    const result = await run(() => call<DreamSkinThemeLibraryResult>("list_dream_skin_themes"));
-    if (!result) return null;
-    const library: DreamSkinThemeLibrary = {
-      themes: result.themes,
-      activeDraft: result.activeDraft,
-    };
-    setDreamSkinLibrary(library);
-    const active = library.themes.find((item) => item.active) ?? library.themes[0];
-    if (active) {
-      const draft = active.builtin
-        ? { config: defaultDreamSkinTheme(), imagePath: "", builtin: true }
-        : library.activeDraft;
-      setDreamSkinDraftSelection(active.key, draft);
+    setDreamSkinLibraryLoading(true);
+    try {
+      const result = await run(() => call<DreamSkinThemeLibraryResult>("list_dream_skin_themes"));
+      if (!result) return null;
+      const library: DreamSkinThemeLibrary = {
+        themes: result.themes,
+        activeDraft: result.activeDraft,
+      };
+      setDreamSkinLibrary(library);
+      const active = library.themes.find((item) => item.active) ?? library.themes[0];
+      if (active) {
+        const draft = active.builtin
+          ? { config: defaultDreamSkinTheme(), imagePath: "", builtin: true }
+          : library.activeDraft;
+        setDreamSkinDraftSelection(active.key, draft);
+      }
+      if (!silent && !isSuccessStatus(result.status)) {
+        showResultNotice(t("主题库"), result);
+      }
+      return library;
+    } finally {
+      setDreamSkinLibraryLoading(false);
     }
-    if (!silent && !isSuccessStatus(result.status)) {
-      showResultNotice(t("主题库"), result);
-    }
-    return library;
   };
 
   const refreshDreamSkinMarket = async (silent = false) => {
-    const result = await run(() => call<DreamSkinMarketResult>("refresh_dream_skin_market"));
-    if (result) {
-      setDreamSkinMarket(result);
-      if (!silent || !isSuccessStatus(result.status)) {
-        showResultNotice(t("主题市场"), result, { silentSuccess: true });
+    setDreamSkinMarketLoading(true);
+    try {
+      const result = await run(() => call<DreamSkinMarketResult>("refresh_dream_skin_market"));
+      if (result) {
+        setDreamSkinMarket(result);
+        if (!silent || !isSuccessStatus(result.status)) {
+          showResultNotice(t("主题市场"), result, { silentSuccess: true });
+        }
       }
+      return result;
+    } finally {
+      setDreamSkinMarketLoading(false);
     }
-    return result;
   };
 
   const refreshDreamSkinCommunity = async (silent = false) => {
-    const result = await run(() => call<DreamSkinCommunityResult>("refresh_dream_skin_community"));
-    if (result) {
-      setDreamSkinCommunity(result);
-      if (!silent || !isSuccessStatus(result.status)) {
-        showResultNotice(t("DreamSkin 社区"), result, { silentSuccess: true });
+    setDreamSkinCommunityLoading(true);
+    try {
+      const result = await run(() => call<DreamSkinCommunityResult>("refresh_dream_skin_community"));
+      if (result) {
+        setDreamSkinCommunity(result);
+        if (!silent || !isSuccessStatus(result.status)) {
+          showResultNotice(t("DreamSkin 社区"), result, { silentSuccess: true });
+        }
       }
+      return result;
+    } finally {
+      setDreamSkinCommunityLoading(false);
     }
-    return result;
   };
 
   const installDreamSkinCommunityTheme = async (theme: DreamSkinCommunityTheme) => {
@@ -2051,6 +2115,43 @@ export function App() {
     }
   };
 
+  /**
+   * 读取自动接管状态。总开关关闭时不探测：守护线程本来就不工作，
+   * 读到的只会是「未运行」，徒增一次 IPC。
+   */
+  const refreshAutoTakeover = async (silent = false) => {
+    if (settings && !settings.settings.codexAppAutoTakeover) {
+      setAutoTakeoverState(null);
+      return;
+    }
+    const result = await run(() => call<AutoTakeoverResult>("load_auto_takeover_state"));
+    if (result) {
+      setAutoTakeoverState(result);
+      if (!silent) showResultNotice(t("自动接管状态"), result, { silentSuccess: true });
+    }
+  };
+
+  /** 开关必须走既有设置保存链路，才能在设置文件里持久化并被守护线程读到。 */
+  const setAutoTakeover = async (enabled: boolean) => {
+    if (!settings) return;
+    const saved = await saveSettingsValue({ ...settings.settings, codexAppAutoTakeover: enabled }, false);
+    if (!saved) return;
+    setSettings((current) => (current ? { ...current, settings: saved } : current));
+    if (enabled) {
+      await refreshAutoTakeover(true);
+    } else {
+      setAutoTakeoverState(null);
+    }
+  };
+
+  const runAutoTakeoverCommand = async (command: string) => {
+    const result = await run(() => call<AutoTakeoverResult>(command));
+    if (result) {
+      setAutoTakeoverState(result);
+      showResultNotice(t("自动接管"), result, { silentSuccess: false });
+    }
+  };
+
   const navigate = async (next: Route, skipDreamSkinDraftGuard = false) => {
     if (!skipDreamSkinDraftGuard && route === "dreamSkin" && next !== "dreamSkin" && dreamSkinDraftDirty) {
       runAfterDreamSkinDraftGuard(() => void navigate(next, true));
@@ -2108,6 +2209,7 @@ export function App() {
     if (next === "maintenance") {
       await refreshOverview(true);
       await refreshWatcher(true);
+      await refreshAutoTakeover(true);
     }
   };
 
@@ -2139,11 +2241,41 @@ export function App() {
       const result = await run(() => call<MultiLaunchResult>("launch_codex_multi_instance", {
         request: { profileId: profile.id },
       }));
-      if (result) showNotice(t("Codex多开"), result.message, result.status);
+      if (!result) return;
+      // 父进程只知道「worker 已拉起」，真正起来没有要等它就绪（最长 90 秒），
+      // 所以这里不直接报成功，改为轮询到有结论再给提示。
+      await refreshMultiLaunchInstances(true);
+      const outcome = await pollMultiLaunchOutcome(profile.id);
+      if (outcome === "ready") {
+        showNotice(t("Codex多开"), t("Codex 多开实例已就绪。"), "ok");
+      } else if (outcome === "failed") {
+        showNotice(t("Codex多开"), t("Codex 实例启动失败，请查看实例列表中的原因。"), "failed");
+      } else {
+        showNotice(t("Codex多开"), result.message, result.status);
+      }
       await refreshMultiLaunchInstances(true);
     } finally {
       setMultiLaunchPending(null);
     }
+  };
+
+  /**
+   * 等待某个多开实例给出结论（就绪 / 失败），最长约 2 分钟。
+   *
+   * worker 是独立进程且 stdout 被丢弃，父进程只能靠 `launch-result.json` 判断成败；
+   * 没有这个轮询的话，Windows 上「点了没窗口」会一直没有任何反馈。
+   */
+  const pollMultiLaunchOutcome = async (instanceId: string): Promise<"ready" | "failed" | "pending"> => {
+    const deadline = Date.now() + MULTI_LAUNCH_POLL_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, MULTI_LAUNCH_POLL_INTERVAL_MS));
+      const result = await refreshMultiLaunchInstances(true);
+      const instance = result?.instances?.find((item) => item.instanceId === instanceId);
+      if (!instance) continue;
+      if (multiLaunchInstanceRunning(instance)) return "ready";
+      if (multiLaunchInstanceFailure(instance)) return "failed";
+    }
+    return "pending";
   };
 
   const refreshMultiLaunchInstances = async (silent = true) => {
@@ -2153,7 +2285,13 @@ export function App() {
     try {
       const result = await run(() => call<MultiLaunchInstancesResult>("list_codex_multi_instances"));
       if (result) {
-        setMultiLaunchInstances(Array.isArray(result.instances) ? result.instances.filter(multiLaunchInstanceRunning) : []);
+        // 失败实例必须留在列表里：多开在 Windows 上起不来时，
+        // 界面要给出「启动失败 + 原因」，只留运行中的会让它彻底消失。
+        setMultiLaunchInstances(
+          Array.isArray(result.instances)
+            ? result.instances.filter((instance) => multiLaunchInstanceRunning(instance) || Boolean(multiLaunchInstanceFailure(instance)))
+            : [],
+        );
         if (!silent && !isSuccessStatus(result.status)) showNotice(t("当前运行实例"), result.message, result.status);
       }
       return result;
@@ -2283,26 +2421,6 @@ export function App() {
     showNotice(title, t(notice.message), notice.status);
   };
 
-  const installEntrypoints = async () => {
-    const result = await run(() => call<InstallResult>("install_entrypoints"));
-    if (result) {
-      showNotice(t("入口安装"), result.message, result.status);
-      await refreshOverview(true);
-    }
-  };
-
-  const uninstallEntrypoints = async () => {
-    const result = await run(() =>
-      call<InstallResult>("uninstall_entrypoints", {
-        options: { removeOwnedData },
-      }),
-    );
-    if (result) {
-      showNotice(t("入口卸载"), result.message, result.status);
-      await refreshOverview(true);
-    }
-  };
-
   const repairShortcuts = async () => {
     const result = await run(() => call<InstallResult>("repair_shortcuts"));
     if (result) {
@@ -2311,11 +2429,11 @@ export function App() {
     }
   };
 
-  const watcherAction = async (command: string) => {
-    const result = await run(() => call<WatcherResult>(command));
+  const setWatcherEnabled = async (enabled: boolean) => {
+    const result = await run(() => call<WatcherResult>("set_watcher_enabled", { enabled }));
     if (result) {
       setWatcher(result);
-      showNotice(t("Watcher 操作"), result.message, result.status);
+      showNotice(t("开机打开 Codex++"), result.message, result.status);
     }
   };
 
@@ -3058,6 +3176,20 @@ export function App() {
     })();
   }, []);
 
+  // 主题卡片的「更多操作」是原生 details 弹层：原生不会因为点了别处就收起，
+  // 会出现多个菜单同时展开。这里统一做外点收起（details 的开关是 DOM 瞬态，不经 React 状态）。
+  useEffect(() => {
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Element) || target.closest("[data-popover-menu]")) return;
+      document.querySelectorAll<HTMLDetailsElement>("details[data-popover-menu][open]").forEach((node) => {
+        node.open = false;
+      });
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    return () => document.removeEventListener("pointerdown", handlePointerDown);
+  }, []);
+
   useEffect(() => {
     let disposed = false;
     let stopListening: (() => void) | undefined;
@@ -3295,8 +3427,6 @@ export function App() {
       restartMultiLaunchInstance,
       stopMultiLaunchInstance,
       restart,
-      installEntrypoints,
-      uninstallEntrypoints,
       repairShortcuts,
       checkUpdate,
       performUpdate,
@@ -3478,13 +3608,14 @@ export function App() {
         await refreshWatcher(true);
         showNotice(t("检查完成"), t("已刷新 Codex 应用、入口和 Watcher 状态。"), "ok");
       },
-      installWatcher: () => watcherAction("install_watcher"),
-      uninstallWatcher: () => watcherAction("uninstall_watcher"),
-      enableWatcher: () => watcherAction("enable_watcher"),
-      disableWatcher: () => watcherAction("disable_watcher"),
+      setWatcherEnabled,
+      setAutoTakeover,
+      refreshAutoTakeover: () => refreshAutoTakeover(false),
+      takeOverNow: () => runAutoTakeoverCommand("take_over_codex_now"),
+      pauseAutoTakeover: () => runAutoTakeoverCommand("pause_auto_takeover_for_instance"),
       toggleTheme: () => setTheme((current) => (current === "dark" ? "light" : "dark")),
     }),
-    [route, launchForm, settingsForm, settings, overview, removeOwnedData, update, updateInstallProgress.active, logs, diagnostics, theme, relayFiles, localSessions, selectedProviderSyncTarget, envConflicts, relayEnvironment, ccsProviders, multiLaunchPending, multiLaunchInstances, multiLaunchInstancesLoading, multiLaunchActionPending, dreamSkinLibrary, dreamSkinMarket, dreamSkinCommunity, selectedDreamSkinTheme, savedDreamSkinThemeDraft, dreamSkinThemeDraft, dreamSkinDraftDirty, pendingDreamSkinRestart],
+    [route, launchForm, settingsForm, settings, overview, update, updateInstallProgress.active, logs, diagnostics, theme, relayFiles, localSessions, selectedProviderSyncTarget, envConflicts, relayEnvironment, ccsProviders, multiLaunchPending, multiLaunchInstances, multiLaunchInstancesLoading, multiLaunchActionPending, dreamSkinLibrary, dreamSkinMarket, dreamSkinCommunity, selectedDreamSkinTheme, savedDreamSkinThemeDraft, dreamSkinThemeDraft, dreamSkinDraftDirty, pendingDreamSkinRestart],
   );
   const isGlobalPage = globalNavigationRoutes.includes(route);
   const isManagementScreen = route === "relay" || route === "multiLaunch" || route === "sessions" || route === "context" || route === "skills";
@@ -3670,8 +3801,11 @@ export function App() {
               form={settingsForm}
               launchPending={launchPending}
               library={dreamSkinLibrary}
+              libraryLoading={dreamSkinLibraryLoading}
               market={dreamSkinMarket}
+              marketLoading={dreamSkinMarketLoading}
               community={dreamSkinCommunity}
+              communityLoading={dreamSkinCommunityLoading}
               draft={dreamSkinThemeDraft}
               dirty={dreamSkinDraftDirty}
               pendingRestart={pendingDreamSkinRestart}
@@ -3692,11 +3826,10 @@ export function App() {
               overview={overview}
               launchPending={launchPending}
               watcher={watcher}
+              autoTakeover={autoTakeover}
               settings={settings}
               launchForm={launchForm}
               onLaunchFormChange={setLaunchForm}
-              removeOwnedData={removeOwnedData}
-              onRemoveOwnedDataChange={setRemoveOwnedData}
               actions={actions}
             />
           ) : null}
@@ -3825,12 +3958,18 @@ function ModelReasoningLevelsCell({
   const triggerTip = levels.length
     ? `${levels.join(", ")}${defaultLevel ? ` · ${t("默认等级")}: ${defaultLevel}` : ""}`
     : t("未设置时沿用内置默认档位");
+  const { rootRef, menuRef, menuStyle } = usePopoverLayer({
+    open,
+    onOpenChange: setOpen,
+    align: "end",
+    menuWidth: 240,
+    minWidth: 240,
+    maxHeight: 320,
+  });
   return (
     <div
       className={`app-select relay-reasoning ${open ? "open" : ""} ${inherited ? "inherited" : ""}`.trim()}
-      onBlur={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setOpen(false);
-      }}
+      ref={rootRef}
     >
       <button
         aria-expanded={open}
@@ -3843,11 +3982,13 @@ function ModelReasoningLevelsCell({
         <span className={label ? "" : "relay-reasoning-empty"}>{label || t("未设置")}</span>
         <ChevronDown className="h-4 w-4" />
       </button>
-      {open ? (
+      {open ? createPortal(
         <div
           aria-multiselectable="true"
-          className="app-select-menu relay-reasoning-menu"
+          className="app-select-menu app-select-menu-portal relay-reasoning-menu"
+          ref={menuRef}
           role="listbox"
+          style={menuStyle}
         >
           {REASONING_LEVELS.map((level) => {
             const selected = levels.includes(level);
@@ -3893,7 +4034,8 @@ function ModelReasoningLevelsCell({
               ? t("当前为内置默认，修改后保存为该模型的自定义思考等级。")
               : t("未设置时沿用内置默认；清空全部档位即恢复内置。")}
           </p>
-        </div>
+        </div>,
+        document.body,
       ) : null}
     </div>
   );
@@ -3911,8 +4053,6 @@ type Actions = {
   restartMultiLaunchInstance: (instance: MultiLaunchInstance) => Promise<void>;
   stopMultiLaunchInstance: (instance: MultiLaunchInstance) => Promise<void>;
   restart: (syncActiveRelay?: boolean) => Promise<boolean>;
-  installEntrypoints: () => Promise<void>;
-  uninstallEntrypoints: () => Promise<void>;
   repairShortcuts: () => Promise<void>;
   checkUpdate: () => Promise<void>;
   performUpdate: () => Promise<void>;
@@ -3998,10 +4138,11 @@ type Actions = {
   copyLogs: () => Promise<void>;
   copyDiagnostics: () => Promise<void>;
   goLogs: () => Promise<void>;
-  installWatcher: () => Promise<void>;
-  uninstallWatcher: () => Promise<void>;
-  enableWatcher: () => Promise<void>;
-  disableWatcher: () => Promise<void>;
+  setWatcherEnabled: (enabled: boolean) => Promise<void>;
+  setAutoTakeover: (enabled: boolean) => Promise<void>;
+  refreshAutoTakeover: () => Promise<void>;
+  takeOverNow: () => Promise<void>;
+  pauseAutoTakeover: () => Promise<void>;
   toggleTheme: () => void;
   checkHealth: () => Promise<void>;
 };
@@ -4018,20 +4159,12 @@ function SearchablePathPicker({
   onChange: (value: string) => void;
 }) {
   const [open, setOpen] = useState(false);
-  const rootRef = useRef<HTMLDivElement>(null);
   const filteredOptions = useMemo(() => {
     const query = value.trim().toLowerCase();
     return options.filter((option) => !query || option.toLowerCase().includes(query)).slice(0, 30);
   }, [options, value]);
-
-  useEffect(() => {
-    if (!open) return;
-    const handlePointerDown = (event: PointerEvent) => {
-      if (rootRef.current && !rootRef.current.contains(event.target as Node)) setOpen(false);
-    };
-    document.addEventListener("pointerdown", handlePointerDown);
-    return () => document.removeEventListener("pointerdown", handlePointerDown);
-  }, [open]);
+  // 外点关闭/滚动跟随/多开约束统一交给 usePopoverLayer；菜单 portal 出去，不被滚动区裁掉。
+  const { rootRef, menuRef, menuStyle } = usePopoverLayer({ open, onOpenChange: setOpen, maxHeight: 280 });
 
   return (
     <div className="weixin-search-picker" ref={rootRef}>
@@ -4054,8 +4187,8 @@ function SearchablePathPicker({
         />
         <ChevronDown className={`weixin-search-input-chevron h-4 w-4${open ? " is-open" : ""}`} />
       </div>
-      {open ? (
-        <div className="weixin-search-menu" role="listbox">
+      {open ? createPortal(
+        <div className="weixin-search-menu weixin-search-menu-portal" ref={menuRef} role="listbox" style={menuStyle}>
           {filteredOptions.length ? filteredOptions.map((option) => (
             <button
               className="weixin-search-option"
@@ -4071,7 +4204,8 @@ function SearchablePathPicker({
           )) : (
             <div className="weixin-search-empty">{t("没有匹配的已有目录，可继续直接输入。")}</div>
           )}
-        </div>
+        </div>,
+        document.body,
       ) : null}
     </div>
   );
@@ -4089,26 +4223,17 @@ function SearchableSessionPicker({
   const selected = sessions.find((session) => session.id === selectedId) ?? null;
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
-  const rootRef = useRef<HTMLDivElement>(null);
   const filteredSessions = useMemo(() => {
     const normalized = query.trim().toLowerCase();
     return sessions
       .filter((session) => !normalized || [session.title, session.cwd, session.id, session.modelProvider].some((value) => value.toLowerCase().includes(normalized)))
       .slice(0, 30);
   }, [query, sessions]);
+  const { rootRef, menuRef, menuStyle } = usePopoverLayer({ open, onOpenChange: setOpen, maxHeight: 280 });
 
   useEffect(() => {
     if (selected) setQuery(selected.title || selected.id);
   }, [selected]);
-
-  useEffect(() => {
-    if (!open) return;
-    const handlePointerDown = (event: PointerEvent) => {
-      if (rootRef.current && !rootRef.current.contains(event.target as Node)) setOpen(false);
-    };
-    document.addEventListener("pointerdown", handlePointerDown);
-    return () => document.removeEventListener("pointerdown", handlePointerDown);
-  }, [open]);
 
   return (
     <div className="weixin-search-picker" ref={rootRef}>
@@ -4132,8 +4257,8 @@ function SearchableSessionPicker({
         />
         <ChevronDown className={`weixin-search-input-chevron h-4 w-4${open ? " is-open" : ""}`} />
       </div>
-      {open ? (
-        <div className="weixin-search-menu weixin-session-menu" role="listbox">
+      {open ? createPortal(
+        <div className="weixin-search-menu weixin-search-menu-portal weixin-session-menu" ref={menuRef} role="listbox" style={menuStyle}>
           {filteredSessions.length ? filteredSessions.map((session) => (
             <button
               aria-selected={session.id === selectedId}
@@ -4153,7 +4278,8 @@ function SearchableSessionPicker({
           )) : (
             <div className="weixin-search-empty">{t("没有匹配的本地会话。")}</div>
           )}
-        </div>
+        </div>,
+        document.body,
       ) : null}
     </div>
   );
@@ -4822,7 +4948,16 @@ function RelayScreen({
       setProviderView("routing");
     }
   }, [normalized.relayProfiles, providerView]);
-  const listForm = syncLegacyRelayFields({ ...normalized, relayProfiles: visibleProfiles });
+  // 分页过滤只作用于列表展示：活动归属与 legacy 根字段保持完整设置的值。
+  // 修复：过去对过滤后的列表跑 syncLegacyRelayFields，当前供应商不在本分页时
+  // activeRelayId 会被改写成列表第一项（假「使用中」）；卡片切换还会把这份缺成员
+  // 的子集直接提交后端——模型聚合因此报「成员不存在」，普通切换则可能用子集覆盖
+  // settings.json，丢掉其它分页的供应商。
+  const listForm: BackendSettings = { ...normalized, relayProfiles: visibleProfiles };
+  const switchRelayProfileFromList = (profileId: string) => {
+    const next = syncLegacyRelayFields({ ...normalized, activeRelayId: profileId });
+    void actions.switchRelayProfile(next, normalized.activeRelayId);
+  };
   const saveVisibleRelaySettings = async (next: BackendSettings) => {
     const hiddenProfiles = normalized.relayProfiles.filter((profile) => (
       relayProviderView(profile) !== providerView
@@ -4866,10 +5001,17 @@ function RelayScreen({
   useEffect(() => {
     if (!thirdPartyImportOpen) return;
     const close = () => setThirdPartyImportOpen(false);
+    // 菜单挂在 .mg-page（overflow:hidden）里，只能自己判定外点，不然点空白处收不起来。
+    const handlePointerDown = (event: PointerEvent) => {
+      if (thirdPartyImportTriggerRef.current?.contains(event.target as Node)) return;
+      close();
+    };
+    document.addEventListener("pointerdown", handlePointerDown, true);
     window.addEventListener("resize", close);
     // capture 监听内层 .mg-content 的滚动。
     window.addEventListener("scroll", close, { capture: true, passive: true });
     return () => {
+      document.removeEventListener("pointerdown", handlePointerDown, true);
       window.removeEventListener("resize", close);
       window.removeEventListener("scroll", close, { capture: true });
     };
@@ -4995,6 +5137,11 @@ function RelayScreen({
               <span>{t("直连")}</span>
               <CircleHelp className="provider-view-help" size={13} />
             </button>
+            <button aria-selected={providerView === "modelAggregation"} className={providerView === "modelAggregation" ? "active" : ""} onClick={() => selectProviderView("modelAggregation")} role="tab" title={t("把成员模型合并到 Codex 模型列表，带供应商前缀的模型固定发送到对应成员。")} type="button">
+              <Layers3 className="h-4 w-4" />
+              <span>{t("模型聚合")}</span>
+              <CircleHelp className="provider-view-help" size={13} />
+            </button>
             <button aria-selected={providerView === "routing"} className={providerView === "routing" ? "active" : ""} onClick={() => selectProviderView("routing")} role="tab" title={t("供应商只支持 Chat Completions（或配置了模型路由）：由本地协议代理转换后转发。")} type="button">
               <GitBranch className="h-4 w-4" />
               <span>{t("需协议转换")}</span>
@@ -5003,11 +5150,6 @@ function RelayScreen({
             <button aria-selected={providerView === "failover"} className={providerView === "failover" ? "active" : ""} onClick={() => selectProviderView("failover")} role="tab" title={t("多个供应商组成请求池，支持失败切换、会话轮转、请求轮转与权重；成员可以是 API 供应商或官方登录账号。")} type="button">
               <ArrowRightLeft className="h-4 w-4" />
               <span>{t("故障转移")}</span>
-              <CircleHelp className="provider-view-help" size={13} />
-            </button>
-            <button aria-selected={providerView === "modelAggregation"} className={providerView === "modelAggregation" ? "active" : ""} onClick={() => selectProviderView("modelAggregation")} role="tab" title={t("把成员模型合并到 Codex 模型列表，带供应商前缀的模型固定发送到对应成员。")} type="button">
-              <Layers3 className="h-4 w-4" />
-              <span>{t("模型聚合")}</span>
               <CircleHelp className="provider-view-help" size={13} />
             </button>
           </div>
@@ -5055,6 +5197,7 @@ function RelayScreen({
             form={listForm}
             onEdit={(profileId) => void editRelayProfile(profileId)}
             onFormChange={saveVisibleRelaySettings}
+            onSwitchProfile={switchRelayProfileFromList}
             disabled={actions.relaySwitching}
             actions={actions}
           />
@@ -5118,18 +5261,21 @@ function CodexMultiLaunchScreen({
                   const running = multiLaunchInstanceRunning(instance);
                   const pending = actions.multiLaunchActionPending === instance.instanceId;
                   const label = formatMultiLaunchInstanceLabel(instance, { main: t("主 Codex"), fallback: t("Codex 实例") });
+                  // 启动失败的原因必须让用户看得见：Windows 上多开曾经完全不吭声。
+                  const failure = multiLaunchInstanceFailure(instance);
                   const detail = [
                     instance.isMain ? t("主进程") : instance.instanceId,
                     typeof instance.pid === "number" ? `PID ${instance.pid}` : "",
                     typeof instance.debugPort === "number" ? `CDP ${instance.debugPort}` : "",
                     typeof instance.helperPort === "number" ? `API ${instance.helperPort}` : "",
+                    failure ? `${t("启动失败")}：${failure}` : "",
                   ].filter(Boolean).join(" · ");
                   return (
                     <div className="multi-launch-instance-card" data-instance-id={instance.instanceId} key={instance.instanceId}>
                       <span className="relay-index" title={label}>{providerInitial(label)}</span>
                       <span className="relay-summary">
                         <strong>{label}</strong>
-                        <small>{detail || t("未提供进程详情")}</small>
+                        <small data-failed={failure ? "true" : undefined}>{detail || t("未提供进程详情")}</small>
                       </span>
                       <UiBadge className={`multi-launch-instance-status ${statusClass(status)}`} variant="secondary">{statusLabel(status)}</UiBadge>
                       <span className="relay-card-actions">
@@ -5536,7 +5682,7 @@ function DictationSettingsPanel({ form, onFormChange }: {
             <Info className="h-4 w-4" />
             <span>{form.dictation.provider === "sensevoice"
               ? t("下载模型并保存配置后，可在 Codex 输入框录音，停止后在本机转写并插入文字。")
-              : t("保存后 Codex 输入框会显示「语音输入」按钮，停止录音后可插入或发送文字。录音会发送到上面填写的服务地址，无需重启。")}</span>
+              : t("保存后 Codex 输入框底部会显示麦克风图标，停止录音后可插入或发送文字。录音会发送到上面填写的服务地址，无需重启。")}</span>
           </div>
         </div>
       </CardContent>
@@ -5705,18 +5851,32 @@ function EnhanceScreen({
     <div className="settings-page enhance-page">
       <div className="enhance-page-controls" id="enhance-page-controls">
         <div className="enhance-page-toolbar">
-          <label className="switch-row compact enhance-master-switch">
-            <input
-              checked={form.enhancementsEnabled}
-              onChange={(event) => onFormChange({ ...form, enhancementsEnabled: event.currentTarget.checked })}
-              type="checkbox"
-            />
-            <span>
-              <strong>{t("启用 Codex增强")}</strong>
-              <small>{t("关闭后暂停增强功能，服务配置会保留。")}</small>
-            </span>
-            <ToggleVisual />
-          </label>
+          <div className="enhance-primary-switches">
+            <label className="switch-row compact enhance-master-switch">
+              <input
+                checked={form.enhancementsEnabled}
+                onChange={(event) => onFormChange({ ...form, enhancementsEnabled: event.currentTarget.checked })}
+                type="checkbox"
+              />
+              <span>
+                <strong>{t("启用 Codex增强")}</strong>
+                <small>{t("关闭后暂停增强功能，服务配置会保留。")}</small>
+              </span>
+              <ToggleVisual />
+            </label>
+            <label className="switch-row compact enhance-master-switch">
+              <input
+                checked={form.codexAppStandaloneQuotaUnlock}
+                onChange={(event) => setEnhanceFlag("codexAppStandaloneQuotaUnlock", event.currentTarget.checked)}
+                type="checkbox"
+              />
+              <span>
+                <strong>{t("独立额度解锁")}</strong>
+                <small>{t("官方登录 + 混入 API Key")}</small>
+              </span>
+              <ToggleVisual />
+            </label>
+          </div>
           <div className="enhance-save-actions">
             <span className={dirty ? "is-dirty" : ""} role="status">{dirty ? t("有未保存修改") : t("已保存")}</span>
             <Button disabled={!dirty} onClick={() => void actions.saveSettings()}>
@@ -5801,6 +5961,7 @@ function EnhanceScreen({
                 <FeatureToggle title={t("会话 ID 标识")} detail={t("在侧边栏会话标题前显示短 ID 和 UUIDv7 创建时间，方便定位历史会话。")} checked={form.codexAppThreadIdBadge} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppThreadIdBadge", value)} />
                 <FeatureToggle title={t("对话居中宽度")} detail={t("把主对话和输入框限制到固定最大宽度，适合大屏阅读。")} checked={form.codexAppConversationView} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppConversationView", value)} />
                 <FeatureToggle title={t("切换对话保留位置")} detail={t("切换 thread 时恢复上一次浏览位置。")} checked={form.codexAppThreadScrollRestore} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppThreadScrollRestore", value)} />
+                <FeatureToggle title={t("用量状态栏")} detail={t("在输入框下方显示生成速度、缓存命中率和上下文占用。数据来自本机 Codex 会话记录，不改变请求内容。")} checked={form.codexAppUsageStatusLine} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppUsageStatusLine", value)} />
               </FeatureGroup>
               <FeatureGroup title={t("挂件与桌宠")} detail={t("在 Codex 中查看用量，设置自己的角色和互动方式。")}>
                 <FeatureToggle
@@ -5810,9 +5971,10 @@ function EnhanceScreen({
                   disabled={!masterEnabled}
                   onChange={(value) => setEnhanceFlag("codexAppWhaleWidgetEnabled", value)}
                 />
-                <WhaleBalanceSettingsFields form={form} onFormChange={onFormChange} />
                 <FeatureToggle title={t("活动进度条右侧布局")} detail={t("把 Codex 原生活动进度条、状态波形和活动悬浮框移到右侧，并镜像波形方向。")} checked={form.codexAppActivityOverlayRight} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppActivityOverlayRight", value)} />
                 {isWindowsPlatform ? <FeatureToggle title={t("桌宠跟随真实鼠标")} detail={t("仅支持 V2 桌宠；不会修改宠物文件。将 V2 的 Computer Use 光标朝向动作映射到真实鼠标，V1 开启后安全不生效；拖拽、原生悬停或 Computer Use 活跃时自动让步。")} checked={form.codexAppPetRealMouseLook} disabled={!masterEnabled} onChange={(value) => setPersistedEnhanceFlag("codexAppPetRealMouseLook", value)} /> : null}
+                {/* 余额配置独占一整行（CSS: > .settings-block），展开时不会牵动上面的开关卡。 */}
+                <WhaleBalanceSettingsFields form={form} onFormChange={onFormChange} />
               </FeatureGroup>
             </div>
             <div className="hint-line enhance-footer-hint">
@@ -5836,8 +5998,11 @@ function DreamSkinScreen({
   form,
   launchPending,
   library,
+  libraryLoading,
   market,
+  marketLoading,
   community,
+  communityLoading,
   draft,
   dirty,
   pendingRestart,
@@ -5851,8 +6016,11 @@ function DreamSkinScreen({
   form: BackendSettings;
   launchPending: boolean;
   library: DreamSkinThemeLibrary | null;
+  libraryLoading: boolean;
   market: DreamSkinMarketResult | null;
+  marketLoading: boolean;
   community: DreamSkinCommunityResult | null;
+  communityLoading: boolean;
   draft: DreamSkinThemeDraft | null;
   dirty: boolean;
   pendingRestart: PendingDreamSkinRestart | null;
@@ -5962,6 +6130,13 @@ function DreamSkinScreen({
   const localThemes = (library?.themes ?? []).filter((item) =>
     !localQuery.trim() || item.name.toLocaleLowerCase().includes(localQuery.trim().toLocaleLowerCase()),
   );
+  // 数据未就绪或正在刷新时，tab 计数显示转圈而不是 0，避免被误读成空列表。
+  const libraryPending = libraryLoading || !library;
+  const marketPending = marketLoading || !market;
+  const communityPending = communityLoading || !community;
+  const libraryCount = library?.themes.length ?? 0;
+  const marketCount = market?.themes.length ?? 0;
+  const communityCount = community?.items.length ?? 0;
   const runtimeChecks = status?.checks ?? [];
   const verificationChecks = verification?.checks ?? [];
 
@@ -6052,7 +6227,9 @@ function DreamSkinScreen({
               >
                 <Palette className="h-4 w-4" />
                 {t("我的主题")}
-                <span>{library?.themes.length ?? 0}</span>
+                <span className={libraryPending ? "is-loading" : ""} title={libraryPending ? t("加载中…") : undefined}>
+                  {libraryPending ? <Loader2 aria-hidden="true" className="h-3 w-3 animate-spin" /> : libraryCount}
+                </span>
               </button>
               <button
                 aria-selected={themeView === "community"}
@@ -6063,7 +6240,9 @@ function DreamSkinScreen({
               >
                 <Github className="h-4 w-4" />
                 {t("DreamSkin 社区")}
-                <span>{community?.items.length ?? 0}</span>
+                <span className={communityPending ? "is-loading" : ""} title={communityPending ? t("加载中…") : undefined}>
+                  {communityPending ? <Loader2 aria-hidden="true" className="h-3 w-3 animate-spin" /> : communityCount}
+                </span>
               </button>
               <button
                 aria-selected={themeView === "market"}
@@ -6074,7 +6253,9 @@ function DreamSkinScreen({
               >
                 <Store className="h-4 w-4" />
                 {t("主题市场")}
-                <span>{market?.themes.length ?? 0}</span>
+                <span className={marketPending ? "is-loading" : ""} title={marketPending ? t("加载中…") : undefined}>
+                  {marketPending ? <Loader2 aria-hidden="true" className="h-3 w-3 animate-spin" /> : marketCount}
+                </span>
               </button>
             </div>
             {themeView === "local" ? (
@@ -6094,6 +6275,7 @@ function DreamSkinScreen({
           {themeView === "community" ? (
             <DreamSkinCommunitySection
               community={community}
+              communityLoading={communityLoading}
               actions={actions}
               onInstalled={() => setThemeView("local")}
             />
@@ -6138,7 +6320,12 @@ function DreamSkinScreen({
                 </div>
               ) : (
                 <div className="empty">
-                  {market?.status === "failed" ? market.message : t("正在加载主题市场…")}
+                  {market?.status === "failed" ? market.message : (
+                    <span className="dream-skin-loading" role="status">
+                      {marketPending ? <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" /> : null}
+                      {t("正在加载主题市场…")}
+                    </span>
+                  )}
                 </div>
               )}
             </section>
@@ -6204,7 +6391,7 @@ function DreamSkinScreen({
                       {item.modified || cardDirty ? <em>{t("已修改")}</em> : null}
                     </button>
                     {item.kind === "stored" ? (
-                      <details className="dream-skin-theme-menu">
+                      <details className="dream-skin-theme-menu" data-popover-menu="">
                         <summary aria-label={tf("主题操作：{0}", [item.name])} title={t("主题操作")}><MoreHorizontal className="h-4 w-4" /></summary>
                         <div>
                           <button onClick={() => void actions.renameDreamSkinTheme(item)} type="button">
@@ -6222,7 +6409,14 @@ function DreamSkinScreen({
                 );
               })}
             </div>
-            {!library ? <p className="empty">{t("正在加载主题库…")}</p> : null}
+            {!library ? (
+              <p className="empty">
+                <span className="dream-skin-loading" role="status">
+                  <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
+                  {t("正在加载主题库…")}
+                </span>
+              </p>
+            ) : null}
             {library && !localThemes.length ? (
               <div className="dream-skin-local-empty">
                 <Search aria-hidden="true" className="h-5 w-5" />
@@ -6609,10 +6803,12 @@ function DreamSkinMarketCard({
 
 function DreamSkinCommunitySection({
   community,
+  communityLoading,
   actions,
   onInstalled,
 }: {
   community: DreamSkinCommunityResult | null;
+  communityLoading: boolean;
   actions: Actions;
   onInstalled: () => void;
 }) {
@@ -6695,13 +6891,16 @@ function DreamSkinCommunitySection({
         </div>
       ) : (
         <div className="empty">
-          {!community
-            ? t("正在加载 DreamSkin 社区…")
-            : community.status === "failed"
-              ? community.message
-              : query.trim()
-                ? t("没有匹配的社区主题。")
-                : t("DreamSkin 社区暂时没有可用主题。")}
+          {!community || communityLoading ? (
+            <span className="dream-skin-loading" role="status">
+              <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
+              {t("正在加载 DreamSkin 社区…")}
+            </span>
+          ) : community.status === "failed"
+            ? community.message
+            : query.trim()
+              ? t("没有匹配的社区主题。")
+              : t("DreamSkin 社区暂时没有可用主题。")}
         </div>
       )}
     </section>
@@ -7396,21 +7595,19 @@ function MaintenanceScreen({
   overview,
   launchPending,
   watcher,
+  autoTakeover,
   settings,
   launchForm,
   onLaunchFormChange,
-  removeOwnedData,
-  onRemoveOwnedDataChange,
   actions,
 }: {
   overview: OverviewResult | null;
   launchPending: boolean;
   watcher: WatcherResult | null;
+  autoTakeover: AutoTakeoverResult | null;
   settings: SettingsResult | null;
   launchForm: { appPath: string; debugPort: string; helperPort: string };
   onLaunchFormChange: (next: { appPath: string; debugPort: string; helperPort: string }) => void;
-  removeOwnedData: boolean;
-  onRemoveOwnedDataChange: (value: boolean) => void;
   actions: Actions;
 }) {
   const savedCodexAppPath = settings?.settings.codexAppPath ?? "";
@@ -7423,6 +7620,11 @@ function MaintenanceScreen({
             <StatusRow title={t("Codex 应用")} status={overview?.codex_app.status} path={overview?.codex_app.path} />
             <StatusRow title={t("Codex++ 应用入口")} status={overview?.management_shortcut.status} path={overview?.management_shortcut.path} />
             <StatusRow title={t("开机打开 Codex++")} status={watcher?.enabled ? "ok" : "disabled"} path={watcher?.disabled_flag} />
+            <StatusRow
+              title={t("自动接管官方 App")}
+              status={settings?.settings.codexAppAutoTakeover && autoTakeover?.running ? "ok" : "disabled"}
+              path={autoTakeover?.lastError ?? autoTakeover?.lastReason ?? null}
+            />
           </div>
           <Toolbar>
             <Button onClick={() => void actions.checkHealth()}>{t("检查")}</Button>
@@ -7431,28 +7633,69 @@ function MaintenanceScreen({
         </CardContent>
       </Panel>
       <Panel>
-        <CardHead title={t("入口管理")} detail={t("快捷方式写入系统实际桌面位置，不使用写死桌面路径")} />
+        <CardHead title={t("开机打开 Codex++")} detail={t("登录系统后打开 Codex++ 界面，Codex 仍需点击启动")} />
         <CardContent>
-          <label className="check-row">
-            <input checked={removeOwnedData} onChange={(event) => onRemoveOwnedDataChange(event.currentTarget.checked)} type="checkbox" />
-            <span>{t("卸载时移除 Codex++ 托管数据")}</span>
+          <label className="switch-row">
+            <input
+              checked={Boolean(watcher?.enabled)}
+              disabled={!watcher}
+              onChange={(event) => void actions.setWatcherEnabled(event.currentTarget.checked)}
+              type="checkbox"
+            />
+            <span>
+              <strong>{t("登录时自动打开")}</strong>
+              <small>{t("开启后注册系统登录项，关闭时移除；Codex 仍需你手动点击启动。")}</small>
+            </span>
+            <ToggleVisual />
           </label>
-          <Toolbar>
-            <Button onClick={() => void actions.installEntrypoints()}>{t("安装入口")}</Button>
-            <Button variant="secondary" onClick={() => void actions.uninstallEntrypoints()}>{t("卸载入口")}</Button>
-            <Button variant="secondary" onClick={() => void actions.repairShortcuts()}>{t("修复入口")}</Button>
-          </Toolbar>
         </CardContent>
       </Panel>
       <Panel>
-        <CardHead title={t("开机打开 Codex++")} detail={t("登录系统后打开 Codex++ 界面，Codex 仍需点击启动")} />
+        <CardHead title={t("自动接管官方 App")} detail={t("你自己双击启动官方 App 时，Codex++ 自动接管并注入增强")} />
         <CardContent>
-          <Toolbar>
-            <Button variant="secondary" onClick={() => void actions.installWatcher()}>{t("设置开机启动")}</Button>
-            <Button variant="secondary" onClick={() => void actions.uninstallWatcher()}>{t("移除开机启动")}</Button>
-            <Button variant="secondary" onClick={() => void actions.enableWatcher()}>{t("启用")}</Button>
-            <Button variant="secondary" onClick={() => void actions.disableWatcher()}>{t("禁用")}</Button>
-          </Toolbar>
+          <label className="switch-row">
+            <input
+              checked={Boolean(settings?.settings.codexAppAutoTakeover)}
+              onChange={(event) => void actions.setAutoTakeover(event.currentTarget.checked)}
+              type="checkbox"
+            />
+            <span>
+              <strong>{t("开启自动接管")}</strong>
+              <small>{t("开启后，你自己启动官方 App 时 Codex++ 会自动接管。官方 App 已在运行且没有调试端口时，会先退出再带参数重开（可能中断正在进行的操作）。")}</small>
+            </span>
+            <ToggleVisual />
+          </label>
+          {settings?.settings.codexAppAutoTakeover ? (
+            <>
+              <div className="status-table">
+                <StatusRow
+                  title={t("接管状态")}
+                  status={autoTakeover?.state === "degraded" ? "failed" : autoTakeover?.running ? "ok" : "disabled"}
+                  path={autoTakeover?.state === "degraded" ? t("已降级") : autoTakeover?.running ? t("监听中") : t("未运行")}
+                />
+                <StatusRow title={t("官方 App")} status={autoTakeover?.appRunning ? "ok" : "disabled"} path={autoTakeover?.appRunning ? t("运行中") : t("未运行")} />
+                <StatusRow
+                  title={t("调试端口")}
+                  status={autoTakeover?.actualDebugPort ? "ok" : "not_checked"}
+                  path={autoTakeover?.actualDebugPort ? String(autoTakeover.actualDebugPort) : null}
+                />
+              </div>
+              {autoTakeover?.pausedInstance ? <p className="hint">{t("本次已跳过自动接管，重启官方 App 后恢复。")}</p> : null}
+              {autoTakeover?.lastError ? <p className="hint">{autoTakeover.lastError}</p> : null}
+              {autoTakeover?.lastTakeoverAtMs ? (
+                <p className="hint">{tf("上次接管：{0}", [new Date(autoTakeover.lastTakeoverAtMs).toLocaleString()])}</p>
+              ) : null}
+              {autoTakeover?.platformSupported ? null : <p className="hint">{t("自动接管目前只支持 macOS。")}</p>}
+              <p className="hint">{t("仅在 Codex++ 正在运行时生效；需要重启官方 App 时会自动重启。")}</p>
+              <Toolbar>
+                <Button variant="secondary" onClick={() => void actions.takeOverNow()}>{t("立即接管")}</Button>
+                <Button variant="secondary" onClick={() => void actions.pauseAutoTakeover()}>{t("本次不接管")}</Button>
+                <Button variant="secondary" onClick={() => void actions.refreshAutoTakeover()}>{t("刷新状态")}</Button>
+              </Toolbar>
+            </>
+          ) : (
+            <p className="hint">{t("仅在 Codex++ 正在运行时生效；建议同时开启上面的「开机打开 Codex++」。")}</p>
+          )}
         </CardContent>
       </Panel>
       <Panel>
@@ -7816,12 +8059,14 @@ function RelayProfileList({
   form,
   onFormChange,
   onEdit,
+  onSwitchProfile,
   disabled = false,
   actions,
 }: {
   form: BackendSettings;
   onFormChange: (value: BackendSettings) => void;
   onEdit: (id: string) => void;
+  onSwitchProfile: (id: string) => void;
   disabled?: boolean;
   actions: Actions;
 }) {
@@ -7851,6 +8096,7 @@ function RelayProfileList({
               key={profile.id}
               onEdit={onEdit}
               onFormChange={onFormChange}
+              onSwitchProfile={onSwitchProfile}
               disabled={disabled}
               profile={profile}
             />
@@ -7867,6 +8113,7 @@ function SortableRelayProfileCard({
   index,
   onFormChange,
   onEdit,
+  onSwitchProfile,
   disabled = false,
   actions,
 }: {
@@ -7875,6 +8122,7 @@ function SortableRelayProfileCard({
   index: number;
   onFormChange: (value: BackendSettings) => void;
   onEdit: (id: string) => void;
+  onSwitchProfile: (id: string) => void;
   disabled?: boolean;
   actions: Actions;
 }) {
@@ -7921,9 +8169,7 @@ function SortableRelayProfileCard({
           onClick={(event) => {
             event.stopPropagation();
             if (disabled) return;
-            const previousActiveRelayId = form.activeRelayId;
-            const next = syncLegacyRelayFields({ ...form, activeRelayId: profile.id });
-            void actions.switchRelayProfile(next, previousActiveRelayId);
+            onSwitchProfile(profile.id);
           }}
           size="sm"
           title={
@@ -8118,6 +8364,14 @@ function RelayProfileDetail({
   });
   const isActive = !isNew && profile.id === form.activeRelayId;
   const profileUsesLiveFiles = relayProfileUsesLiveFiles(profile);
+  // 只有当前供应商才从 live 文件回填；非当前供应商时不能把 relayFiles 当依赖——
+  // live 文件一变就会重建整份模型行，编辑中的增删被无声撤销（保存后看起来「没生效」）。
+  const liveConfigContents = isActive && profileUsesLiveFiles ? relayFiles?.configContents ?? "" : "";
+  const liveAuthContents = isActive && profileUsesLiveFiles ? relayFiles?.authContents ?? "" : "";
+  // 行编辑守卫：编辑器里还有未保存的模型行改动时，外部变化（元数据、live 文件、别处保存设置
+  // 触发的重渲染）不许把用户的增删覆盖回已保存列表。
+  const unsavedRowEditsRef = useRef(false);
+  const lastDetailProfileIdRef = useRef(profile.id);
   useEffect(() => {
     const useLiveFiles = isActive && profileUsesLiveFiles && relayFiles;
     const liveDraft = isAggregateRelayProfile(profile)
@@ -8136,8 +8390,14 @@ function RelayProfileDetail({
       ? applyRelayProfilePatchToFiles(liveDraft, { apiKey: storedApiKey })
       : liveDraft;
     setDraft(nextDraft);
-    setModelWindowRows(modelWindowRowsFromProfile(nextDraft.modelList, nextDraft.modelWindows || "", nextDraft.modelVlm, nextDraft.modelAutoCompact));
-  }, [profile.id, profile.modelList, profile.modelWindows, profile.modelAutoCompact, profile.modelMetadata, profile.modelVlm, profileUsesLiveFiles, isActive, isNew, relayFiles?.configContents, relayFiles?.authContents]);
+    const switchedProfile = lastDetailProfileIdRef.current !== profile.id;
+    lastDetailProfileIdRef.current = profile.id;
+    if (switchedProfile || !unsavedRowEditsRef.current) {
+      setModelWindowRows(modelWindowRowsFromProfile(nextDraft.modelList, nextDraft.modelWindows || "", nextDraft.modelVlm, nextDraft.modelAutoCompact));
+    }
+    // 依赖里刻意不放 profile.modelMetadata / 原始 relayFiles：元数据改动是本编辑器自己触发的
+    // （删行会清该模型元数据），把它当依赖会让「删行 → 清元数据 → 重建行」把删掉的行加回来。
+  }, [profile.id, profile.modelList, profile.modelWindows, profile.modelAutoCompact, profile.modelVlm, profileUsesLiveFiles, isActive, isNew, liveConfigContents, liveAuthContents]);
   const validationSettings = relaySettingsWithDraft(form, profile.id, draft, isNew);
   const validationError = relaySessionProviderValidation(draft)
     ?? (isAggregateRelayProfile(draft)
@@ -8173,9 +8433,20 @@ function RelayProfileDetail({
     modelMetadata: currentModelState.modelMetadata,
     modelVlm: currentModelState.modelVlm,
   }) !== JSON.stringify(persistedModelState);
+  // 交给上面的行编辑守卫：有未保存行改动时，外部变化不覆盖模型行。
+  unsavedRowEditsRef.current = hasUnsavedModelChanges;
   const saveDraft = async () => {
-    if (savingDraft || validationError || modelRowsError
-      || (isNew && isAggregateRelayProfile(draft) && aggregateMode === null)) return;
+    if (savingDraft) return;
+    // 配置有误不再静默 return：把原因弹出来（按钮也不再因此禁用，见头部那一行提示）。
+    if (isNew && isAggregateRelayProfile(draft) && aggregateMode === null) {
+      void actions.showMessage(t("保存供应商"), t("先选择聚合类型（模型聚合 / 故障转移）再保存。"), "failed");
+      return;
+    }
+    const blockingIssue = validationError || modelRowsError;
+    if (blockingIssue) {
+      void actions.showMessage(t("保存供应商"), blockingIssue, "failed");
+      return;
+    }
     setSavingDraft(true);
     try {
       const draftWithWindows = draftWithModelRows();
@@ -8263,6 +8534,12 @@ function RelayProfileDetail({
           <div className="relay-editor-heading-copy">
             <strong>{draft.name || (aggregateProfile ? t("未命名聚合供应商") : t("未命名供应商"))}</strong>
             <span>{hasUnsavedModelChanges ? `${detailStatus} · ${t("有未保存修改")}` : detailStatus}</span>
+            {validationError || modelRowsError ? (
+              // 就地写出「为什么存不了」：按钮不再禁用，这里也给人一眼能看到的原因。
+              <span className="relay-editor-validation" role="alert">
+                {validationError || modelRowsError}
+              </span>
+            ) : null}
           </div>
         </div>
         <div className="relay-editor-actions">
@@ -8286,7 +8563,8 @@ function RelayProfileDetail({
             </Button>
           )}
           <Button
-            disabled={savingDraft || !!validationError || !!modelRowsError || aggregateModeRequired}
+            // 配置有误时也让人点：点一下把原因弹出来，比一个点不动的按钮清楚。
+            disabled={savingDraft}
             onClick={() => void saveDraft()}
             title={aggregateModeRequired ? t("先选择类型") : validationError || modelRowsError || t("保存")}
             type="button"
@@ -8880,6 +9158,16 @@ function RelayProfileEditor({
   };
   const removeModelWindowRow = (index: number) => {
     const removedSlug = modelWindowRows[index]?.model.trim() || modelSlugOriginsRef.current[index] || "";
+    // 「配置模型」不能被删掉：保存时后端会把 profile.model 合并回 model_list
+    // （relay_config::merge_model_into_model_list），删了也会被加回来、看起来像"保存没生效"。
+    const configuredSlug = parseModelSuffix(profile.model || "").slug.trim();
+    if (removedSlug && configuredSlug && removedSlug === configuredSlug) {
+      void actions.showMessage(
+        t("配置模型不能从列表里删除"),
+        tf("「{0}」是当前「配置模型」：Codex 会始终把它发布在模型列表里，删掉保存后也会被加回来。要减少模型，请先把上方「配置模型」改成要保留的那个，再删这一行。", [removedSlug]),
+      );
+      return;
+    }
     const nextRows = modelWindowRows.filter((_, rowIndex) => rowIndex !== index);
     const nextOrigins = modelSlugOriginsRef.current.filter((_, rowIndex) => rowIndex !== index);
     const resolved = resolvePendingModelSlugRenames(nextRows, nextOrigins, profile.modelMetadata);
@@ -10071,10 +10359,6 @@ function AggregateRelayProfileEditor({
             placeholder={t("例如 主力聚合池")}
           />
         </Field>
-        <Field label={t("聚合方式")}>
-          <UiBadge variant="secondary">{modelMode ? t("模型聚合") : t("故障转移")}</UiBadge>
-          <p className="field-hint">{t("此配置的聚合方式固定；需要另一种方式时，请创建新的聚合配置。")}</p>
-        </Field>
         {!modelMode ? <Field className="relay-field-test-model" label={t("测试模型")}>
           <Input
             value={profile.testModel}
@@ -10124,7 +10408,7 @@ function AggregateRelayProfileEditor({
       ) : (
         <div className="aggregate-model-mode-hint">
           <strong>{t("模型聚合已启用")}</strong>
-          <span>{t("成员模型会生成带供应商前缀的 Codex 模型；本模式不使用轮转策略或通配符路由。")}</span>
+          <span>{t("默认成员的模型以裸名发布、其他成员带 cpx- 前缀；勾选成员后点行尾「设为默认」指定默认供应商。本模式不使用轮转策略或通配符路由。")}</span>
         </div>
       )}
       <div className="aggregate-members">
@@ -10140,6 +10424,13 @@ function AggregateRelayProfileEditor({
             {candidates.map((candidate) => {
               const member = aggregate.members.find((item) => item.profileId === candidate.id);
               const checked = memberIds.has(candidate.id);
+              const isDefaultMember = !!aggregate.defaultRelayId && aggregate.defaultRelayId === candidate.id;
+              // 只显示模型数量 + 行内「设为默认」：整串模型名会把每张卡片撑成不同高度。
+              // 完整名单放 title；「默认」和勾选在同一行，不再需要下方单独的下拉。
+              const memberModelNames = [...new Set([
+                ...candidate.modelList.split(/[\r\n,]+/).map((line) => line.trim()).filter(Boolean),
+                ...(candidate.model.trim() ? [candidate.model.trim()] : []),
+              ])];
               return (
                 <label className={`aggregate-member-row ${checked ? "selected" : ""}`} key={candidate.id}>
                   <input
@@ -10148,7 +10439,9 @@ function AggregateRelayProfileEditor({
                     type="checkbox"
                   />
                   <span className="aggregate-member-summary">
-                    <strong>{candidate.name || t("未命名供应商")}</strong>
+                    <span className="aggregate-member-title">
+                      <strong>{candidate.name || t("未命名供应商")}</strong>
+                    </span>
                     <small>
                       {relayProfileModeLabel(candidate)} · {relayProtocolLabel(candidate.protocol)} ·{" "}
                       {isOfficialLoginMemberProfile(candidate)
@@ -10158,11 +10451,37 @@ function AggregateRelayProfileEditor({
                   </span>
                   {modelMode ? (
                     <span className="aggregate-member-models">
-                      {candidate.modelList
-                        || candidate.model
-                        || (isOfficialLoginMemberProfile(candidate)
-                          ? t("请填写该官方账号的模型列表")
-                          : t("未填写模型"))}
+                      <span
+                        className="aggregate-member-models-count"
+                        title={memberModelNames.length ? memberModelNames.join("\n") : undefined}
+                      >
+                        {memberModelNames.length
+                          ? tf("{0} 个模型", [memberModelNames.length])
+                          : (isOfficialLoginMemberProfile(candidate)
+                            ? t("请填写该官方账号的模型列表")
+                            : t("未填写模型"))}
+                      </span>
+                      {checked ? (isDefaultMember ? (
+                        <UiBadge className="aggregate-member-default-badge" variant="secondary">
+                          {t("默认")}
+                        </UiBadge>
+                      ) : (
+                        <Button
+                          className="aggregate-member-default-action"
+                          onClick={(event) => {
+                            // 行本身是 <label>：不拦默认行为会顺带切换勾选状态。
+                            event.preventDefault();
+                            event.stopPropagation();
+                            updateAggregate({ ...aggregate, defaultRelayId: candidate.id });
+                          }}
+                          size="sm"
+                          title={t("不带 cpx- 前缀的请求（旧会话、自动压缩带的模型名）会原样交给它")}
+                          type="button"
+                          variant="ghost"
+                        >
+                          {t("设为默认")}
+                        </Button>
+                      )) : null}
                     </span>
                   ) : (
                     <span className="aggregate-weight-box">
@@ -10184,6 +10503,17 @@ function AggregateRelayProfileEditor({
           <div className="empty">{t("先添加至少 1 个可用的 API 供应商或官方登录账号，再创建聚合供应商。")}</div>
         )}
       </div>
+      {modelMode ? (
+        <div className="aggregate-default-provider aggregate-default-hint">
+          <span>
+            {aggregate.defaultRelayId
+              ? tf("默认供应商：{0}。不带 cpx- 前缀的请求（旧会话、自动压缩带的模型名等）会原样交给它；带 cpx- 前缀但解析不出来的 ID 一律报错，不回落。", [
+                candidates.find((candidate) => candidate.id === aggregate.defaultRelayId)?.name || aggregate.defaultRelayId,
+              ])
+              : t("还没指定默认供应商：在上方成员行尾点「设为默认」。不带 cpx- 前缀的请求会原样交给它，没设就报错。")}
+          </span>
+        </div>
+      ) : null}
       {!modelMode ? <div className="aggregate-routes">
         <div className="aggregate-routes-head">
           <div>
@@ -10254,14 +10584,7 @@ function AggregateRelayProfileEditor({
             <span>{aggregateStrategyHelp(aggregate.strategy)}</span>
           </div>
         </>
-      ) : (
-        <div className="relay-grid compact aggregate-preview">
-          <Metric label={t("模式")} value={t("模型聚合")} />
-          <Metric label={t("成员数量")} value={tf("{0} 个", [aggregate.members.length])} />
-          <Metric label={t("模型来源")} value={t("沿用成员供应商模型列表")} />
-          <Metric label={t("绑定方式")} value={t("供应商前缀 + 真实模型名")} />
-        </div>
-      )}
+      ) : null}
     </div>
   );
 }
@@ -11835,12 +12158,16 @@ function AppSelect<T extends string>({
     onChange(option.value);
     setOpen(false);
   };
+  const { rootRef, menuRef, menuStyle } = usePopoverLayer({
+    open: open && !disabled,
+    onOpenChange: setOpen,
+    minWidth: 180,
+    maxHeight: 260,
+  });
   return (
     <div
       className={`app-select ${open ? "open" : ""} ${disabled ? "disabled" : ""} ${className}`.trim()}
-      onBlur={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setOpen(false);
-      }}
+      ref={rootRef}
     >
       <button
         aria-expanded={open}
@@ -11854,8 +12181,13 @@ function AppSelect<T extends string>({
         <span>{selected?.label ?? value}</span>
         <ChevronDown className="h-4 w-4" />
       </button>
-      {open && !disabled ? (
-        <div className="app-select-menu" role="listbox">
+      {open && !disabled ? createPortal(
+        <div
+          className={`app-select-menu app-select-menu-portal ${className}`.trim()}
+          ref={menuRef}
+          role="listbox"
+          style={menuStyle}
+        >
           {options.map((option) => (
             <button
               aria-selected={option.value === value}
@@ -11874,7 +12206,8 @@ function AppSelect<T extends string>({
               <span>{option.label}</span>
             </button>
           ))}
-        </div>
+        </div>,
+        document.body,
       ) : null}
     </div>
   );
@@ -12011,7 +12344,7 @@ function routeSubtitle(route: Route) {
     pluginMarket: t("检索插件，按需下载并安装到 Codex"),
     recommendations: t("普通推荐内容"),
     agentCache: t("扫描 Codex、Claude 与 Codex++ 的已知缓存目录，由你选择清理项目。"),
-    maintenance: t("入口安装、修复、开机启动与应用路径"),
+    maintenance: t("入口检查与修复、开机启动与应用路径"),
     about: t("版本信息、项目链接、GitHub Release 更新、日志与诊断"),
     settings: t("主题和启动参数"),
   };
@@ -12909,6 +13242,7 @@ function hydrateAggregateRelayProfile(profile: RelayProfile, aggregate: Aggregat
         weight: clampAggregateWeight(member.weight),
       })),
       routes: normalizeAggregateRoutes(aggregate.routes ?? []),
+      defaultRelayId: aggregate.defaultRelayId ?? "",
     },
   };
 }
@@ -13815,8 +14149,15 @@ function tomlString(value: string): string {
 }
 
 function syncLegacyRelayFields(settings: BackendSettings): BackendSettings {
+  // 先规范化非聚合供应商：聚合成员的"存在性"要用**规范化后仍然在列表里**的那些 id，
+  // 否则同一批 profile 里排在聚合后面的成员会被当成不存在而丢掉（顺序相关的老问题）。
+  const nonAggregate = settings.relayProfiles
+    .filter((profile) => !isAggregateRelayProfile(profile))
+    .map((profile) => deriveRelayProfileFromFiles(profile));
   const relayProfiles = settings.relayProfiles.map((profile) =>
-    isAggregateRelayProfile(profile) ? normalizeAggregateRelayProfile(profile, { ...settings, relayProfiles: settings.relayProfiles }) : deriveRelayProfileFromFiles(profile),
+    isAggregateRelayProfile(profile)
+      ? normalizeAggregateRelayProfile(profile, { ...settings, relayProfiles: [...nonAggregate, ...settings.relayProfiles.filter(isAggregateRelayProfile)] })
+      : deriveRelayProfileFromFiles(profile),
   );
   const active = activeRelayProfile({ ...settings, relayProfiles });
   const aggregateRelayProfiles = normalizeAggregateProfilesFromRelayProfiles(relayProfiles);
@@ -13852,6 +14193,7 @@ function normalizeAggregateProfilesFromRelayProfiles(profiles: RelayProfile[]): 
         relayId: route.profileId,
         priority: route.priority,
       })),
+      defaultRelayId: aggregate.defaultRelayId ?? "",
     };
   });
 }
@@ -13961,6 +14303,7 @@ function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
         strategy: "failover",
         modelAggregationEnabled: false,
         members: candidates.slice(0, 1).map((profile) => ({ profileId: profile.id, weight: 1 })),
+        defaultRelayId: "",
       },
     },
     settings,
@@ -14023,9 +14366,13 @@ function removeRelayProfile(settings: BackendSettings, id: string): BackendSetti
           {
             ...profile,
             aggregate: {
-              ...normalizeAggregateConfig(profile.aggregate, []),
-              members: normalizeAggregateConfig(profile.aggregate, []).members.filter((member) => member.profileId !== id),
-              routes: normalizeAggregateConfig(profile.aggregate, []).routes ?? [],
+              ...normalizeAggregateConfig(profile.aggregate, [], new Set(profiles.map((item) => item.id))),
+              // 用户显式删除的这家必须从成员/路由里移除：存在性判定会保留它
+              // （profiles 里已经没有了，其实也会被丢掉），这里再做一次明确的过滤。
+              members: normalizeAggregateConfig(profile.aggregate, [], new Set(profiles.map((item) => item.id)))
+                .members.filter((member) => member.profileId !== id),
+              routes: (normalizeAggregateConfig(profile.aggregate, [], new Set(profiles.map((item) => item.id))).routes ?? [])
+                .filter((route) => route.profileId !== id),
             },
           },
           { ...settings, relayProfiles: profiles },
@@ -14082,7 +14429,9 @@ function relayProviderView(profile: RelayProfile): ProviderViewKind {
 
 function normalizeAggregateRelayProfile(profile: RelayProfile, settings: BackendSettings | null): RelayProfile {
   const candidates = settings ? aggregateMemberCandidates(settings.relayProfiles, profile.id) : [];
-  const aggregate = normalizeAggregateConfig(profile.aggregate, candidates);
+  // 传"全部供应商 id"而不是候选：成员的存在性判定不能受"当前是否就绪"影响。
+  const existingProfileIds = settings ? new Set(settings.relayProfiles.map((item) => item.id)) : null;
+  const aggregate = normalizeAggregateConfig(profile.aggregate, candidates, existingProfileIds);
   return {
     ...profile,
     baseUrl: "",
@@ -14106,14 +14455,23 @@ function normalizeAggregateRelayProfile(profile: RelayProfile, settings: Backend
 
 // 创建时选定类型；重新创建草稿时不沿用另一类的路由、权重或测试模型。
 function aggregateProfileForMode(profile: RelayProfile, settings: BackendSettings, mode: AggregateMode): RelayProfile {
+  const members = (profile.aggregate?.members ?? []).map((member) => ({ profileId: member.profileId, weight: 1 }));
+  // 模型聚合总要有一个默认供应商（对标 CC Switch）：沿用仍合法的旧值，否则默认第一个成员。
+  const defaultRelayId = mode === "model"
+    ? normalizeAggregateDefaultRelayId(
+        profile.aggregate?.defaultRelayId,
+        new Set(members.map((member) => member.profileId)),
+      ) || members[0]?.profileId || ""
+    : "";
   return normalizeAggregateRelayProfile({
     ...profile,
     testModel: "",
     aggregate: {
       strategy: "failover",
       modelAggregationEnabled: mode === "model",
-      members: (profile.aggregate?.members ?? []).map((member) => ({ profileId: member.profileId, weight: 1 })),
+      members,
       routes: [],
+      defaultRelayId,
     },
   }, settings);
 }
@@ -14121,6 +14479,12 @@ function aggregateProfileForMode(profile: RelayProfile, settings: BackendSetting
 function normalizeAggregateConfig(
   aggregate: RelayAggregateConfig | null | undefined,
   candidates: RelayProfile[],
+  /**
+   * 当前快照里**全部**供应商 id（不只是可勾选候选）。传了才判定成员的存在性；不传
+   * （分页子集、拿不到完整快照）则一律保留成员——宁可留着让用户自己取消勾选，
+   * 也不能替用户删配置。
+   */
+  existingProfileIds: ReadonlySet<string> | null = null,
 ): RelayAggregateConfig {
   const candidateIds = new Set(candidates.map((profile) => profile.id));
   const seen = new Set<string>();
@@ -14129,25 +14493,34 @@ function normalizeAggregateConfig(
       ? aggregate.strategy
       : "failover";
   const modelAggregationEnabled = aggregate?.modelAggregationEnabled === true;
-  const members = (aggregate?.members ?? [])
-    .filter((member) => member.profileId && !seen.has(member.profileId))
-    .filter((member) => !candidateIds.size || candidateIds.has(member.profileId))
+  // 成员去留只看"这家供应商还在不在"：候选集合只决定 UI 能勾选什么，不能用来删掉
+  // 已经在聚合里的成员（供应商编辑中缺 Key 时判定会翻转，见 normalizeAggregateMembers）。
+  const members = normalizeAggregateMembers(aggregate?.members ?? [], existingProfileIds)
     .map((member) => {
       seen.add(member.profileId);
       return { profileId: member.profileId, weight: modelAggregationEnabled ? 1 : clampAggregateWeight(member.weight) };
     });
+  // 路由目标同样只按"供应商还在不在"去留：路由早就配好了，目标一时不就绪（或同一批
+  // settings 里排在聚合后面）不代表用户想删掉这条路由。
   const routes = modelAggregationEnabled ? [] : (aggregate?.routes ?? [])
     .filter((route) => route.pattern.trim() !== "" || route.profileId.trim() !== "")
+    .filter((route) => !existingProfileIds || !route.profileId.trim() || existingProfileIds.has(route.profileId.trim()))
     .map((route) => ({
       pattern: route.pattern.trim(),
       profileId: route.profileId,
       priority: clampAggregateRoutePriority(route.priority),
     }));
+  // 默认供应商必须是当前成员；成员被移出（或值不再合法）时自动清空为「未设置」。
+  const defaultRelayId = normalizeAggregateDefaultRelayId(
+    aggregate?.defaultRelayId,
+    new Set(members.map((member) => member.profileId)),
+  );
   return {
     strategy: modelAggregationEnabled ? "failover" : strategy,
     modelAggregationEnabled,
     members,
     routes,
+    defaultRelayId,
   };
 }
 
@@ -14171,6 +14544,15 @@ function aggregateRelayProfileValidation(profile: RelayProfile): string | null {
   const aggregate = normalizeAggregateConfig(profile.aggregate, []);
   if (aggregate.members.length < 1) {
     return t("聚合供应商至少需要勾选 1 个可用成员（API 供应商或官方登录账号）。");
+  }
+  // 模型聚合必须指定默认供应商（不带前缀的请求只有它能接）。
+  if (aggregate.modelAggregationEnabled === true) {
+    const defaultRelayId = (aggregate.defaultRelayId ?? "").trim();
+    const defaultIsMember = !!defaultRelayId
+      && aggregate.members.some((member) => member.profileId === defaultRelayId);
+    if (!defaultIsMember) {
+      return t("模型聚合必须指定「默认供应商」：在成员列表里点某一行的「设为默认」。不带 cpx- 前缀的请求会原样交给它，没设就报错。");
+    }
   }
   const issues = validateAggregateRoutes(
     aggregate.routes ?? [],
