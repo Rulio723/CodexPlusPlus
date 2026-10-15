@@ -6734,6 +6734,9 @@ pub async fn diagnose_relay_profile(profile: RelayProfile) -> CommandResult<Prov
             match profile.protocol {
                 codex_plus_core::settings::RelayProtocol::Responses => "Responses API",
                 codex_plus_core::settings::RelayProtocol::ChatCompletions => "Chat Completions",
+                codex_plus_core::settings::RelayProtocol::AnthropicMessages => {
+                    "Anthropic Messages"
+                }
             }
         ),
     });
@@ -8680,6 +8683,8 @@ base_url = "https://example.invalid/v1"
         let _guard = lock_codex_home_for_test();
         let temp = tempfile::tempdir().unwrap();
         // 只验证旧聚合链路，不读取运行中管理器的真实聚合设置和登录快照。
+        // 本地主线的同名单测（e0cb49cd）与远端（eb241dbf）做的是同一件事，
+        // 这里采用远端版本：额外写入一份默认 settings.json，隔离更彻底。
         let settings_path = temp.path().join("settings.json");
         std::fs::write(&settings_path, serde_json::to_vec(&BackendSettings::default()).unwrap()).unwrap();
         let previous = codex_plus_core::paths::set_settings_path_for_tests(Some(settings_path));

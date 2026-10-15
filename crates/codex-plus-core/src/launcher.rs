@@ -2254,13 +2254,26 @@ async fn handle_protocol_proxy_connection(
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or(""),
             );
+            let is_anthropic_upstream =
+                upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::AnthropicMessages;
             if upstream.wire_api != crate::protocol_proxy::UpstreamWireApi::Responses {
                 converter = converter.with_chat_upstream();
             }
+            // Anthropic 事件流先落成 chat 事件流，再进既有的 chat 压缩聚合器。
+            let mut anthropic_bridge = is_anthropic_upstream
+                .then(crate::anthropic_bridge::AnthropicSseToChatSse::default);
             let mut bytes_stream = upstream.take_response()?.bytes_stream();
             while let Some(chunk) = bytes_stream.next().await {
                 match chunk {
-                    Ok(bytes) => converter.push_upstream_bytes(&bytes),
+                    Ok(bytes) => {
+                        let payload = match anthropic_bridge.as_mut() {
+                            Some(bridge) => bridge.push_bytes(&bytes),
+                            None => bytes.to_vec(),
+                        };
+                        if !payload.is_empty() {
+                            converter.push_upstream_bytes(&payload);
+                        }
+                    }
                     Err(error) => {
                         converter.fail(format!("Stream error: {error}"), None);
                         break;
@@ -2348,8 +2361,12 @@ async fn handle_protocol_proxy_connection(
     };
     if upstream.compaction {
         // v2 远程压缩非流式路径：同样重组为单个 compaction 输出项。
-        let body = crate::protocol_proxy::wrap_non_stream_response_as_compaction(
+        let compaction_input = crate::anthropic_bridge::normalize_non_stream_body_for_compaction(
+            upstream.wire_api,
             &upstream_body,
+        )?;
+        let body = crate::protocol_proxy::wrap_non_stream_response_as_compaction(
+            &compaction_input,
             request_json
                 .as_ref()
                 .and_then(|request| request.get("model"))
@@ -2400,12 +2417,28 @@ async fn handle_protocol_proxy_connection(
         stream.shutdown().await?;
         return Ok(());
     }
-    let chat_json: serde_json::Value = serde_json::from_slice(&upstream_body)?;
-    let response_json = if let Some(request_json) = request_json.as_ref() {
+    let upstream_json: serde_json::Value = serde_json::from_slice(&upstream_body)?;
+    // Anthropic 上游先落成 chat 响应体，再复用同一份 chat → Responses 映射；
+    // 签名思考块要挂回 Responses 的 reasoning item，下一轮才能原样回放。
+    let (chat_json, thinking_blocks) =
+        if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::AnthropicMessages {
+            let blocks =
+                crate::anthropic_bridge::thinking_blocks_from_anthropic_message(&upstream_json);
+            (
+                crate::anthropic_bridge::anthropic_message_to_chat_completion(upstream_json)?,
+                blocks,
+            )
+        } else {
+            (upstream_json, Vec::new())
+        };
+    let mut response_json = if let Some(request_json) = request_json.as_ref() {
         crate::protocol_proxy::chat_completion_to_response_with_request(chat_json, request_json)?
     } else {
         crate::protocol_proxy::chat_completion_to_response(chat_json)?
     };
+    if !thinking_blocks.is_empty() {
+        crate::anthropic_bridge::attach_thinking_to_responses(&mut response_json, &thinking_blocks);
+    }
     let body = serde_json::to_vec(&response_json)?;
     write_http_response(stream, "200 OK", "application/json; charset=utf-8", &body).await?;
     log_helper_response(
@@ -2900,6 +2933,45 @@ async fn forward_protocol_proxy_stream(
             }
         }
         return Ok(observer.finish());
+    }
+    if wire_api == crate::protocol_proxy::UpstreamWireApi::AnthropicMessages {
+        // Anthropic SSE → chat SSE → Responses SSE，终端事件语义与 chat 上游一致。
+        let mut converter = request
+            .map(crate::anthropic_bridge::AnthropicSseToResponsesConverter::with_request)
+            .unwrap_or_default();
+        while let Some(chunk) = chunks.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    let converted = converter.push_bytes(&bytes);
+                    if !converted.is_empty() {
+                        stream.write_all(&converted).await?;
+                    }
+                    if converter.has_failed() {
+                        return Ok(Some("上游返回了流式错误事件".to_string()));
+                    }
+                }
+                Err(error) => {
+                    let failed = converter.fail(
+                        "上游响应流读取失败".to_string(),
+                        Some("stream_error".to_string()),
+                    );
+                    stream.write_all(&failed).await?;
+                    return Ok(Some(error.without_url().to_string()));
+                }
+            }
+        }
+        // Anthropic 的 `message_stop` 就是完成事件；缺它说明流被掐断，
+        // 已发出的文本和工具增量不能自动重放。
+        if !converter.has_terminal_event() {
+            let failed = converter.fail(
+                "上游在完成事件前结束了响应流".to_string(),
+                Some("stream_incomplete".to_string()),
+            );
+            stream.write_all(&failed).await?;
+            return Ok(Some("上游缺少完成事件".to_string()));
+        }
+        stream.write_all(&converter.finish()).await?;
+        return Ok(None);
     }
     let mut converter = request
         .map(crate::protocol_proxy::ChatSseToResponsesConverter::with_request)
@@ -6079,5 +6151,48 @@ mod proxy_stream_tests {
         assert!(failure.is_none());
         assert!(output.contains("event: response.completed"));
         assert!(!output.contains("event: response.failed"));
+    }
+
+    /// Anthropic 上游：`message_stop` 是完成事件，缺失时按掐断上报而不是伪装成功。
+    #[tokio::test]
+    async fn anthropic_stream_is_converted_and_truncation_is_reported() {
+        let complete = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-5\"}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"你好\"}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+        let (failure, output) =
+            forward_fixture(complete, false, UpstreamWireApi::AnthropicMessages).await;
+        assert!(failure.is_none(), "{failure:?}");
+        assert!(output.contains("event: response.output_text.delta"));
+        assert!(output.contains("你好"));
+        assert!(output.contains("event: response.completed"));
+        assert!(!output.contains("event: response.failed"));
+
+        // 少了 message_stop：已有增量不能重放，也不能记成正常结束。
+        let truncated = complete
+            .split("event: message_delta")
+            .next()
+            .expect("fixture 由多个事件拼成");
+        let (failure, output) =
+            forward_fixture(truncated, false, UpstreamWireApi::AnthropicMessages).await;
+        assert!(
+            failure.expect("流中途断开必须报错").contains("完成事件"),
+            "错误原因要能指向缺失的完成事件"
+        );
+        assert!(output.contains("event: response.failed"));
+
+        // 只有 message_stop 缺失、但 stop_reason 已到：与 chat 上游口径一致，
+        // finish_reason 本身就是终止信号，按成功处理而不是报「被掐断」。
+        let without_stop = complete.replace(
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            "",
+        );
+        let (failure, output) =
+            forward_fixture(&without_stop, false, UpstreamWireApi::AnthropicMessages).await;
+        assert!(failure.is_none(), "{failure:?}");
+        assert!(output.contains("event: response.completed"));
     }
 }
