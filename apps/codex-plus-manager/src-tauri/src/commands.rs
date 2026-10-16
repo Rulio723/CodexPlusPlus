@@ -3166,7 +3166,30 @@ pub async fn native_browser_status() -> NativeBrowserDiagnostics {
 
 #[tauri::command]
 pub fn load_settings() -> CommandResult<SettingsPayload> {
-    settings_payload("设置已加载。", "设置读取失败")
+    let Ok(_guard) = relay_switch_mutex().lock() else {
+        return failed(
+            "供应商切换锁已损坏，请重启管理器后再试。",
+            fallback_settings_payload(),
+        );
+    };
+    let store = SettingsStore::default();
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    match codex_plus_core::provider_import::initialize_local_config_provider(&store, &home) {
+        Ok(settings) => ok(
+            "设置已加载。",
+            SettingsPayload {
+                settings,
+                settings_path: codex_plus_core::paths::default_settings_path()
+                    .to_string_lossy()
+                    .to_string(),
+                user_scripts: user_script_inventory(),
+            },
+        ),
+        Err(error) => failed(
+            &format!("读取本机默认供应商失败：{error}"),
+            fallback_settings_payload(),
+        ),
+    }
 }
 
 #[tauri::command]
@@ -5590,7 +5613,11 @@ pub async fn perform_update(
     app: tauri::AppHandle,
     release: Option<codex_plus_core::update::Release>,
 ) -> CommandResult<Value> {
-    let result = perform_update_inner(release).await;
+    let emitter = app.clone();
+    let result = perform_update_inner(release, move |progress| {
+        let _ = emitter.emit("update-progress", progress);
+    })
+    .await;
     if result.status == "ok" {
         // 返回下载结果后正常退出，安装器等待后台服务清理完成再替换程序。
         std::thread::spawn(move || {
@@ -5606,13 +5633,17 @@ pub async fn perform_update(
 pub async fn perform_update(
     release: Option<codex_plus_core::update::Release>,
 ) -> CommandResult<Value> {
-    perform_update_inner(release).await
+    perform_update_inner(release, |_| {}).await
 }
 
 // 无需 app runtime 的业务核心；其它平台测试不应引入 Wry 析构依赖。
-async fn perform_update_inner(
+async fn perform_update_inner<F>(
     release: Option<codex_plus_core::update::Release>,
-) -> CommandResult<Value> {
+    mut on_progress: F,
+) -> CommandResult<Value>
+where
+    F: FnMut(codex_plus_core::update::UpdateProgress) + Send,
+{
     let Some(release) = release else {
         return failed(
             "请先检查更新并选择可下载的 Release asset。",
@@ -5623,7 +5654,7 @@ async fn perform_update_inner(
         );
     };
     let download_dir = codex_plus_core::paths::default_app_state_dir().join("updates");
-    match codex_plus_core::update::perform_update(&release, &download_dir).await {
+    match codex_plus_core::update::perform_update_with_progress(&release, &download_dir, &mut on_progress).await {
         Ok(result) => ok(
             if cfg!(target_os = "macos") {
                 "安装包已验证，Codex++ 将关闭以安装更新，完成后自动重启；失败时保留旧版。"
@@ -8441,7 +8472,7 @@ base_url = "https://example.invalid/v1"
 
     #[test]
     fn update_install_requires_release_payload() {
-        let result = tauri::async_runtime::block_on(perform_update_inner(None));
+        let result = tauri::async_runtime::block_on(perform_update_inner(None, |_| {}));
 
         assert_eq!(result.status, "failed");
         assert!(result.message.contains("请先检查更新"));

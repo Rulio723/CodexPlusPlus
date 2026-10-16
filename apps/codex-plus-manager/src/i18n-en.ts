@@ -5,6 +5,10 @@
 
 // Plain strings: t("中文") -> EN_PLAIN["中文"].
 export const EN_PLAIN: Record<string, string> = {
+  "设为当前 Key": "Select this key",
+  "Key 名称": "Key name",
+  "删除 Key": "Delete key",
+  "添加 Key": "Add key",
   "本地服务器状态": "Local server status",
   "调试连接状态": "Debug connection status",
   "当前配置无需本地服务器": "The current configuration does not require a local server",
@@ -976,6 +980,10 @@ export const EN_PLAIN: Record<string, string> = {
   "模式": "Mode",
   "模式。": " mode.",
   "正在下载安装包…": "Downloading installer…",
+  "正在准备下载安装包…": "Preparing installer download…",
+  "正在写入安装包并准备安装…": "Writing installer and preparing installation…",
+  "正在启动安装器…": "Launching installer…",
+  "更新包仍在处理中，请保持窗口打开；完成后会自动更新状态。": "The update package is still being processed. Keep this window open; the status will update automatically when it finishes.",
   "正在写入安装包…": "Writing installer…",
   "正在修复…": "Repairing…",
   "正在修复历史会话": "Repairing historical sessions",
@@ -1471,6 +1479,7 @@ export const EN_PLAIN: Record<string, string> = {
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  "{0} 的 API Key": "API key for {0}",
   "文档里的上下文窗口是 {0}，当前列填的是 {1}，已保留当前值；要用文档的值请先清空窗口。": "The document's context window is {0}, but the column holds {1}. The current value was kept; clear the window to use the document's value.",
   "{0} 个插件": "{0} plugins",
   "{0} / {1} 个插件": "{0} / {1} plugins",
