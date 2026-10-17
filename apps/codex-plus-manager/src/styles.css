@@ -1477,6 +1477,14 @@ body {
   align-items: start;
 }
 
+/* 左侧端点与协议独立排列，不随右侧 Key 列表的高度拉开间距。 */
+.relay-api-connection-fields {
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  min-width: 0;
+}
+
 /* 已在 .relay-advanced-block 里，不再需要跨列。左右内边距由自己负责：
    外层盒子的 padding 已经移到 trigger 上，好让收起态整块可点 */
 .relay-advanced-fields {
@@ -1889,11 +1897,14 @@ body {
 .relay-api-key-list {
   display: grid;
   gap: 8px;
+  min-width: 0;
+  container-type: inline-size;
+  container-name: relay-api-keys;
 }
 
 .relay-api-key-row {
   display: grid;
-  grid-template-columns: 36px minmax(120px, 0.55fr) minmax(220px, 1.45fr) 36px;
+  grid-template-columns: 36px minmax(0, 0.55fr) minmax(0, 1.45fr) 36px;
   align-items: center;
   gap: 8px;
   min-width: 0;
@@ -1901,6 +1912,37 @@ body {
   border: 1px solid hsl(var(--border) / 0.8);
   border-radius: var(--radius-md);
   background: hsl(var(--surface-raised) / 0.35);
+}
+
+.relay-api-key-row > input {
+  min-width: 0;
+}
+
+/* Key 区可能只占表单半列，按它自身的宽度换行，避免宽窗口内仍挤出边框。 */
+@container relay-api-keys (max-width: 440px) {
+  .relay-api-key-row {
+    grid-template-columns: 36px minmax(0, 1fr) 36px;
+  }
+
+  .relay-api-key-select {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .relay-api-key-row > input:not([type="password"]) {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .relay-api-key-row > input[type="password"] {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+
+  .relay-api-key-row > button:last-child {
+    grid-column: 3;
+    grid-row: 1;
+  }
 }
 
 .relay-api-key-row.active {
@@ -2160,8 +2202,7 @@ details.relay-fold[open] > .relay-fold-body {
   min-width: 0;
 }
 
-.relay-options-grid > .relay-field-config-model,
-.relay-connection-section .relay-api-fields > .relay-field-protocol {
+.relay-options-grid > .relay-field-config-model {
   grid-column: 1 / -1;
 }
 
@@ -7076,14 +7117,6 @@ select {
     flex-direction: column;
   }
 
-  .relay-api-key-row {
-    grid-template-columns: 36px minmax(0, 1fr) 36px;
-  }
-
-  .relay-api-key-row > input[type="password"] {
-    grid-column: 2 / 4;
-  }
-
   .relay-model-list-tools {
     justify-content: flex-start;
   }
@@ -8824,14 +8857,6 @@ select {
   justify-content: space-between;
   gap: 20px;
   padding: 14px 18px;
-}
-
-.enhance-primary-switches {
-  display: grid;
-  gap: 14px;
-  flex: 1;
-  min-width: 0;
-  max-width: 480px;
 }
 
 .enhance-master-switch.switch-row {
