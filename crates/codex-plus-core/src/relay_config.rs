@@ -1994,7 +1994,16 @@ fn preserve_unmanaged_live_context_entries(
         return Ok(ensure_trailing_newline(config_text.to_string()));
     }
     let mut target_doc = parse_toml_document(config_text)?;
-    let live_doc = parse_toml_document(&live_config)?;
+    // live config.toml 已被上游/人工改坏时，切换供应商不应整次失败（#2478/#2500）：
+    // 无法从坏文件里捞用户托管条目，就直接按新配置写出；原文件已在 write_codex_live_atomic
+    // 的 create_live_backup 中备份，可手工恢复。
+    let Ok(live_doc) = parse_toml_document(&live_config) else {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "relay_config.live_config_unparsable",
+            serde_json::json!({ "home": home.to_string_lossy() }),
+        );
+        return Ok(ensure_trailing_newline(config_text.to_string()));
+    };
     let managed_doc =
         parse_toml_document(&sanitize_common_config_contents(managed_context_config))?;
     preserve_unmanaged_context_tables(
@@ -3303,13 +3312,27 @@ fn apply_model_catalog_to_config_with_live_policy(
     // 托管 Responses 传输走 model_routes 时需要 catalog，与会话身份无关；
     // 纯平铺 model_list 且无窗口/元数据的仍保持"不生成"契约（无后缀不落盘，见既有测试）。
     // 上游不认 tool_search 时必须落 catalog 关掉该能力，否则 Codex 照发、整单 400。
+    let catalog_path = home.join(&catalog_relative);
+    // 已经存在的托管 catalog 必须随当前模型列表重建：否则用户在供应商渠道里
+    // 增删/重命名模型后，Codex 重启读到的仍是旧 catalog，选择器不刷新
+    // （#2081）。「从没生成过 catalog 的平铺 model_list」保持不凭空创建。
+    // 仅限仍有多模型条目时刷新：模型列表收敛回单个无窗口模型时，平铺列表本身
+    // 就够用，继续落 catalog 会架空「关闭每模型覆盖即删除指针」的既有契约
+    // （见 tests/model_catalog_paths.rs）。
+    let existing_managed_catalog = catalog_path.exists()
+        && entries.len() > 1
+        && root_key_string(&config_text, "model_catalog_json").is_some_and(|pointer| {
+            pointer == catalog_relative || pointer == catalog_pointer
+        });
     if !should_write_managed_model_catalog(
         &entries,
         has_metadata_overrides,
         standard_responses,
         profile.has_model_routes(),
         official_deepseek_responses,
+        fallback.is_some(),
     ) && !upstream_rejects_tool_search(profile)
+        && !existing_managed_catalog
     {
         let mut doc = parse_toml_document(&config_text)?;
         if root_key_string(&config_text, "model_catalog_json")
@@ -3319,7 +3342,6 @@ fn apply_model_catalog_to_config_with_live_policy(
         }
         return Ok(normalize_optional_toml(doc));
     }
-    let catalog_path = home.join(&catalog_relative);
     if let Some(parent) = catalog_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -3471,8 +3493,13 @@ fn should_write_managed_model_catalog(
     standard_responses: bool,
     has_model_routes: bool,
     official_deepseek_responses: bool,
+    has_profile_window: bool,
 ) -> bool {
+    // profile 级窗口（`context_window`）也必须落 catalog：只配全局窗口、模型列表
+    // 不带后缀时，过去不会生成 catalog，Codex 继续用内置默认窗口，用户看到的仍是
+    // 272k（issue #2590）。有全局窗口时把每模型条目写成该窗口即可。
     metadata_overrides
+        || has_profile_window
         || entries.iter().any(|entry| {
             entry.suffix_window.is_some()
                 || entry.auto_compact_percent.is_some()
@@ -3536,6 +3563,21 @@ mod managed_catalog_predicate_tests {
             false,
             false,
             false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn predicate_writes_for_profile_level_window_without_suffixes() {
+        // #2590：只配 profile 级 context_window、模型列表不带 [1M] 后缀时，
+        // 也必须生成 catalog，否则 Codex 继续按内置 272k 窗口压缩。
+        assert!(should_write_managed_model_catalog(
+            &[entry("custom-model")],
+            false,
+            false,
+            false,
+            false,
+            true,
         ));
     }
 
@@ -3544,17 +3586,18 @@ mod managed_catalog_predicate_tests {
         let mut window = entry("custom-model");
         window.suffix_window = Some(1_000_000);
         assert!(should_write_managed_model_catalog(
-            &[window], false, false, false, false
+            &[window], false, false, false, false, false
         ));
 
         let mut compact = entry("custom-model");
         compact.auto_compact_percent = Some(80_000_000);
         assert!(should_write_managed_model_catalog(
-            &[compact], false, false, false, false
+            &[compact], false, false, false, false, false
         ));
         assert!(should_write_managed_model_catalog(
             &[entry("custom-model")],
             true,
+            false,
             false,
             false,
             false,
@@ -3569,6 +3612,7 @@ mod managed_catalog_predicate_tests {
             true,
             true,
             false,
+            false,
         ));
         assert!(should_write_managed_model_catalog(
             &[entry("deepseek-v4-pro")],
@@ -3576,6 +3620,7 @@ mod managed_catalog_predicate_tests {
             false,
             false,
             true,
+            false,
         ));
     }
 
@@ -4662,6 +4707,26 @@ fn merge_proxy_key_into_auth_json(source: &str, bearer_token: &str) -> Option<St
         .map(|text| format!("{text}\n"))
 }
 
+/// 当前 live 配置里实际生效的 API 凭据：`auth.json` 的 `OPENAI_API_KEY` 与
+/// 当前 provider 的 `experimental_bearer_token`。读不到或解析失败时返回空列表。
+pub fn active_api_credentials_in_home(home: &Path) -> Vec<String> {
+    let mut credentials = Vec::new();
+    if let Ok(auth) = read_optional_text(&home.join("auth.json"))
+        && let Some(key) = codex_auth_api_key(&auth)
+    {
+        credentials.push(key);
+    }
+    if let Ok(config) = read_optional_text(&home.join("config.toml"))
+        && let Ok(Some(token)) = experimental_bearer_token_from_config(&config)
+    {
+        let token = token.trim().to_string();
+        if !token.is_empty() && !credentials.contains(&token) {
+            credentials.push(token);
+        }
+    }
+    credentials
+}
+
 fn codex_auth_api_key(auth_contents: &str) -> Option<String> {
     let auth: Value = serde_json::from_str(auth_contents).ok()?;
     auth.get("OPENAI_API_KEY")
@@ -5324,6 +5389,36 @@ fn read_optional_text(path: &Path) -> anyhow::Result<String> {
     match std::fs::read_to_string(path) {
         Ok(contents) => Ok(contents),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            // 上游客户端在中文代码页下可能把 config.toml 写成 GBK/ANSI 字节。
+            // 直接报错会让切换供应商与沙盒初始化整条链路失败（#585）。
+            // 这里不改写原文件：先复制一份带时间戳的 `.invalid-utf8.bak`，
+            // 再按「没有可保留的 live 配置」继续——原字节完整保留在备份里，
+            // 用户可以手工转码后再放回。
+            let backup = path.with_file_name(format!(
+                "{}.invalid-utf8-{}.bak",
+                path.file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "config.toml".to_string()),
+                timestamp_millis()
+            ));
+            let backup_result = std::fs::copy(path, &backup);
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "relay_config.non_utf8_config",
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "backup": backup.to_string_lossy(),
+                    "backup_ok": backup_result.is_ok(),
+                    "error": error.to_string(),
+                }),
+            );
+            if backup_result.is_err() {
+                return Err(error).context(
+                    "config.toml 不是有效 UTF-8，且无法创建备份；原文件未修改",
+                );
+            }
+            Ok(String::new())
+        }
         Err(error) => Err(error.into()),
     }
 }

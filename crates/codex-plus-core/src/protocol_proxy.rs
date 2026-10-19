@@ -114,19 +114,100 @@ fn recall_tool_call_extra_content(call_id: &str) -> Option<Value> {
         .and_then(|cache| cache.recall(call_id))
 }
 
+const PROTOCOL_PROXY_PORT_FILE: &str = "protocol-proxy-port";
+
 /// 协议代理的实际生效端口，默认 [`DEFAULT_PROTOCOL_PROXY_PORT`]，
 /// 可用环境变量 `CODEX_PLUS_PROTOCOL_PROXY_PORT` 覆盖。
 ///
 /// 端口要写进 `config.toml` 的 `base_url`，不能像普通 helper 端口那样自动换；
-/// 但少数机器（issue #2189）上 57321 恰好被 Hyper-V/WSL 开机划进了 Windows
-/// 动态端口排除区间，bind 报 os error 10013 永远起不来，只能整体挪一个端口。
+/// 但少数机器（issue #2189 / #1163）上 57321 恰好被 Hyper-V/WSL 开机划进了
+/// Windows 动态端口排除区间，bind 报 os error 10013 永远起不来，只能整体挪
+/// 一个端口。迁移后的端口持久化在状态目录里，管理器与启动器读同一份值。
 /// 写入 base_url 与读取校验必须都走本函数，保证同一进程内一致。
 pub fn protocol_proxy_port() -> u16 {
+    if let Some(port) = env_protocol_proxy_port() {
+        return port;
+    }
+    read_persisted_protocol_proxy_port(&persisted_protocol_proxy_port_path())
+        .unwrap_or(DEFAULT_PROTOCOL_PROXY_PORT)
+}
+
+fn env_protocol_proxy_port() -> Option<u16> {
     std::env::var("CODEX_PLUS_PROTOCOL_PROXY_PORT")
         .ok()
         .and_then(|value| value.trim().parse::<u16>().ok())
         .filter(|port| *port > 0)
-        .unwrap_or(DEFAULT_PROTOCOL_PROXY_PORT)
+}
+
+fn persisted_protocol_proxy_port_path() -> std::path::PathBuf {
+    crate::paths::default_app_state_dir().join(PROTOCOL_PROXY_PORT_FILE)
+}
+
+fn read_persisted_protocol_proxy_port(path: &std::path::Path) -> Option<u16> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port > 0)
+}
+
+fn persist_protocol_proxy_port(path: &std::path::Path, port: u16) -> anyhow::Result<()> {
+    crate::settings::atomic_write(path, format!("{port}\n").as_bytes())
+        .with_context(|| format!("持久化协议代理端口失败：{}", path.display()))
+}
+
+/// 启动前确认协议代理端口可绑定。
+///
+/// 端口被**占用**（AddrInUse）时保持原值，交给既有的等待与重试逻辑——旧
+/// launcher 释放端口通常只需要几秒。只有 `PermissionDenied`（Windows 10013，
+/// 端口落在系统排除区间）才会永久失败，此时换一个空闲端口并持久化，让
+/// `config.toml` 的 base_url、helper 绑定和路由校验都跟随同一个新端口。
+///
+/// 显式设置 `CODEX_PLUS_PROTOCOL_PROXY_PORT` 时尊重用户选择，不自动迁移。
+pub fn ensure_protocol_proxy_port_available() -> u16 {
+    let port = protocol_proxy_port();
+    if env_protocol_proxy_port().is_some() {
+        return port;
+    }
+    match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(listener) => {
+            drop(listener);
+            port
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            let replacement = crate::ports::find_available_loopback_port();
+            if replacement != 0 && replacement != port {
+                let path = persisted_protocol_proxy_port_path();
+                match persist_protocol_proxy_port(&path, replacement) {
+                    Ok(()) => {
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "launcher.protocol_proxy_port_relocated",
+                            serde_json::json!({
+                                "from": port,
+                                "to": replacement,
+                                "path": path.to_string_lossy(),
+                                "error": error.to_string(),
+                            }),
+                        );
+                        return replacement;
+                    }
+                    Err(persist_error) => {
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "launcher.protocol_proxy_port_relocate_failed",
+                            serde_json::json!({
+                                "from": port,
+                                "to": replacement,
+                                "error": persist_error.to_string(),
+                            }),
+                        );
+                    }
+                }
+            }
+            port
+        }
+        Err(_) => port,
+    }
 }
 pub const NO_AUTH_PROXY_BEARER_TOKEN: &str = "codex-plus-no-auth";
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -546,7 +627,17 @@ pub fn responses_to_chat_completions_with_options(
     let mut has_chat_tools = false;
     if !converted.is_empty() {
         has_chat_tools = true;
-        result["tools"] = json!(converted);
+        let mut tools = converted;
+        // Gemini 的 function_declarations 只接受字符串枚举值：Codex 工具 schema
+        // 里出现 `enum: [true, false]` 这类布尔/数字值时会整轮 400
+        // （`enum[0] (TYPE_STRING)`，issue #2404）。只对 Gemini 系上游改写，
+        // 其他上游保持原始 JSON Schema 语义。
+        if upstream_requires_string_enums(model) {
+            for tool in tools.iter_mut() {
+                coerce_enum_values_to_strings(tool);
+            }
+        }
+        result["tools"] = json!(tools);
     }
 
     if has_chat_tools {
@@ -5283,6 +5374,10 @@ fn append_responses_input(input: &Value, messages: &mut Vec<Value>) -> anyhow::R
             let mut pending_tool_calls = Vec::new();
             let mut pending_reasoning = Vec::new();
             let mut seen_tool_call_ids = BTreeSet::new();
+            // 同一个 call_id 的输出在历史里出现多次时，Chat 上游会以
+            // `duplicate tool output for call_id` 拒绝整轮请求（#1533）。
+            // 历史回放只保留第一次出现的输出，其余丢弃。
+            let mut seen_tool_output_ids = BTreeSet::new();
             for item in items {
                 append_responses_item(
                     item,
@@ -5290,6 +5385,7 @@ fn append_responses_input(input: &Value, messages: &mut Vec<Value>) -> anyhow::R
                     &mut pending_tool_calls,
                     &mut pending_reasoning,
                     &mut seen_tool_call_ids,
+                    &mut seen_tool_output_ids,
                 )?;
             }
             flush_tool_calls(messages, &mut pending_tool_calls, &mut pending_reasoning);
@@ -5299,12 +5395,14 @@ fn append_responses_input(input: &Value, messages: &mut Vec<Value>) -> anyhow::R
             let mut pending_tool_calls = Vec::new();
             let mut pending_reasoning = Vec::new();
             let mut seen_tool_call_ids = BTreeSet::new();
+            let mut seen_tool_output_ids = BTreeSet::new();
             append_responses_item(
                 input,
                 messages,
                 &mut pending_tool_calls,
                 &mut pending_reasoning,
                 &mut seen_tool_call_ids,
+                &mut seen_tool_output_ids,
             )?;
             flush_tool_calls(messages, &mut pending_tool_calls, &mut pending_reasoning);
             flush_reasoning(messages, &mut pending_reasoning);
@@ -5320,6 +5418,7 @@ fn append_responses_item(
     pending_tool_calls: &mut Vec<Value>,
     pending_reasoning: &mut Vec<String>,
     seen_tool_call_ids: &mut BTreeSet<String>,
+    seen_tool_output_ids: &mut BTreeSet<String>,
 ) -> anyhow::Result<()> {
     match item.get("type").and_then(Value::as_str) {
         Some("function_call") => {
@@ -5355,6 +5454,10 @@ fn append_responses_item(
         Some("function_call_output") => {
             let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
             if call_id.is_empty() {
+                return Ok(());
+            }
+            if !seen_tool_output_ids.insert(call_id.to_string()) {
+                // 重复的 tool output：保留第一次，避免上游 duplicate call_id 400。
                 return Ok(());
             }
             if !seen_tool_call_ids.contains(call_id) {
@@ -5424,6 +5527,9 @@ fn append_responses_item(
         Some("tool_search_output") => {
             let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
             if call_id.is_empty() {
+                return Ok(());
+            }
+            if !seen_tool_output_ids.insert(call_id.to_string()) {
                 return Ok(());
             }
             let output = item.get("tools").unwrap_or(&Value::Null);
@@ -6597,6 +6703,44 @@ fn namespace_tool_to_chat_tools(namespace_tool: &Value, context: &CodexToolConte
         }));
     }
     converted
+}
+
+/// Gemini 系上游（含中转暴露的 google/gemini-*）要求 function declaration 的
+/// `enum` 全部是字符串，布尔/数字枚举会被整轮拒绝（#2404）。
+fn upstream_requires_string_enums(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.contains("gemini") || model.starts_with("google/") || model.starts_with("models/gemini")
+}
+
+/// 递归把 schema 中 `enum` 数组的非字符串值转成字符串。
+fn coerce_enum_values_to_strings(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::Array(entries)) = map.get_mut("enum") {
+                for entry in entries.iter_mut() {
+                    let coerced = match entry {
+                        Value::String(_) => None,
+                        Value::Bool(flag) => Some(flag.to_string()),
+                        Value::Number(number) => Some(number.to_string()),
+                        Value::Null => Some("null".to_string()),
+                        _ => None,
+                    };
+                    if let Some(coerced) = coerced {
+                        *entry = Value::String(coerced);
+                    }
+                }
+            }
+            for child in map.values_mut() {
+                coerce_enum_values_to_strings(child);
+            }
+        }
+        Value::Array(values) => {
+            for child in values.iter_mut() {
+                coerce_enum_values_to_strings(child);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn normalize_chat_tool_parameters(parameters: &Value) -> Value {
@@ -8761,6 +8905,75 @@ mod response_compatibility_tests {
     }
 
     #[test]
+    fn gemini_tool_enum_values_are_coerced_to_strings() {
+        // #2404：Gemini 只接受字符串枚举值，布尔/数字枚举会导致整轮 400。
+        let body = json!({
+            "model": "gemini-3.8-flash",
+            "input": "hi",
+            "tools": [{
+                "type": "function",
+                "name": "set_flag",
+                "description": "",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {"type": "boolean", "enum": [true, false]},
+                        "level": {"type": "integer", "enum": [1, 2]}
+                    }
+                }
+            }]
+        });
+        let converted = responses_to_chat_completions(body).unwrap();
+        let parameters = &converted["tools"][0]["function"]["parameters"]["properties"];
+        assert_eq!(parameters["enabled"]["enum"][0], "true");
+        assert_eq!(parameters["enabled"]["enum"][1], "false");
+        assert_eq!(parameters["level"]["enum"][0], "1");
+
+        // 非 Gemini 上游保持原始 JSON Schema 语义。
+        let body = json!({
+            "model": "glm-5.3",
+            "input": "hi",
+            "tools": [{
+                "type": "function",
+                "name": "set_flag",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"enabled": {"type": "boolean", "enum": [true, false]}}
+                }
+            }]
+        });
+        let converted = responses_to_chat_completions(body).unwrap();
+        assert_eq!(
+            converted["tools"][0]["function"]["parameters"]["properties"]["enabled"]["enum"][0],
+            true
+        );
+    }
+
+    #[test]
+    fn duplicate_function_call_output_keeps_first_and_avoids_upstream_400() {
+        // #1533：历史里同一 call_id 的 tool output 出现两次时，Chat 上游会以
+        // `duplicate tool output for call_id` 拒绝整轮请求。转换后只保留第一条。
+        let body = json!({
+            "model": "glm-5.3",
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "exec_command",
+                 "arguments": "{\"cmd\":\"pwd\"}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "first"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "second"}
+            ]
+        });
+        let converted = responses_to_chat_completions(body).unwrap();
+        let messages = converted["messages"].as_array().unwrap();
+        let tool_messages: Vec<_> = messages
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .collect();
+        assert_eq!(tool_messages.len(), 1, "同一 call_id 的输出只能保留一条");
+        assert_eq!(tool_messages[0]["tool_call_id"], "call_1");
+        assert_eq!(tool_messages[0]["content"], "first");
+    }
+
+    #[test]
     fn gemini_reasoning_conversion_respects_standard_protocol_opt_in() {
         for standard in [false, true] {
             let body = responses_to_chat_completions_with_options(
@@ -8988,6 +9201,34 @@ mod relay_custom_header_tests {
             request.headers().get("authorization").unwrap(),
             "Bearer explicit"
         );
+    }
+}
+
+#[cfg(test)]
+mod protocol_proxy_port_tests {
+    use super::*;
+
+    #[test]
+    fn persisted_port_round_trips_and_rejects_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PROTOCOL_PROXY_PORT_FILE);
+        assert_eq!(read_persisted_protocol_proxy_port(&path), None);
+        persist_protocol_proxy_port(&path, 57432).unwrap();
+        assert_eq!(read_persisted_protocol_proxy_port(&path), Some(57432));
+        std::fs::write(&path, "not-a-port\n").unwrap();
+        assert_eq!(read_persisted_protocol_proxy_port(&path), None);
+        std::fs::write(&path, "0\n").unwrap();
+        assert_eq!(read_persisted_protocol_proxy_port(&path), None);
+    }
+
+    #[test]
+    fn persisted_port_is_used_when_env_is_absent() {
+        // 环境变量优先级由 env_protocol_proxy_port 单独覆盖；这里验证持久化值
+        // 确实参与了 protocol_proxy_port 的解析。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PROTOCOL_PROXY_PORT_FILE);
+        persist_protocol_proxy_port(&path, 57555).unwrap();
+        assert_eq!(read_persisted_protocol_proxy_port(&path), Some(57555));
     }
 }
 

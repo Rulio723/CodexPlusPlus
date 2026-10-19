@@ -2635,7 +2635,7 @@ enabled = true
 }
 
 #[test]
-fn apply_relay_profile_does_not_write_model_catalog_json_for_selected_models() {
+fn apply_relay_profile_writes_catalog_for_profile_context_window() {
     let temp = tempfile::tempdir().unwrap();
     let profile = RelayProfile {
         id: "relay-a".to_string(),
@@ -2664,10 +2664,16 @@ experimental_bearer_token = "sk-new"
     apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
 
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-    assert!(!config.contains("model_catalog_json"));
+    // profile 级窗口必须落进 catalog，否则 Codex 继续按内置 272k 压缩（#2590）。
+    assert!(config.contains("model_catalog_json"));
     assert!(config.contains("model_context_window = 200000"));
     assert!(config.contains("model_auto_compact_token_limit = 160000"));
-    assert!(!temp.path().join("model-catalogs").exists());
+    let catalog = std::fs::read_to_string(
+        temp.path().join("model-catalogs").join("relay-a.json"),
+    )
+    .unwrap();
+    assert!(catalog.contains(r#""context_window": 200000"#), "{catalog}");
+    assert!(catalog.contains(r#""max_context_window": 200000"#), "{catalog}");
 }
 
 #[test]
@@ -4631,6 +4637,34 @@ command = "old"
 }
 
 #[test]
+fn disabling_one_managed_plugin_keeps_every_other_live_plugin() {
+    // #675：在管理器里停用一个插件，其余插件（含 Codex 自己装的、未被托管的）必须原样保留。
+    let live = r#"model = "gpt-5"
+
+[plugins."github@openai-curated"]
+enabled = true
+
+[plugins."figma@openai-curated"]
+enabled = true
+
+[plugins."notion@codex-plus-market"]
+enabled = true
+"#;
+    let context = r#"[plugins."notion@codex-plus-market"]
+enabled = false
+
+[plugins."figma@openai-curated"]
+enabled = true
+"#;
+
+    let updated = sync_live_config_context_entries(live, context).unwrap();
+
+    assert!(updated.contains(r#"[plugins."github@openai-curated"]"#), "{updated}");
+    assert!(updated.contains(r#"[plugins."figma@openai-curated"]"#), "{updated}");
+    assert!(!updated.contains(r#"[plugins."notion@codex-plus-market"]"#), "{updated}");
+}
+
+#[test]
 fn apply_relay_profile_to_home_with_switch_rules_writes_provider_even_when_auth_has_no_api_key() {
     let temp = tempfile::tempdir().unwrap();
     let profile = RelayProfile {
@@ -5053,7 +5087,51 @@ experimental_bearer_token = "sk-new"
 }
 
 #[test]
-fn apply_relay_profile_no_catalog_when_model_list_has_no_suffix() {
+fn apply_relay_profile_refreshes_existing_managed_catalog_when_models_change() {
+    // #2081：供应商渠道的模型列表变化后，已存在的托管 catalog 必须重建，
+    // 否则 Codex 重启后仍显示旧模型列表。
+    let temp = tempfile::tempdir().unwrap();
+    let mut profile = RelayProfile {
+        id: "relay-a".to_string(),
+        name: "Relay A".to_string(),
+        model: "qwen3-coder".to_string(),
+        relay_mode: RelayMode::PureApi,
+        config_contents: r#"model = "qwen3-coder"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "https://relay.example/v1"
+experimental_bearer_token = "sk-new"
+"#
+        .to_string(),
+        auth_contents: r#"{"OPENAI_API_KEY":"sk-new"}"#.to_string(),
+        model_insert_mode: Default::default(),
+        model_list: "qwen3-coder".to_string(),
+        context_window: "200000".to_string(),
+        ..RelayProfile::default()
+    };
+    apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
+    let catalog_path = temp.path().join("model-catalogs").join("relay-a.json");
+    let before = std::fs::read_to_string(&catalog_path).unwrap();
+    assert!(before.contains(r#""slug": "qwen3-coder""#), "{before}");
+    assert!(!before.contains(r#""slug": "kimi-k3""#));
+
+    // 用户更新了渠道模型列表（不再带窗口设置，只有平铺列表）。
+    profile.model_list = "qwen3-coder\nkimi-k3".to_string();
+    profile.context_window = String::new();
+    apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
+
+    let after = std::fs::read_to_string(&catalog_path).unwrap();
+    assert!(after.contains(r#""slug": "kimi-k3""#), "catalog 未随模型列表刷新：{after}");
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(config.contains("model_catalog_json"));
+}
+
+#[test]
+fn apply_relay_profile_writes_catalog_for_context_window_without_suffix() {
     let temp = tempfile::tempdir().unwrap();
     let profile = RelayProfile {
         id: "relay-a".to_string(),
@@ -5082,9 +5160,13 @@ experimental_bearer_token = "sk-new"
     apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
 
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-    assert!(!config.contains("model_catalog_json"));
+    assert!(config.contains("model_catalog_json"));
     assert!(config.contains("model_context_window = 200000"));
-    assert!(!temp.path().join("model-catalogs").exists());
+    let catalog = std::fs::read_to_string(
+        temp.path().join("model-catalogs").join("relay-a.json"),
+    )
+    .unwrap();
+    assert!(catalog.contains(r#""context_window": 200000"#), "{catalog}");
 }
 
 #[test]
@@ -6842,4 +6924,47 @@ base_url = "https://responses.example.test/v1"
     apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
     assert!(!config.contains("model_catalog_json"), "{config}");
+}
+
+#[test]
+fn official_mix_profile_keeps_user_feature_flags_in_live_config() {
+    // #1010：混入模式下 Codex 直连中转 base_url，Codex++ 无法在转发时剥掉生图工具；
+    // 中转不支持生图时，用户在供应商配置里写 `[features] image_generation = false`
+    // 是唯一规避手段，切换供应商时必须原样落到 live config.toml。
+    let temp = tempfile::tempdir().unwrap();
+    let mut profile = RelayProfile {
+        id: "mix".to_string(),
+        relay_mode: RelayMode::Official,
+        official_mix_api_key: true,
+        protocol: RelayProtocol::Responses,
+        base_url: "https://relay.example.test/v1".to_string(),
+        upstream_base_url: "https://relay.example.test/v1".to_string(),
+        api_key: "sk-test-redacted".to_string(),
+        config_contents: r#"model = "gpt-5.6-sol"
+model_provider = "custom"
+
+[features]
+image_generation = false
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "https://relay.example.test/v1"
+experimental_bearer_token = "sk-test-redacted"
+"#
+        .to_string(),
+        ..RelayProfile::default()
+    };
+    normalize_relay_profile_for_storage(&mut profile).unwrap();
+
+    apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
+
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    let doc = config.parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(
+        doc["features"]["image_generation"].as_bool(),
+        Some(false),
+        "{config}"
+    );
 }
