@@ -144,6 +144,10 @@ pub struct RelayProfile {
     /// 明确选择严格 Responses 历史契约；默认不改写历史。
     #[serde(default, skip_serializing_if = "is_false")]
     pub strict_responses_reasoning: bool,
+    /// Codex「替我审批」固定请求 `codex-auto-review`，第三方上游通常不认识这个模型；
+    /// 填写后协议代理把它改写成这里的模型（#1446）。留空则原样转发。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub auto_review_model: String,
     /// Anthropic 上游的认证字段：`x-api-key`（默认，Anthropic 原生）或
     /// `authorization`（多数 Claude 系中转网关用 Bearer）。
     #[serde(
@@ -338,6 +342,7 @@ impl Default for RelayProfile {
             web_search_history_compat: false,
             trust_upstream_catalog_lite: false,
             strict_responses_reasoning: false,
+            auto_review_model: String::new(),
             anthropic_auth_header: String::new(),
             anthropic_max_tokens: 0,
             anthropic_prompt_cache: true,
@@ -389,6 +394,13 @@ impl RelayProfile {
             Some("passthrough") => "passthrough",
             _ => "auto",
         }
+    }
+
+    /// 配置了「自动审批模型」时需要经本地协议代理改写 codex-auto-review（#1446），
+    /// 否则 Responses 直连的供应商根本不经过代理，填了也不生效（#1021）。
+    pub fn rewrites_auto_review_model(&self) -> bool {
+        (self.relay_mode != RelayMode::Official || self.official_mix_api_key)
+            && !self.auto_review_model.trim().is_empty()
     }
 
     pub fn request_compatibility_enabled(&self) -> bool {
@@ -693,6 +705,10 @@ pub struct BackendSettings {
     pub codex_extra_args: Vec<String>,
     #[serde(rename = "providerSyncEnabled", default)]
     pub provider_sync_enabled: bool,
+    /// 切换供应商/默认模型后，下次启动前把仍停在旧默认模型的会话迁到新默认（#2081）。
+    /// 默认关闭；用户手动改过模型的会话不受影响。
+    #[serde(rename = "threadModelFollowSwitchEnabled", default)]
+    pub thread_model_follow_switch_enabled: bool,
     #[serde(rename = "providerSyncSavedProviders", default)]
     pub provider_sync_saved_providers: Vec<String>,
     #[serde(rename = "providerSyncManualProviders", default)]
@@ -709,12 +725,17 @@ pub struct BackendSettings {
     pub enhancements_enabled: bool,
     #[serde(rename = "codexAppStandaloneQuotaUnlock", default)]
     pub codex_app_standalone_quota_unlock: bool,
+    /// 纯 API 供应商下启动前把详情模式写回 Codex 视图，避开 Work 视图要求 ChatGPT 账号（#2632）。
+    #[serde(rename = "codexAppDisableWorkView", default)]
+    pub codex_app_disable_work_view: bool,
     #[serde(rename = "codexAppPluginMarketplaceUnlock", default = "default_true")]
     pub codex_app_plugin_marketplace_unlock: bool,
     #[serde(rename = "codexAppModelWhitelistUnlock", default = "default_true")]
     pub codex_app_model_whitelist_unlock: bool,
     #[serde(rename = "codexAppSessionDelete", default = "default_true")]
     pub codex_app_session_delete: bool,
+    #[serde(rename = "codexAppSideChatSave", default)]
+    pub codex_app_side_chat_save: bool,
     #[serde(rename = "codexAppMarkdownExport", default = "default_true")]
     pub codex_app_markdown_export: bool,
     #[serde(rename = "codexAppSessionShare", default = "default_true")]
@@ -776,6 +797,8 @@ pub struct BackendSettings {
     pub codex_app_activity_overlay_right: bool,
     #[serde(rename = "codexAppCapacityAutoRetry", default)]
     pub codex_app_capacity_auto_retry: bool,
+    #[serde(rename = "codexAppTurnRewind", default)]
+    pub codex_app_turn_rewind: bool,
     #[serde(rename = "codexAppWhaleWidgetEnabled", default)]
     pub codex_app_whale_widget_enabled: bool,
     #[serde(
@@ -980,6 +1003,17 @@ pub struct BackendSettings {
         default = "default_protocol_proxy_auto_retry_commit_delay_ms"
     )]
     pub protocol_proxy_auto_retry_commit_delay_ms: u64,
+    /// 目录外模型名映射（#1183 / #1446 / #1457）：Codex 客户端的自动审查
+    /// （codex-auto-review）与标题/摘要等后台任务固定使用 gpt-* 等内部模型名，
+    /// 不经用户选模；第三方上游没有这些名字，原样转发只会得到
+    /// 「No available channel / 模型不存在」类错误，还可能按失败重试持续消耗额度。
+    /// 开启后，本地协议代理把「不在当前供应商公布模型集里的请求模型」改写为
+    /// 该供应商的默认模型再转发；在公布集合里的模型（含用户显式配置的 gpt-*）
+    /// 不受影响。官方登录（未混入 API）与聚合供应商不适用本映射。
+    /// 供应商配置了自动审批模型（autoReviewModel）时，codex-auto-review 仍按其改写。
+    /// 默认关闭（opt-in）：开启会改写用户手填但没写进 model_list 的模型，不能静默生效。
+    #[serde(rename = "protocolProxyMapUnlistedModels", default)]
+    pub protocol_proxy_map_unlisted_models: bool,
     /// 本地协议代理（helper）单次 HTTP 请求体上限，单位 MiB。
     ///
     /// 默认 128 MiB：1M 上下文窗口的长会话（带截图历史）实测请求体可到 ~50 MB，
@@ -1009,6 +1043,7 @@ impl Default for BackendSettings {
             codex_app_auto_takeover_when_active: default_auto_takeover_when_active(),
             codex_extra_args: Vec::new(),
             provider_sync_enabled: false,
+            thread_model_follow_switch_enabled: false,
             provider_sync_saved_providers: Vec::new(),
             provider_sync_manual_providers: Vec::new(),
             provider_sync_last_selected_provider: String::new(),
@@ -1017,9 +1052,11 @@ impl Default for BackendSettings {
             relay_profiles_enabled: true,
             enhancements_enabled: true,
             codex_app_standalone_quota_unlock: false,
+            codex_app_disable_work_view: false,
             codex_app_plugin_marketplace_unlock: true,
             codex_app_model_whitelist_unlock: true,
             codex_app_session_delete: true,
+            codex_app_side_chat_save: false,
             codex_app_markdown_export: true,
             codex_app_session_share: true,
             codex_app_usage_status_line: true,
@@ -1039,6 +1076,7 @@ impl Default for BackendSettings {
             codex_app_pet_real_mouse_look: false,
             codex_app_activity_overlay_right: false,
             codex_app_capacity_auto_retry: false,
+            codex_app_turn_rewind: false,
             codex_app_whale_widget_enabled: false,
             codex_app_whale_balance_protocol: default_whale_balance_protocol(),
             codex_app_whale_balance_path: String::new(),
@@ -1099,6 +1137,7 @@ impl Default for BackendSettings {
             protocol_proxy_auto_retry_mode: default_protocol_proxy_auto_retry_mode(),
             protocol_proxy_auto_retry_commit_delay_ms:
                 default_protocol_proxy_auto_retry_commit_delay_ms(),
+            protocol_proxy_map_unlisted_models: false,
             helper_max_request_body_mib: default_helper_max_request_body_mib(),
             tools: BTreeMap::new(),
             active_tool: ToolId::Codex,
@@ -1164,6 +1203,7 @@ impl BackendSettings {
                 web_search_history_compat: false,
                 trust_upstream_catalog_lite: false,
                 strict_responses_reasoning: false,
+                auto_review_model: String::new(),
                 anthropic_auth_header: String::new(),
                 anthropic_max_tokens: 0,
                 anthropic_prompt_cache: true,
@@ -1230,6 +1270,7 @@ impl BackendSettings {
             web_search_history_compat: false,
             trust_upstream_catalog_lite: false,
             strict_responses_reasoning: false,
+            auto_review_model: String::new(),
             anthropic_auth_header: String::new(),
             anthropic_max_tokens: 0,
             anthropic_prompt_cache: true,
@@ -1293,6 +1334,7 @@ impl BackendSettings {
             || self.active_relay_profile().uses_independent_proxy()
             || self.active_relay_profile().web_search_history_compat_enabled()
             || self.active_relay_profile().request_compatibility_enabled()
+            || self.active_relay_profile().rewrites_auto_review_model()
     }
 
     pub fn active_relay_uses_protocol_proxy(&self) -> bool {
@@ -2220,6 +2262,12 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     if let Some(value) = source.get("providerSyncEnabled").and_then(Value::as_bool) {
         target.insert("providerSyncEnabled".to_string(), Value::Bool(value));
     }
+    if let Some(value) = source
+        .get("threadModelFollowSwitchEnabled")
+        .and_then(Value::as_bool)
+    {
+        target.insert("threadModelFollowSwitchEnabled".to_string(), Value::Bool(value));
+    }
     if let Some(value) = source.get("ccsDbPath").and_then(Value::as_str) {
         target.insert(
             "ccsDbPath".to_string(),
@@ -2232,6 +2280,8 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     // 协议代理自动重试：管理器整份保存也会经过 normalize，这里补上部分更新路径，
     // 保证任何走 /settings/set 的调用都不会被静默丢弃。
     merge_bool_setting(target, source, "protocolProxyAutoRetry");
+    // 目录外模型映射开关同上：漏登记会让 /settings/set 补丁「保存了但没生效」。
+    merge_bool_setting(target, source, "protocolProxyMapUnlistedModels");
     if let Some(value) = source
         .get("protocolProxyAutoRetryMaxAttempts")
         .and_then(Value::as_u64)
@@ -2293,9 +2343,11 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
         target.insert("enhancementsEnabled".to_string(), Value::Bool(value));
     }
     merge_bool_setting(target, source, "codexAppStandaloneQuotaUnlock");
+    merge_bool_setting(target, source, "codexAppDisableWorkView");
     merge_bool_setting(target, source, "codexAppPluginMarketplaceUnlock");
     merge_bool_setting(target, source, "codexAppModelWhitelistUnlock");
     merge_bool_setting(target, source, "codexAppSessionDelete");
+    merge_bool_setting(target, source, "codexAppSideChatSave");
     merge_bool_setting(target, source, "codexAppMarkdownExport");
     merge_bool_setting(target, source, "codexAppSessionShare");
     merge_bool_setting(target, source, "codexAppUsageStatusLine");
@@ -2318,6 +2370,7 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     merge_bool_setting(target, source, "codexAppPetRealMouseLook");
     merge_bool_setting(target, source, "codexAppActivityOverlayRight");
     merge_bool_setting(target, source, "codexAppCapacityAutoRetry");
+    merge_bool_setting(target, source, "codexAppTurnRewind");
     merge_bool_setting(target, source, "codexAppWhaleWidgetEnabled");
     if let Some(value @ ("auto" | "custom" | "off")) =
         source.get("codexAppWhaleBalanceProtocol").and_then(Value::as_str)
@@ -3145,6 +3198,9 @@ pub fn atomic_write_with(
         if let Some(permissions) = existing_permissions {
             temp_file.set_permissions(permissions)?;
         }
+        // rename 前必须落盘：只 flush 时内容可能还在页缓存里，断电或蓝屏后会留下
+        // 已经替换成功、内容却全是 NUL 的 config.toml（#2450）。
+        temp_file.sync_all()?;
         Ok(())
     })();
     if let Err(error) = write_result {
@@ -4283,6 +4339,20 @@ experimental_bearer_token = "sk-existing""#
     }
 
     #[test]
+    fn settings_store_update_persists_disable_work_view_flag() {
+        // 前端开关已上线，后端白名单漏掉这个键时开关永远不生效（#2632）。
+        let dir = temp_dir();
+        let store = SettingsStore::new(dir.join("settings.json"));
+        store.save(&BackendSettings::default()).unwrap();
+        assert!(!store.load().unwrap().codex_app_disable_work_view);
+
+        let updated = store.update(json!({ "codexAppDisableWorkView": true })).unwrap();
+
+        assert!(updated.codex_app_disable_work_view);
+        assert!(store.load().unwrap().codex_app_disable_work_view);
+    }
+
+    #[test]
     fn settings_store_update_only_mutates_present_known_fields() {
         let dir = temp_dir();
         let store = SettingsStore::new(dir.join("settings.json"));
@@ -4298,6 +4368,7 @@ experimental_bearer_token = "sk-existing""#
             "codexAppPath": "C:\\Portable\\Codex\\Codex.exe",
             "enhancementsEnabled": false,
             "codexAppSessionDelete": false,
+            "codexAppSideChatSave": true,
             "codexAppConversationView": true,
             "codexAppThreadIdBadge": true,
             "codexAppNativeFastUnlock": true,
@@ -4314,6 +4385,7 @@ experimental_bearer_token = "sk-existing""#
         assert_eq!(updated.codex_app_path, r"C:\Portable\Codex\Codex.exe");
         assert!(!updated.enhancements_enabled);
         assert!(!updated.codex_app_session_delete);
+        assert!(updated.codex_app_side_chat_save);
         assert!(updated.codex_app_conversation_view);
         assert!(updated.codex_app_thread_id_badge);
         assert!(updated.codex_app_native_fast_unlock);
@@ -5033,6 +5105,19 @@ experimental_bearer_token = "sk-existing""#
         let reloaded = store.load().unwrap();
         assert!(reloaded.codex_app_auto_takeover);
         assert_eq!(reloaded.codex_app_auto_takeover_when_active, "immediate");
+    }
+
+    #[test]
+    fn turn_rewind_is_opt_in_and_round_trips_through_settings_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        assert!(!BackendSettings::default().codex_app_turn_rewind);
+        store.save(&BackendSettings::default()).unwrap();
+        let updated = store.update(json!({ "codexAppTurnRewind": true })).unwrap();
+        assert!(updated.codex_app_turn_rewind);
+        assert!(store.load().unwrap().codex_app_turn_rewind);
+        store.update(json!({ "codexAppTurnRewind": false })).unwrap();
+        assert!(!store.load().unwrap().codex_app_turn_rewind);
     }
 
 }
