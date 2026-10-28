@@ -12,8 +12,21 @@
     if (loaded && typeof syncCodexPlusCapacityAutoRetry === "function") runScanStep(syncCodexPlusCapacityAutoRetry);
     // 后端可用后预取设置项清单，首次打开设置页时不必再等一次请求。
     if (loaded && typeof loadCodexPlusSettingsCatalog === "function") void loadCodexPlusSettingsCatalog();
+    // 读到设置后立即补一次皮肤，不等下一轮 DOM 变更触发扫描（#2680）。
+    if (loaded && typeof refreshDreamSkin === "function") runScanStep(refreshDreamSkin);
     globalThis.__CODEX_PLUS_ACTIVITY_OVERLAY_SYNC__?.();
     return loaded;
+  }
+
+  /**
+   * 启动期读取后端设置的重试间隔；返回 -1 表示停止。
+   * 前 60 次每 250ms 一次（约 15 秒，覆盖常规启动）；之后按指数退避到 5 秒封顶再试 30 次，
+   * 重启 Codex 后首次桥接超时、页面被启动壳自救重载这类慢启动也能补上设置与皮肤（#2680）。
+   */
+  function backendSettingsStartupRetryDelay(attempt) {
+    if (attempt < 60) return 250;
+    if (attempt >= 90) return -1;
+    return Math.min(5000, 250 * 2 ** (attempt - 59));
   }
 
   function loadBackendSettingsForStartup(attempt = 0) {
@@ -22,8 +35,9 @@
         scan();
         return;
       }
-      if (attempt < 60) {
-        setTimeout(() => loadBackendSettingsForStartup(attempt + 1), 250);
+      const delay = backendSettingsStartupRetryDelay(attempt);
+      if (delay >= 0) {
+        setTimeout(() => loadBackendSettingsForStartup(attempt + 1), delay);
       }
     });
   }
@@ -40,6 +54,8 @@
         runScanStep(syncCodexPlusTypingEffects);
         if (typeof syncCodexPlusAgentPet === "function") runScanStep(syncCodexPlusAgentPet);
         if (typeof syncCodexPlusCapacityAutoRetry === "function") runScanStep(syncCodexPlusCapacityAutoRetry);
+        // 启动期读取全部失败时，心跳是之后唯一的设置来源；读到就补一次皮肤（#2680）。
+        if (typeof refreshDreamSkin === "function") runScanStep(refreshDreamSkin);
         globalThis.__CODEX_PLUS_ACTIVITY_OVERLAY_SYNC__?.();
         // 管理器里改的设置：设置页开着时，开关与随总开关切换的说明也跟着变。
         syncCodexPlusBackendToggleButtons();
@@ -67,6 +83,11 @@
           enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
           codexAppNativeFastUnlock: codexPlusBackendSettings.codexAppNativeFastUnlock === true,
           nativeFastLocalApiConfigured: codexPlusBackendSettings.nativeFastLocalApiConfigured === true,
+        });
+        globalThis.window?.__codexPlusNativePredictions?.runtime?.update?.({
+          enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
+          codexAppNativePredictions: codexPlusBackendSettings.codexAppNativePredictions === true,
+          nativePredictionsLocalApiConfigured: codexPlusBackendSettings.nativePredictionsLocalApiConfigured === true,
         });
         globalThis.__CODEX_PLUS_ACTIVITY_OVERLAY_SYNC__?.();
       }
@@ -1355,6 +1376,19 @@
     });
   }
 
+  // 与管理器增强页一致：「（实验）」从标题里拿出来做成小标签；说明里写了要重启 Codex 的，标题旁加「需重启」。
+  const codexPlusExperimentalTitle = /\s*(?:（实验性?）|\(experimental\))$/i;
+  const codexPlusRestartHint = /重启 ?Codex|重新启动 ?Codex|下次启动 ?Codex|restart(?:ing)? Codex|relaunch/i;
+
+  function renderCodexPlusSettingsCatalogTitle(item, description) {
+    const experimental = codexPlusExperimentalTitle.test(item.title);
+    const tags = [
+      experimental ? '<em class="codex-plus-feature-tag" data-tone="experimental">实验</em>' : "",
+      codexPlusRestartHint.test(description) ? '<em class="codex-plus-feature-tag">需重启</em>' : "",
+    ].join("");
+    return escapeHtml(experimental ? item.title.replace(codexPlusExperimentalTitle, "") : item.title) + tags;
+  }
+
   function renderCodexPlusSettingsCatalogRow(item) {
     const title = escapeHtml(item.title);
     let control = "";
@@ -1370,11 +1404,12 @@
     // 不认识的控件类型宁可不显示，也不显示一个点了不生效的行。
     if (!control) return "";
     // 独立模式补丁在增强开启时换一句说明，与管理器一致；切换由 syncCodexPlusSettingsCatalogDescriptions 完成。
-    const description = escapeHtml(codexPlusSettingsCatalogDescription(item));
+    const rawDescription = codexPlusSettingsCatalogDescription(item);
+    const description = escapeHtml(rawDescription);
     const descriptionData = item.descriptionWhenEnhancementsOn ? ` data-codex-plus-setting-description="${escapeHtml(item.key)}"` : "";
     return `
                 <div class="codex-plus-row" data-codex-plus-setting-row="${escapeHtml(item.key)}">
-                  <div><div class="codex-plus-row-title">${title}</div><div class="codex-plus-row-description"${descriptionData}>${description}</div></div>
+                  <div><div class="codex-plus-row-title">${renderCodexPlusSettingsCatalogTitle(item, rawDescription)}</div><div class="codex-plus-row-description"${descriptionData}>${description}</div></div>
                   ${control}
                 </div>`;
   }
@@ -1397,11 +1432,16 @@
                 </div>`;
       return renderCodexPlusSettingsSection("设置", renderCodexPlusBackendStatusRow() + state);
     }
+    // #686：「上下文感知建议」读写的是 Codex 自己的设置，不在后端清单里；放进 stepwise 组，
+    // 清单没有这一组时退到 chat 组，再不行放第一组，保证总能看到。
+    const ambientGroupId = ["stepwise", "chat"].find((id) => catalog.groups.some((group) => group.id === id))
+      || catalog.groups[0]?.id;
     return catalog.groups.map((group, index) => {
       const rows = catalog.items
         .filter((item) => item.group === group.id && codexPlusSettingsCatalogItemVisible(item))
         .map(renderCodexPlusSettingsCatalogRow)
         .filter(Boolean);
+      if (group.id === ambientGroupId) rows.push(renderCodexAmbientSuggestionsRow());
       if (index === 0) rows.unshift(renderCodexPlusBackendStatusRow());
       return rows.length ? renderCodexPlusSettingsSection(group.title, rows.join("")) : "";
     }).join("");
@@ -1425,6 +1465,7 @@
     if (!rendered) return;
     renderBackendStatus();
     refreshCodexPlusBackendToggles();
+    syncCodexAmbientSuggestionsToggles();
   }
 
   function openCodexPlusModal(options = {}) {
@@ -1701,6 +1742,12 @@
         overlay.querySelector(".codex-plus-extensions-back")?.focus({ preventScroll: true });
         return;
       }
+      const ambientToggle = target?.closest("[data-codex-app-ambient-suggestions]");
+      if (ambientToggle) {
+        if (ambientToggle.disabled || ambientToggle.dataset.pending === "true") return;
+        void setCodexAmbientSuggestionsEnabled(ambientToggle.dataset.enabled !== "true");
+        return;
+      }
       const toggle = target?.closest("[data-codex-plus-setting]");
       if (toggle) {
         if (toggle.disabled || toggle.dataset.pending === "true") return;
@@ -1758,6 +1805,8 @@
     refreshCodexPlusBackendToggles();
     renderBackendStatus();
     loadUserScripts();
+    // 每次打开都重读一次：用户可能在 Codex 设置页（官方登录时可见）改过。
+    void loadCodexAmbientSuggestionsSetting();
     // 清单已缓存时上面的模板已经按清单渲染；否则读完后再替换“正在读取”占位。
     if (!codexPlusSettingsCatalog) void loadCodexPlusSettingsCatalog();
   }

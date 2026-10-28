@@ -61,6 +61,10 @@ const BROWSER_LOGIN_COMMANDS: Record<Exclude<AccountKind, "copilot">, string> = 
 /** 表单弹窗的用途：按预设新建、自定义新建、编辑已有供应商。 */
 type FormState = ProviderFormState;
 
+/** 详情里模型超过 MODEL_CHIP_COLLAPSE 个时先只列前 MODEL_CHIP_PREVIEW 个，其余点开再看。 */
+const MODEL_CHIP_PREVIEW = 12;
+const MODEL_CHIP_COLLAPSE = 16;
+
 /** 供应商池上次用的视图（切页再回来保持）。 */
 const providersViewMemo: { view: "list" | "models" } = { view: "list" };
 
@@ -420,6 +424,9 @@ function PoolRow({
   // 生图模型单独一行，「模型」里只列能聊天的。
   const imageModels = entry.imageModels ?? [];
   const chatModels = entry.models.filter((model) => !imageModels.some((image) => image.toLowerCase() === model.toLowerCase()));
+  const [allModels, setAllModels] = useState(false);
+  const modelsCollapsible = chatModels.length > MODEL_CHIP_COLLAPSE;
+  const shownModels = modelsCollapsible && !allModels ? chatModels.slice(0, MODEL_CHIP_PREVIEW) : chatModels;
   const [reasoningOpen, setReasoningOpen] = useState(false);
   const reasoning = reasoningSummary(entry);
   const saveReasoning = async (modelMetadata: string) => {
@@ -434,8 +441,8 @@ function PoolRow({
     if (await run(`models:${entry.id}`, "save_gateway_provider_models", { id: entry.id, models, defaultModel }, t("保存模型列表"))) setModelsOpen(false);
   };
   const price = priceSummary(entry);
-  // ChatGPT 订阅账号和 Copilot 能查额度（ChatGPT API 账号按量计费，没有额度窗口）。
-  const quotaSupported = entry.account === "chatgpt" || entry.account === "copilot";
+  // ChatGPT 订阅账号、Copilot 和 SuperGrok 能查额度（ChatGPT API 账号按量计费，没有额度窗口）。
+  const quotaSupported = entry.account === "chatgpt" || entry.account === "copilot" || entry.account === "grok";
   const saveExtras = async (nextPrice: ProviderPrice | null, modelPrices: Record<string, ProviderPrice> | null, proxy: string) => {
     const title = extrasOpen === "proxy" ? t("保存代理") : t("保存价格");
     if (await run(`extras:${entry.id}`, "save_gateway_provider_extras", { id: entry.id, price: nextPrice, modelPrices, proxy }, title)) setExtrasOpen(null);
@@ -493,9 +500,25 @@ function PoolRow({
           <div className="gw-detail-row">
             <span className="gw-detail-label">{t("模型")}</span>
             <div className="gw-detail-value gw-chip-row">
-              {chatModels.map((model) => <code className="gw-chip" key={model}>{`${entry.id}/${model}`}</code>)}
+              {shownModels.map((model) => <code className="gw-chip" key={model}>{`${entry.id}/${model}`}</code>)}
               {chatModels.length === 0 ? <span className="gw-muted">{t("未配置模型")}</span> : null}
+              {modelsCollapsible ? (
+                <button className="gw-text-button" onClick={() => setAllModels(!allModels)} type="button">
+                  {allModels ? t("收起") : tf("显示全部 {0} 个模型", [chatModels.length])}
+                </button>
+              ) : null}
               <button className="gw-text-button" disabled={busy !== null} onClick={() => setModelsOpen(true)} type="button">{t("编辑")}</button>
+              {/* 一键拉上游：新增的直接加进列表，已有的不删；要删下架的进「编辑」。 */}
+              <button
+                className="gw-text-button gw-sync-button"
+                disabled={busy !== null}
+                onClick={() => void run(`fetch-models:${entry.id}`, "fetch_gateway_provider_models", { id: entry.id }, t("从上游获取"))}
+                title={t("用已保存的 Key 或登录重新获取，新增的模型直接加进列表")}
+                type="button"
+              >
+                <RefreshCw className={busy === `fetch-models:${entry.id}` ? "h-3.5 w-3.5 animate-spin" : "h-3.5 w-3.5"} />
+                {t("从上游获取")}
+              </button>
             </div>
           </div>
           {imageModels.length ? (

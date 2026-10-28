@@ -15,6 +15,8 @@ use serde_json::{Map, Value, json};
 use crate::relay_rotation::{RotationContext, RotationEvent};
 use crate::settings::{RelayProtocol, SettingsStore};
 
+mod local_compaction;
+
 pub const DEFAULT_PROTOCOL_PROXY_PORT: u16 = 57321;
 
 /// 工具调用上需要跨 turn 原样带回的供应商附带数据，按 `call_id` 索引。
@@ -1770,13 +1772,16 @@ fn chat_completion_to_response_with_context(
     if let Some(reasoning) = chat_reasoning_to_response_output_item(message, &response_id) {
         output.push(reasoning);
     }
-    if let Some(message) = chat_message_to_response_output_item(message, &response_id) {
+    let tool_items = chat_tool_calls_to_response_output_items(message, tool_context);
+    if let Some(mut message) = chat_message_to_response_output_item(message, &response_id) {
+        // 与流式转换一致：无工具调用的消息即本轮最终回答（issue #2659，设置里打开才补）。
+        if message_phase_fill_enabled() {
+            message["phase"] =
+                json!(if tool_items.is_empty() { "final_answer" } else { "commentary" });
+        }
         output.push(message);
     }
-    output.extend(chat_tool_calls_to_response_output_items(
-        message,
-        tool_context,
-    ));
+    output.extend(tool_items);
 
     let invalid_web_search = output.iter().any(invalid_web_search_output_item);
     let mut response = json!({
@@ -1880,6 +1885,14 @@ struct ModelRouteSelection {
 impl UpstreamProxyResponse {
     pub fn status(&self) -> String {
         http_status_line(self.status_code)
+    }
+
+    /// 适配过的响应要按哪些工具改写还原；没有记录时按 exec 兼容重试处理。
+    pub(crate) fn tool_adaptation(&self) -> crate::responses_exec::ToolAdaptation {
+        self.exec_outcome
+            .as_ref()
+            .map(|outcome| outcome.adaptation().clone())
+            .unwrap_or_else(crate::responses_exec::ToolAdaptation::exec)
     }
 
     pub fn is_success(&self) -> bool {
@@ -3335,8 +3348,12 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     live_request_id: Option<&str>,
     forced: Option<ForcedRelay>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
+    set_message_phase_fill(settings.codex_app_third_party_reasoning_collapse);
     let mut request_json: Value = serde_json::from_str(body)?;
     expand_local_compaction_history(&mut request_json);
+    let local_compaction_request = !is_responses_compact_proxy_path(request_path)
+        && !request_has_compaction_trigger(&request_json)
+        && local_compaction::is_local_request(&request_json, COMPACTION_SUMMARY_INSTRUCTION);
     let is_stream = request_json
         .get("stream")
         .and_then(Value::as_bool)
@@ -3347,10 +3364,17 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         .map(str::trim)
         .unwrap_or("")
         .to_string();
+    // 聚合指定了审批成员（#2703）时，codex-auto-review 先按它解析，
+    // 不再交给默认成员 / 轮转（默认成员是官方登录时会消耗官方额度）。
     let aggregate_model = match if forced.is_some() {
         Ok(None)
     } else {
-        crate::aggregate_catalog::resolve_active_model(&settings, &source_model)
+        crate::aggregate_catalog::resolve_auto_review_member(&settings, &source_model).and_then(
+            |binding| match binding {
+                Some(binding) => Ok(Some(binding)),
+                None => crate::aggregate_catalog::resolve_active_model(&settings, &source_model),
+            },
+        )
     } {
         Ok(binding) => binding,
         Err(error) => {
@@ -3503,10 +3527,62 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         let probe_native_compaction = request_has_compaction_trigger(&request_json)
             && relay.protocol == RelayProtocol::Responses
             && !is_responses_compact_proxy_path(request_path);
+        let mut logical_body = request_json.clone();
+        if relay.local_compaction_prompt_at_end_enabled()
+            && let Some(model) = model_override.as_deref().map(str::trim).filter(|model| !model.is_empty())
+        {
+            logical_body["model"] = json!(model);
+        }
+        let experimental_local_compaction =
+            local_compaction_request && relay.local_compaction_prompt_at_end_enabled();
+        let cache_key = relay.local_compaction_prompt_at_end_enabled()
+            .then(|| local_compaction::key(&relay, &logical_body, session_headers))
+            .flatten();
+        let cache_context = if !local_compaction_request {
+            cache_key.as_ref()
+                .and_then(|_| local_compaction::RequestContext::from_request(&logical_body))
+        } else {
+            None
+        };
+        let local_candidate = if experimental_local_compaction {
+            cache_key
+                .as_deref()
+                .and_then(|key| local_compaction::candidate(key, &logical_body))
+        } else {
+            None
+        };
+        if experimental_local_compaction {
+            let detail = if let Some(candidate) = &local_candidate {
+                json!({
+                    "relayId":relay.id, "action":"reuse_context",
+                    "contextFieldsMatch":candidate.context_fields_match,
+                    "historyPrefixMatches":candidate.history_prefix_matches
+                })
+            } else {
+                json!({
+                    "relayId":relay.id, "action":"original_request",
+                    "reason":if cache_key.is_some() {
+                        "no_request_context"
+                    } else {
+                        "missing_session_identity"
+                    }
+                })
+            };
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "protocol_proxy.local_compaction",
+                detail,
+            );
+        }
+        let local_exec_adapted = local_candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.exec_adapted);
+        if let Some(candidate) = local_candidate {
+            logical_body = candidate.body;
+        }
         let (mut endpoint, mut upstream_body, mut wire_api, compaction) =
             match upstream_request_parts(
                 &relay,
-                request_json.clone(),
+                logical_body,
                 request_path,
                 model_override.as_deref(),
                 preserve_native_request,
@@ -3530,6 +3606,28 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         let legacy_native_compaction = relay.protocol == RelayProtocol::Responses
             && is_responses_compact_proxy_path(request_path);
         let is_compaction_request = compaction || probe_native_compaction || legacy_native_compaction;
+        // xAI 的 Responses 接口不认 Codex 的 custom / namespace / 客户端 tool_search 等，
+        // 带上就整包拒绝：发出前整理请求，响应再按记录还原（见 xai_responses）。
+        let xai_upstream =
+            wire_api == UpstreamWireApi::Responses && upstream_rejects_custom_tools(&relay);
+        let mut forced_adaptation = crate::responses_exec::ToolAdaptation::default();
+        if xai_upstream {
+            let (shaped, adaptation) = crate::xai_responses::shape_request(upstream_body)?;
+            upstream_body = shaped;
+            forced_adaptation = adaptation;
+        }
+        let relay = if xai_upstream {
+            crate::xai_responses::with_conversation_header(relay, &upstream_body)
+        } else {
+            relay
+        };
+        if local_exec_adapted
+            && wire_api == UpstreamWireApi::Responses
+            && !xai_upstream
+        {
+            // 声明与当前全部历史同时转换，不能对已转换的声明再拼入原始新工具结果。
+            upstream_body = crate::responses_exec::adapt_request(upstream_body)?;
+        }
         request_trace.relay_id = relay.id.clone();
         request_trace.relay_name = relay.name.clone();
         request_trace.wire_api = upstream_wire_api_label(wire_api).to_string();
@@ -3559,11 +3657,19 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             }),
         );
         let user_agent = effective_user_agent(&relay.user_agent, original_user_agent);
+        let forced_adapted = !forced_adaptation.is_empty();
+        let adapted_tools = if forced_adapted {
+            forced_adaptation
+        } else {
+            crate::responses_exec::ToolAdaptation::exec()
+        };
         let eligible = wire_api == UpstreamWireApi::Responses
+            && !xai_upstream
             && !is_compaction_request
+            && !experimental_local_compaction
             && crate::responses_exec::should_adapt_request(&upstream_body, request_path);
         let mut key = None;
-        let mut exec_adapted = false;
+        let mut exec_adapted = forced_adapted;
         let send = async {
             let builder = build_responses_upstream_request(
                 &relay, &endpoint, &upstream_body, wire_api, is_stream,
@@ -4112,6 +4218,14 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 continue 'request_attempts;
             }
         }
+        if (200..300).contains(&status_code)
+            && !local_compaction_request
+            && !is_compaction_request
+            && let Some(key) = cache_key
+        {
+            // buffered 模式会提前返回，也必须记录普通请求的逻辑上下文字段。
+            local_compaction::remember(key, cache_context, exec_adapted);
+        }
         // 200 的流式响应也可能带着 response.failed（官方 server_overloaded
         // 就是先回 200 再在流里失败）。在向 Codex 写出任何字节前先预读；
         // 若识别到容量失败就退避后重发同一次上游请求。
@@ -4120,6 +4234,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             && (200..300).contains(&status_code)
             && wire_api == UpstreamWireApi::Responses
             && !is_compaction_request
+            && !experimental_local_compaction
             && !exec_adapted
             && auto_retry.is_some()
             && buffered_mode
@@ -4200,6 +4315,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             && (200..300).contains(&status_code)
             && wire_api == UpstreamWireApi::Responses
             && !is_compaction_request
+            && !experimental_local_compaction
             && !exec_adapted
             && auto_retry.is_some()
         {
@@ -4322,13 +4438,24 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             request_trace: Some(request_trace),
             exec_adapted,
             exec_outcome: (exec_adapted && (200..300).contains(&status_code)).then(|| {
-                crate::responses_exec_transport::ExecOutcome::new(
-                    key.expect("adapted request has a cache identity"), &settings,
-                )
+                crate::responses_exec_transport::ExecOutcome::new(key, adapted_tools, &settings)
             }),
             response: Some(upstream),
         });
     }
+}
+
+/// xAI 的 Responses 接口（api.x.ai 与 SuperGrok 订阅代理）只认 function 等内置工具类型，
+/// 不认 Codex 的 custom 工具、namespace、客户端执行的 tool_search 等，请求要先整理。
+fn upstream_rejects_custom_tools(relay: &crate::settings::RelayProfile) -> bool {
+    reqwest::Url::parse(relay.base_url.trim())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| {
+            ["x.ai", "grok.com"]
+                .iter()
+                .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+        })
 }
 
 /// 目录外模型名 → 当前供应商默认模型的映射（#1183 / #1446 / #1457）。
@@ -4427,7 +4554,7 @@ fn select_model_route(
     if target_relay_id == source.id {
         anyhow::bail!("模型路由不能指向当前供应商自身：{model}");
     }
-    let target = settings
+    let mut target = settings
         .relay_profiles
         .iter()
         .find(|profile| profile.id == target_relay_id)
@@ -4439,6 +4566,7 @@ fn select_model_route(
     if target.protocol != RelayProtocol::Responses {
         anyhow::bail!("模型路由目标必须使用 Responses API：{}", target.name);
     }
+    target.local_compaction_prompt_at_end |= source.local_compaction_prompt_at_end_enabled();
 
     let upstream_model = if route.target_model.trim().is_empty() {
         model.to_string()
@@ -5024,8 +5152,67 @@ fn project_strict_reasoning_history(body: &mut Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Responses 托管生图工具的类型名。
+const IMAGE_GENERATION_TOOL_TYPE: &str = "image_generation";
+
+fn is_image_generation_tool(tool: &Value) -> bool {
+    tool.get("type").and_then(Value::as_str) == Some(IMAGE_GENERATION_TOOL_TYPE)
+}
+
+/// 从 Responses 请求里移除托管生图工具：顶层 `tools`、以输入项形式交来的
+/// `additional_tools`，以及指向它的 `tool_choice`。工具删空时连 `tool_choice` 一起去掉，
+/// 免得 `required` 落在空工具表上。返回是否改动过请求。
+pub fn strip_image_generation_tool(body: &mut Value) -> bool {
+    let Some(object) = body.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    if let Some(Value::Array(items)) = object.get_mut("input") {
+        for item in items.iter_mut() {
+            if item.get("type").and_then(Value::as_str) == Some("additional_tools")
+                && let Some(Value::Array(tools)) = item.get_mut("tools")
+            {
+                let before = tools.len();
+                tools.retain(|tool| !is_image_generation_tool(tool));
+                changed |= tools.len() != before;
+            }
+        }
+    }
+    let mut tools_emptied = false;
+    if let Some(Value::Array(tools)) = object.get_mut("tools") {
+        let before = tools.len();
+        tools.retain(|tool| !is_image_generation_tool(tool));
+        if tools.len() != before {
+            changed = true;
+            tools_emptied = tools.is_empty();
+        }
+    }
+    if tools_emptied {
+        object.remove("tools");
+        object.remove("tool_choice");
+        return true;
+    }
+    match object.get_mut("tool_choice") {
+        // 指名要生图工具：工具已不在，退回默认的自动选择。
+        Some(choice) if is_image_generation_tool(choice) => {
+            object.remove("tool_choice");
+            changed = true;
+        }
+        // allowed_tools 白名单里的生图工具也一并去掉。
+        Some(choice) => {
+            if let Some(Value::Array(allowed)) = choice.get_mut("tools") {
+                let before = allowed.len();
+                allowed.retain(|tool| !is_image_generation_tool(tool));
+                changed |= allowed.len() != before;
+            }
+        }
+        None => {}
+    }
+    changed
+}
+
 /// Codex 自动审批（「替我审批」）请求使用的固定模型 slug。
-const CODEX_AUTO_REVIEW_MODEL: &str = "codex-auto-review";
+const CODEX_AUTO_REVIEW_MODEL: &str = crate::aggregate_catalog::CODEX_AUTO_REVIEW_MODEL;
 
 /// codex-auto-review 的改写目标：供应商配置了审批模型（#1446）时返回它，否则 `None`。
 /// 目录外模型映射（#1183）也用它判断是否让路，两处共用同一条规则。
@@ -5083,6 +5270,14 @@ async fn upstream_request_parts(
     if reasoning_mode == "omit" { strip_reasoning_parameters(&mut request_json); }
     if relay.protocol == RelayProtocol::Responses && relay.strict_responses_reasoning && compatibility_enabled {
         project_strict_reasoning_history(&mut request_json)?;
+    }
+    // #228：Codex App 固定带托管生图工具，不支持生图的第三方 Responses 上游会整条拒绝；
+    // 供应商打开「移除托管生图工具」时在转发前去掉。直连代理与 2.0 网关都经过这里。
+    if relay.strips_image_generation_tool() && strip_image_generation_tool(&mut request_json) {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "protocol_proxy.strip_image_generation_tool",
+            json!({ "relayId": relay.id }),
+        );
     }
     let mut body = match relay.protocol {
         RelayProtocol::Responses => request_json,
@@ -5504,7 +5699,8 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
     if wire_api == UpstreamWireApi::Responses {
         let body = if upstream.exec_adapted {
             let (body, valid) = if is_stream {
-                let mut converter = crate::responses_exec_sse::ExecSseAdapter::new();
+                let mut converter =
+                    crate::responses_exec_sse::ExecSseAdapter::for_adaptation(upstream.tool_adaptation());
                 let mut bytes = match converter.push_bytes(&upstream_body) {
                     Ok(bytes) => bytes,
                     Err(_) => converter.fail(),
@@ -5512,7 +5708,10 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
                 bytes.extend(converter.finish()?);
                 (bytes, converter.succeeded())
             } else {
-                crate::responses_exec_transport::adapted_json(&upstream_body)
+                crate::responses_exec_transport::adapted_json(
+                    &upstream_body,
+                    &upstream.tool_adaptation(),
+                )
             };
             if let Some(outcome) = upstream.exec_outcome.as_mut() {
                 outcome.finish(valid);
@@ -6363,13 +6562,19 @@ impl ChatSseState {
             return;
         }
         let output_index = self.text.output_index.unwrap_or(0);
-        let item = json!({
+        // 文本在整段流结束时才收尾，此时已知本响应有没有工具调用：没有工具调用时
+        // 它就是本轮最终回答，Codex 桌面端据此折叠前面的过程（issue #2659）。
+        let mut item = json!({
             "id": self.text.item_id,
             "type": "message",
             "status": "completed",
             "role": "assistant",
             "content": [{ "type": "output_text", "text": self.text.text, "annotations": [] }]
         });
+        if message_phase_fill_enabled() {
+            item["phase"] =
+                json!(if self.tools.is_empty() { "final_answer" } else { "commentary" });
+        }
         self.output_items.push((output_index, item.clone()));
         self.text.done = true;
         push_sse(
@@ -6604,6 +6809,72 @@ pub(crate) fn http_status_line(status: u16) -> String {
     }
 }
 
+/// 网关里的上游失败（#2741）：Codex 只显示错误消息，池里有好几家时看不出是哪一家、
+/// 哪个模型、什么状态码出的错。在消息末尾补上这些；`type` / `code` 不动——Codex 按它们
+/// 判断重试与提示文案。没有路由信息（请求没发到任何上游）时不改。
+pub fn annotate_gateway_upstream_error(
+    error: &mut Value,
+    status_code: u16,
+    trace: Option<&crate::request_log::RequestTrace>,
+) {
+    let Some(trace) = trace else {
+        return;
+    };
+    let relay = if trace.relay_name.trim().is_empty() {
+        trace.relay_id.trim()
+    } else {
+        trace.relay_name.trim()
+    };
+    if relay.is_empty() {
+        return;
+    }
+    let mut origin = format!("网关上游：{relay}");
+    if !trace.upstream_model.trim().is_empty() {
+        origin.push_str(&format!(" · 模型 {}", trace.upstream_model.trim()));
+    }
+    if !trace.wire_api.trim().is_empty() {
+        origin.push_str(&format!(" · {}", trace.wire_api.trim()));
+    }
+    origin.push_str(&format!(" · HTTP {status_code}"));
+    let Some(object) = error.get_mut("error").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let message = object
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let annotated = if message.is_empty() {
+        origin
+    } else {
+        format!("{message}（{origin}）")
+    };
+    object.insert("message".to_string(), Value::String(annotated));
+}
+
+/// 请求日志里记的上游错误：状态码、类型 / code、提取出的消息，外加响应体原文预览（#2741）。
+/// 提取出的消息可能只是一句概括（Google 系错误的 details、中转附带的说明都在别的字段里），
+/// 日志里留一份原文才能定位；只进本地请求日志，不发给客户端。
+pub fn upstream_error_log_text(status_code: u16, error: &Value, body: &[u8]) -> String {
+    let inner = error.get("error").unwrap_or(error);
+    let mut text = format!("HTTP {status_code}");
+    for key in ["type", "code"] {
+        if let Some(value) = inner.get(key).and_then(Value::as_str).filter(|value| !value.is_empty()) {
+            text.push_str(&format!(" · {key}={value}"));
+        }
+    }
+    let message = inner.get("message").and_then(Value::as_str).unwrap_or_default().trim();
+    if !message.is_empty() {
+        text.push_str(&format!("：{message}"));
+    }
+    let raw = truncate_error_preview(String::from_utf8_lossy(body).trim());
+    if !raw.is_empty() && !message.contains(raw.as_str()) {
+        text.push_str(&format!("\n上游原文：{raw}"));
+    }
+    text
+}
+
 pub fn responses_error_from_upstream(status_code: u16, content_type: &str, body: &[u8]) -> Value {
     let (message, error_type, code, param) = upstream_error_parts(status_code, content_type, body);
     let mut error = json!({
@@ -6626,6 +6897,15 @@ pub(crate) fn upstream_error_parts(
 ) -> (String, Option<String>, Option<String>, Option<String>) {
     if content_type.to_ascii_lowercase().contains("json") {
         if let Ok(value) = serde_json::from_slice::<Value>(body) {
+            // Gemini 的 OpenAI 兼容端点把错误包在单元素数组里：`[{"error":{...}}]`（#2741）。
+            // 不拆开时整段数组被当成消息、类型与状态码都丢了，看不出是哪种错误。
+            let value = match value {
+                Value::Array(mut items) if items.len() == 1 && items[0].is_object() => {
+                    items.remove(0)
+                }
+                other => other,
+            };
+            let wrapped = value.get("error").is_some_and(Value::is_object);
             let error = value.get("error").unwrap_or(&value);
             let message = error
                 .get("message")
@@ -6636,9 +6916,12 @@ pub(crate) fn upstream_error_parts(
                 .filter(|value| !value.is_empty())
                 .map(ToString::to_string)
                 .unwrap_or_else(|| truncate_error_preview(&value.to_string()));
+            // Google 系错误没有 type，用 `status`（如 INVALID_ARGUMENT）补上；
+            // 只认 `error` 对象里的，免得把顶层 `{"status":"failed"}` 这类包装误当类型。
             let error_type = error
                 .get("type")
                 .or_else(|| error.get("error_type"))
+                .or_else(|| wrapped.then(|| error.get("status")).flatten())
                 .and_then(Value::as_str)
                 .map(ToString::to_string);
             let code = error.get("code").and_then(|value| {
@@ -8754,7 +9037,7 @@ fn dedup_chat_tools_by_name(tools: &mut Vec<Value>) {
     });
 }
 
-fn combine_namespace_description(namespace_description: &str, child_description: &str) -> String {
+pub(crate) fn combine_namespace_description(namespace_description: &str, child_description: &str) -> String {
     let namespace_description = namespace_description.trim();
     let child_description = child_description.trim();
     match (
@@ -8768,7 +9051,7 @@ fn combine_namespace_description(namespace_description: &str, child_description:
     }
 }
 
-fn flatten_namespace_tool_name(namespace: &str, name: &str) -> String {
+pub(crate) fn flatten_namespace_tool_name(namespace: &str, name: &str) -> String {
     if namespace.is_empty() {
         return name.to_string();
     }
@@ -10776,6 +11059,29 @@ mod relay_custom_header_tests {
     }
 
     #[test]
+    fn only_xai_upstreams_get_custom_tools_rewritten() {
+        let relay = |base_url: &str| crate::settings::RelayProfile {
+            base_url: base_url.to_string(),
+            ..Default::default()
+        };
+        for base_url in [
+            "https://cli-chat-proxy.grok.com/v1",
+            "https://api.x.ai/v1",
+            " https://API.X.AI/v1 ",
+        ] {
+            assert!(upstream_rejects_custom_tools(&relay(base_url)), "{base_url}");
+        }
+        for base_url in [
+            "https://api.openai.com/v1",
+            "https://notx.ai/v1",
+            "https://x.ai.example.com/v1",
+            "",
+        ] {
+            assert!(!upstream_rejects_custom_tools(&relay(base_url)), "{base_url}");
+        }
+    }
+
+    #[test]
     fn upstream_request_carries_custom_headers() {
         let request = build_upstream_request(&relay_with(vec![header("X-Tenant", "acme")]));
         assert_eq!(request.headers().get("x-tenant").unwrap(), "acme");
@@ -10992,6 +11298,7 @@ mod unlisted_model_mapping_tests {
             routes: Vec::new(),
             default_relay_id: String::new(),
             sync_default_member_login: false,
+            auto_review_relay_id: String::new(),
         }];
         // 聚合有自己的按成员归因与「不做静默改派」策略，不在此映射。
         assert_eq!(unlisted_model_replacement(&settings, "gpt-5.4"), None);
@@ -11418,6 +11725,112 @@ pub(crate) struct ResponsesSseTransformer {
     /// 下游不是 Codex（经网关接入的 Grok 等）：去掉 ChatGPT 订阅后端私有的事件，
     /// 这些客户端按标准 Responses 事件解析，遇到不认识的类型会直接报错。
     strip_backend_events: bool,
+    /// 给缺 `phase` 的助手消息补阶段标记（issue #2659），见 [`MessagePhaseFill`]。
+    phase_fill: Option<MessagePhaseFill>,
+}
+
+/// 给第三方 Responses 上游缺失的助手消息 `phase` 补标记（issue #2659）。
+///
+/// Codex 桌面端只在本轮最后一条助手消息带 `phase: "final_answer"` 时，才把它之前的
+/// 推理、命令和过程性消息收进可折叠的「已处理 X 分钟」；官方模型会逐条给出
+/// `commentary` / `final_answer`，第三方模型通常不带这个字段，整轮过程就一直展开。
+///
+/// 一条消息是不是最终回答，要看同一个响应里它后面还有没有工具调用，所以缺 `phase`
+/// 的消息 `output_item.done` 先暂存，等下一个输出项开始（判为 `commentary`）或
+/// `response.completed`（本响应没有工具调用才判为 `final_answer`）时再补上并放行。
+/// 上游已带 `phase` 的消息（官方模型）不暂存、不改写；失败/中断时原样放行。
+#[derive(Default)]
+struct MessagePhaseFill {
+    /// 暂存的消息事件：原始 SSE 文本与解析后的 data JSON。
+    pending: Option<(String, Value)>,
+    /// 本响应里已经出现过需要客户端执行的工具调用（这一轮还会继续）。
+    saw_client_tool_call: bool,
+}
+
+/// 需要 Codex 执行后再发起下一次请求的输出项类型。
+fn is_client_tool_call_item_type(item_type: &str) -> bool {
+    matches!(
+        item_type,
+        "function_call" | "custom_tool_call" | "local_shell_call" | "tool_search_call"
+    )
+}
+
+/// 缺 `phase` 的助手消息完成事件。
+fn is_phaseless_assistant_message_done(event_type: &str, data: &Value) -> bool {
+    if event_type != "response.output_item.done" {
+        return false;
+    }
+    let Some(item) = data.get("item") else {
+        return false;
+    };
+    item.get("type").and_then(Value::as_str) == Some("message")
+        && item.get("role").and_then(Value::as_str) == Some("assistant")
+        && item.get("phase").is_none_or(Value::is_null)
+}
+
+impl MessagePhaseFill {
+    /// 观察一个事件；返回需要先于该事件写出的暂存消息字节，
+    /// 以及当前事件本身是否被暂存（被暂存时调用方不应再写出它）。
+    fn observe(&mut self, event_str: &str, event_type: &str, data: &Value) -> (Vec<u8>, bool) {
+        let item_type = data
+            .pointer("/item/type")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let is_item_event = matches!(
+            event_type,
+            "response.output_item.added" | "response.output_item.done"
+        );
+        if is_item_event && is_client_tool_call_item_type(item_type) {
+            self.saw_client_tool_call = true;
+        }
+        if event_type == "response.created" {
+            // 新响应：阶段判断只看本响应的输出项。
+            self.saw_client_tool_call = false;
+        }
+        let mut out = Vec::new();
+        if self.pending.is_some() {
+            out = match event_type {
+                // 后面还有输出项：这条消息不是本轮最后一条。
+                "response.output_item.added" | "response.output_item.done" => {
+                    self.release(Some("commentary"))
+                }
+                "response.completed" => {
+                    let phase = if self.saw_client_tool_call {
+                        "commentary"
+                    } else {
+                        "final_answer"
+                    };
+                    self.release(Some(phase))
+                }
+                // 失败/中断：不猜阶段，原样放行。
+                "response.failed" | "response.incomplete" | "error" => self.release(None),
+                _ => Vec::new(),
+            };
+        }
+        if is_phaseless_assistant_message_done(event_type, data) {
+            out.extend(self.release(None));
+            self.pending = Some((event_str.to_string(), data.clone()));
+            return (out, true);
+        }
+        (out, false)
+    }
+
+    /// 放行暂存的消息；`phase` 为 `None` 时原样写出。
+    fn release(&mut self, phase: Option<&str>) -> Vec<u8> {
+        let Some((event_str, mut data)) = self.pending.take() else {
+            return Vec::new();
+        };
+        let Some(phase) = phase else {
+            return event_str.into_bytes();
+        };
+        if let Some(item) = data.get_mut("item").and_then(Value::as_object_mut) {
+            item.insert("phase".to_string(), json!(phase));
+        }
+        match serde_json::to_string(&data) {
+            Ok(new_data) => replace_sse_data_line(&event_str, &new_data).into_bytes(),
+            Err(_) => event_str.into_bytes(),
+        }
+    }
 }
 
 /// ChatGPT 订阅后端在回复前后附带的私有事件：`response.metadata`（安全缓冲等）、
@@ -11434,6 +11847,42 @@ fn is_backend_private_event(event_type: &str) -> bool {
 /// Codex 按断流重试，每次重新生图并重复计费。
 const RESPONSES_SSE_MAX_EVENT_BYTES: usize = 4 * 1024 * 1024;
 
+/// 「第三方模型回答完自动折叠过程」（#2659）：每个代理请求开始时按设置更新。
+/// Chat 转换在很深的调用链里，逐层传参改动面太大，所以用进程级开关；
+/// 并发请求读到的都是同一份设置，先后覆盖没有影响。
+static MESSAGE_PHASE_FILL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_message_phase_fill(enabled: bool) {
+    MESSAGE_PHASE_FILL.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+thread_local! {
+    /// 测试用的线程级覆盖：任何代理请求都会按设置重写进程级开关，
+    /// 并发跑的转换用例只认自己线程上的值，才不会被别的用例改掉。
+    static MESSAGE_PHASE_FILL_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// 测试用：在当前线程内固定阶段标记开关执行 `run`，结束后复原。
+#[doc(hidden)]
+pub fn with_message_phase_fill_for_tests<T>(enabled: bool, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MESSAGE_PHASE_FILL_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(MESSAGE_PHASE_FILL_OVERRIDE.with(|cell| cell.replace(Some(enabled))));
+    run()
+}
+
+pub fn message_phase_fill_enabled() -> bool {
+    MESSAGE_PHASE_FILL_OVERRIDE
+        .with(|cell| cell.get())
+        .unwrap_or_else(|| MESSAGE_PHASE_FILL.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 impl ResponsesSseTransformer {
     /// 按原始请求声明的工具形态创建：只有 freeform（custom）的 `apply_patch`
     /// 才需要把被模型包成 JSON 的输入解包回补丁文本。
@@ -11449,13 +11898,35 @@ impl ResponsesSseTransformer {
                                 == Some("apply_patch"))
                 })
             });
-        Self { apply_patch_declared_as_function, ..Self::default() }
+        Self {
+            apply_patch_declared_as_function,
+            ..Self::default()
+        }
+    }
+
+    /// 是否给没带阶段标记的助手消息补 `phase`（设置「第三方模型回答完自动折叠过程」，默认关）。
+    pub(crate) fn filling_message_phase(mut self, enabled: bool) -> Self {
+        self.phase_fill = enabled.then(MessagePhaseFill::default);
+        self
     }
 
     /// 转发给非 Codex 客户端时去掉后端私有事件，见 `strip_backend_events`。
+    /// 阶段标记只给 Codex 桌面端折叠用，非 Codex 客户端不补。
     pub(crate) fn stripping_backend_events(mut self, strip: bool) -> Self {
         self.strip_backend_events = strip;
+        if strip {
+            self.phase_fill = None;
+        }
         self
+    }
+
+    /// 上游结束时取出仍在暂存的消息事件（原样，不补阶段）。
+    /// 正常流会在 `response.completed` 时放行，这里只兜底断流的情况。
+    pub(crate) fn flush_pending(&mut self) -> Vec<u8> {
+        self.phase_fill
+            .as_mut()
+            .map(|fill| fill.release(None))
+            .unwrap_or_default()
     }
 
     /// Push upstream bytes; returns bytes ready to write to the client.
@@ -11494,7 +11965,12 @@ impl ResponsesSseTransformer {
                 }
             } else if self.buf.len() >= RESPONSES_SSE_MAX_EVENT_BYTES {
                 // 超大事件：识别类型后把已缓冲部分连同后续字节原样转发到事件边界。
-                self.passthrough_event = Some(sse_event_type_from_prefix(&self.buf));
+                let event_type = sse_event_type_from_prefix(&self.buf);
+                // 暂存的消息必须先于超大事件写出，按该事件类型决定阶段。
+                if let Some(fill) = self.phase_fill.as_mut() {
+                    out.extend(fill.observe("", &event_type, &Value::Null).0);
+                }
+                self.passthrough_event = Some(event_type);
                 out.append(&mut self.buf);
             }
         }
@@ -11587,9 +12063,33 @@ impl ResponsesSseTransformer {
             return Vec::new();
         }
 
+        // 缺 phase 的助手消息先暂存，到能判断阶段的事件时再补标记写出（issue #2659）。
+        let mut released = Vec::new();
+        if let Some(fill) = self.phase_fill.as_mut() {
+            let (bytes, held) = fill.observe(event_str, event_type, &data_json);
+            if held {
+                return bytes;
+            }
+            released = bytes;
+        }
+        let processed = self.process_parsed_event(event_bytes, event_str, event_type, &data_json);
+        if released.is_empty() {
+            return processed;
+        }
+        released.extend(processed);
+        released
+    }
+
+    fn process_parsed_event(
+        &mut self,
+        event_bytes: &[u8],
+        event_str: &str,
+        event_type: &str,
+        data_json: &Value,
+    ) -> Vec<u8> {
         self.observe_event_type(event_type);
         if event_type == "response.completed" {
-            if let Some(usage) = crate::request_log::usage_from_response_json(&data_json) {
+            if let Some(usage) = crate::request_log::usage_from_response_json(data_json) {
                 self.usage = Some(usage);
             }
         }
@@ -11600,7 +12100,7 @@ impl ResponsesSseTransformer {
                 self.failure_detail = Some(detail);
             }
             if stream_failure_is_retryable(code.as_deref(), message.as_deref())
-                && let Some(normalized) = normalized_overload_failure_event(&data_json)
+                && let Some(normalized) = normalized_overload_failure_event(data_json)
             {
                 return normalized.into_bytes();
             }
@@ -11799,6 +12299,118 @@ fn unwrap_apply_patch_arguments(args: &str) -> String {
 #[cfg(test)]
 mod responses_sse_transformer_tests {
     use super::*;
+
+    fn sse(data: Value) -> String {
+        format!("event: {}\ndata: {}\n\n", data["type"].as_str().unwrap(), data)
+    }
+
+    fn message_done(phase: Option<&str>) -> String {
+        let mut item = json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{ "type": "output_text", "text": "好的", "annotations": [] }]
+        });
+        if let Some(phase) = phase {
+            item["phase"] = json!(phase);
+        }
+        sse(json!({ "type": "response.output_item.done", "output_index": 0, "item": item }))
+    }
+
+    /// 解析输出里每个 output_item.done 消息的 phase（按出现顺序）。
+    fn message_phases(out: &[u8]) -> Vec<Option<String>> {
+        String::from_utf8_lossy(out)
+            .split("\n\n")
+            .filter_map(|event| extract_sse_data(event))
+            .filter_map(|data| serde_json::from_str::<Value>(&data).ok())
+            .filter(|data| {
+                data["type"] == "response.output_item.done" && data["item"]["type"] == "message"
+            })
+            .map(|data| data["item"]["phase"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn phaseless_message_without_tool_call_becomes_final_answer() {
+        let mut t = ResponsesSseTransformer::for_request(None).filling_message_phase(true);
+        // 消息先暂存，等到 response.completed 才能判断它是最终回答。
+        assert!(t.push_bytes(message_done(None).as_bytes()).is_empty());
+        let completed = sse(json!({ "type": "response.completed", "response": {} }));
+        let out = t.push_bytes(completed.as_bytes());
+        assert_eq!(message_phases(&out), vec![Some("final_answer".to_string())]);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.ends_with(&completed), "消息必须先于 completed 写出: {text}");
+        assert!(t.finish().is_none());
+    }
+
+    #[test]
+    fn phaseless_message_before_tool_call_becomes_commentary() {
+        let mut t = ResponsesSseTransformer::for_request(None).filling_message_phase(true);
+        assert!(t.push_bytes(message_done(None).as_bytes()).is_empty());
+        let added = sse(json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": { "type": "function_call", "name": "shell", "call_id": "c1", "arguments": "" }
+        }));
+        let out = t.push_bytes(added.as_bytes());
+        assert_eq!(message_phases(&out), vec![Some("commentary".to_string())]);
+        assert!(String::from_utf8(out).unwrap().ends_with(&added));
+    }
+
+    #[test]
+    fn message_after_tool_call_in_same_response_stays_commentary() {
+        let mut t = ResponsesSseTransformer::for_request(None).filling_message_phase(true);
+        let call = sse(json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": { "type": "function_call", "name": "shell", "call_id": "c1", "arguments": "{}" }
+        }));
+        t.push_bytes(call.as_bytes());
+        assert!(t.push_bytes(message_done(None).as_bytes()).is_empty());
+        let out = t.push_bytes(sse(json!({ "type": "response.completed" })).as_bytes());
+        assert_eq!(message_phases(&out), vec![Some("commentary".to_string())]);
+    }
+
+    #[test]
+    fn upstream_phase_is_forwarded_untouched_without_delay() {
+        let mut t = ResponsesSseTransformer::for_request(None).filling_message_phase(true);
+        let event = message_done(Some("commentary"));
+        assert_eq!(t.push_bytes(event.as_bytes()), event.as_bytes());
+    }
+
+    #[test]
+    fn phase_fill_is_off_unless_enabled() {
+        // 设置里没打开时原样转发：不暂存、不补 phase。
+        let mut t = ResponsesSseTransformer::for_request(None);
+        let out = t.push_bytes(message_done(None).as_bytes());
+        assert_eq!(message_phases(&out), vec![None]);
+    }
+
+    #[test]
+    fn phase_fill_is_skipped_for_foreign_clients() {
+        let mut t = ResponsesSseTransformer::for_request(None)
+            .filling_message_phase(true)
+            .stripping_backend_events(true);
+        let event = message_done(None);
+        assert_eq!(t.push_bytes(event.as_bytes()), event.as_bytes());
+    }
+
+    #[test]
+    fn pending_message_is_released_unchanged_on_failure_or_eof() {
+        let mut t = ResponsesSseTransformer::for_request(None).filling_message_phase(true);
+        let event = message_done(None);
+        t.push_bytes(event.as_bytes());
+        let failed = sse(json!({ "type": "response.failed", "response": {} }));
+        let out = String::from_utf8(t.push_bytes(failed.as_bytes())).unwrap();
+        assert!(out.starts_with(&event), "{out}");
+        assert!(t.finish().is_some());
+
+        let mut t = ResponsesSseTransformer::for_request(None).filling_message_phase(true);
+        t.push_bytes(event.as_bytes());
+        assert_eq!(t.flush_pending(), event.as_bytes());
+        assert!(t.flush_pending().is_empty());
+    }
 
     #[test]
     fn test_context_compaction_event() {
@@ -12278,6 +12890,73 @@ mod parallel_tool_call_pairing_tests {
                 .await
                 .unwrap();
         assert_eq!(out["model"], "deepseek-v4-pro");
+    }
+
+    /// #228：开关关着时托管生图工具原样转发；打开后从 tools、additional_tools
+    /// 与 tool_choice 里去掉，其它工具不动。
+    #[tokio::test]
+    async fn image_generation_tool_is_stripped_only_when_enabled() {
+        let mut relay = crate::settings::RelayProfile {
+            protocol: RelayProtocol::Responses,
+            relay_mode: crate::settings::RelayMode::PureApi,
+            base_url: "https://relay.example.test/v1".into(),
+            api_key: "sk-test".into(),
+            ..Default::default()
+        };
+        let body = || json!({
+            "model": "gpt-5.5",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "additional_tools", "tools": [{"type": "image_generation"}, {"type": "function", "name": "mcp_x"}]}
+            ],
+            "tools": [
+                {"type": "function", "name": "exec"},
+                {"type": "image_generation", "output_format": "png"},
+                {"type": "web_search"}
+            ],
+            "tool_choice": {"type": "image_generation"}
+        });
+        let run = |relay: crate::settings::RelayProfile, body: Value| async move {
+            upstream_request_parts(&relay, body, "/v1/responses", None, false, None, ProxySessionHeaders::default())
+                .await
+                .unwrap()
+                .1
+        };
+
+        let out = run(relay.clone(), body()).await;
+        assert!(out["tools"].as_array().unwrap().iter().any(is_image_generation_tool));
+        assert_eq!(out["tool_choice"]["type"], "image_generation");
+
+        relay.strip_image_generation_tool = true;
+        let out = run(relay.clone(), body()).await;
+        let tools: Vec<&str> = out["tools"].as_array().unwrap().iter()
+            .map(|tool| tool["type"].as_str().unwrap()).collect();
+        assert_eq!(tools, ["function", "web_search"]);
+        assert!(out.get("tool_choice").is_none(), "{out}");
+        let additional = out["input"].as_array().unwrap().iter()
+            .find(|item| item["type"] == "additional_tools").unwrap();
+        assert_eq!(additional["tools"], json!([{"type": "function", "name": "mcp_x"}]));
+
+        // 只剩生图工具：tools 与 tool_choice 一起去掉。
+        let only = json!({"model": "gpt-5.5", "input": "hi", "tools": [{"type": "image_generation"}], "tool_choice": "required"});
+        let out = run(relay.clone(), only).await;
+        assert!(out.get("tools").is_none() && out.get("tool_choice").is_none(), "{out}");
+
+        // Chat 上游不认这个开关（协议转换本来就不带托管工具），判定函数为假。
+        relay.protocol = RelayProtocol::ChatCompletions;
+        assert!(!relay.strips_image_generation_tool());
+    }
+
+    #[test]
+    fn strip_image_generation_tool_keeps_allowed_tools_choice_consistent() {
+        let mut body = json!({
+            "tools": [{"type": "function", "name": "exec"}, {"type": "image_generation"}],
+            "tool_choice": {"type": "allowed_tools", "mode": "auto", "tools": [{"type": "image_generation"}, {"type": "function", "name": "exec"}]}
+        });
+        assert!(strip_image_generation_tool(&mut body));
+        assert_eq!(body["tool_choice"]["tools"], json!([{"type": "function", "name": "exec"}]));
+        let mut untouched = json!({"tools": [{"type": "function", "name": "exec"}], "tool_choice": "auto"});
+        assert!(!strip_image_generation_tool(&mut untouched));
     }
 
     fn assert_pairing(body: &Value, expected: usize) {

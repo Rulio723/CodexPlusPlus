@@ -43,6 +43,7 @@ pub mod global_dictation;
 pub mod http_client;
 pub mod install;
 pub mod launcher;
+pub mod macos_window;
 pub mod manager_navigation;
 pub mod mcp_config;
 pub mod model_catalog;
@@ -53,6 +54,7 @@ pub mod multi_worker;
 pub mod native_browser;
 pub mod native_browser_connection;
 pub(crate) mod native_fast;
+pub(crate) mod native_predictions;
 pub mod official_login;
 pub mod packaged_launch;
 pub mod paths;
@@ -83,6 +85,7 @@ pub mod settings;
 pub mod settings_catalog;
 pub mod share;
 pub mod skills;
+pub mod ssh_remote_loopback;
 pub mod status;
 pub mod stepwise;
 pub mod sub2api;
@@ -93,6 +96,7 @@ pub mod version;
 pub mod vision;
 pub mod watcher;
 pub mod work_view;
+pub(crate) mod xai_responses;
 // 不加 `#[cfg(windows)]`：模块内部各项已各自标注平台门控，在非 Windows 平台上
 // 是一个只含少数无平台依赖项（如 current_process_is_elevated 的桩实现）的空模块。
 // 门控在模块级会导致 `if cfg!(windows)` 这类运行时分支在非 Windows 平台找不到符号。
@@ -116,6 +120,7 @@ pub fn windows_activate_process_window(process_id: u32) -> bool {
 }
 
 /// 设置 Codex++ 任务栏分组、名称和重启入口，保留 Codex 自己的图标。
+/// 启动器不再对打包版 Codex 调用：改写包应用的 AppUserModelID 会让任务栏丢失官方图标并单独分组（#2499、#2668）。
 #[cfg(windows)]
 pub fn windows_apply_codexplusplus_taskbar_to_process_window(process_id: u32) -> bool {
     windows_integration::apply_codexplusplus_taskbar_to_process_window(process_id)

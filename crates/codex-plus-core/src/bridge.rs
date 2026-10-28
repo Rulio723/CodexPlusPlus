@@ -171,6 +171,60 @@ pub fn bridge_health_check_script() -> &'static str {
 }
 
 #[cfg(test)]
+mod native_quota_settings_tests {
+    use super::native_quota_settings_from;
+    use crate::settings::{BackendSettings, RelayMode, RelayProfile};
+
+    fn relay(id: &str, mode: RelayMode, mix: bool) -> RelayProfile {
+        RelayProfile {
+            id: id.to_string(),
+            relay_mode: mode,
+            official_mix_api_key: mix,
+            api_key: "sk-secret".to_string(),
+            ..RelayProfile::default()
+        }
+    }
+
+    /// 独立门禁要按聚合成员判断，所以带上当前聚合的成员；Key 一类的字段不能进页面。
+    #[test]
+    fn active_aggregate_members_are_sent_without_secrets() {
+        let mut settings = BackendSettings {
+            relay_profiles_enabled: true,
+            relay_profiles: vec![
+                relay("agg", RelayMode::Aggregate, false),
+                relay("login", RelayMode::Official, false),
+                relay("api", RelayMode::PureApi, false),
+            ],
+            active_relay_id: "agg".to_string(),
+            ..BackendSettings::default()
+        };
+        settings.aggregate_relay_profiles = vec![
+            serde_json::from_value(serde_json::json!({
+                "id": "agg", "name": "聚合",
+                "members": [{"relayId": "login", "weight": 1}, {"relayId": "api", "weight": 1}],
+                "defaultRelayId": "login"
+            }))
+            .unwrap(),
+        ];
+        let payload = native_quota_settings_from(&settings);
+        let ids: Vec<&str> = payload["relayProfiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|profile| profile["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["agg", "login", "api"]);
+        assert_eq!(payload["aggregateRelayProfiles"][0]["members"][1]["relayId"], "api");
+        assert!(!payload.to_string().contains("sk-secret"), "{payload}");
+
+        settings.active_relay_id = "login".to_string();
+        let payload = native_quota_settings_from(&settings);
+        assert_eq!(payload["relayProfiles"].as_array().unwrap().len(), 1);
+        assert!(payload["aggregateRelayProfiles"].as_array().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
 mod bridge_health_script_tests {
     use super::bridge_health_check_script;
 
@@ -326,20 +380,49 @@ pub async fn add_script_to_new_documents(
 const NATIVE_QUOTA_SETTINGS_BINDING: &str = "codexPlusNativeQuotaSettings";
 
 fn native_quota_settings() -> Value {
-    // 只传额度策略必需字段，不能把 Key、configContents 或 authContents 放进页面。
     let Ok(settings) = crate::settings::SettingsStore::default().load() else {
         return Value::Null;
     };
+    native_quota_settings_from(&settings)
+}
+
+/// 只传额度策略必需字段，不能把 Key、configContents 或 authContents 放进页面。
+/// 当前是聚合供应商时带上它的成员（同样只有模式与是否混入 Key），独立门禁和增强模式按同一标准判断。
+fn native_quota_settings_from(settings: &crate::settings::BackendSettings) -> Value {
+    let policy = |profile: &crate::settings::RelayProfile| {
+        json!({
+            "id": profile.id,
+            "relayMode": profile.relay_mode,
+            "officialMixApiKey": profile.official_mix_api_key,
+        })
+    };
     let profile = settings.active_relay_profile();
+    let mut relay_profiles = vec![policy(&profile)];
+    let mut aggregates = Vec::new();
+    if let Some(aggregate) = settings.active_aggregate_relay_profile() {
+        for member in &aggregate.members {
+            if let Some(found) = settings
+                .relay_profiles
+                .iter()
+                .find(|candidate| candidate.id == member.relay_id && candidate.id != profile.id)
+            {
+                relay_profiles.push(policy(found));
+            }
+        }
+        let members: Vec<Value> = aggregate
+            .members
+            .iter()
+            .map(|member| json!({ "relayId": member.relay_id }))
+            .collect();
+        aggregates.push(json!({ "id": aggregate.id, "members": members }));
+    }
     json!({
         "codexAppStandaloneQuotaUnlock": settings.codex_app_standalone_quota_unlock,
         "relayProfilesEnabled": settings.relay_profiles_enabled,
         "activeRelayId": profile.id,
-        "relayProfiles": [{
-            "id": profile.id,
-            "relayMode": profile.relay_mode,
-            "officialMixApiKey": profile.official_mix_api_key,
-        }],
+        "activeAggregateRelayId": settings.active_aggregate_relay_id,
+        "relayProfiles": relay_profiles,
+        "aggregateRelayProfiles": aggregates,
     })
 }
 
@@ -708,7 +791,7 @@ async fn run_app_server_client_capture(
     }
     let socket = connect_cdp_websocket(websocket_url).await?;
     let mut session = CdpSession::new(socket);
-    let probe_script = if settings.enhancements_enabled && settings.codex_app_native_fast_unlock {
+    let probe_script = if crate::native_predictions::native_modules_requested(&settings) {
         "window.__codexPlusNativeFastAssetPatchReady===true&&['armed','patched'].includes(window.__codexPlusNativeFastPatchState)&&window.__codexPlusNativeFastCompiled!=='v1'?null:JSON.stringify(window.__codexPlusAppServerClientCapture||null)"
     } else {
         app_server_client_capture_probe_script()
@@ -966,12 +1049,12 @@ pub async fn install_bridge(
     let generation = next_bridge_generation(websocket_url);
     session = session.with_generation(generation.clone());
     let mut registered_script_ids = Vec::new();
-    let native_fast_requested = crate::settings::SettingsStore::default()
+    let native_modules_requested = crate::settings::SettingsStore::default()
         .load()
-        .is_ok_and(|settings| settings.enhancements_enabled && settings.codex_app_native_fast_unlock);
+        .is_ok_and(|settings| crate::native_predictions::native_modules_requested(&settings));
 
     let install_result: anyhow::Result<()> = async {
-        if native_fast_requested {
+        if native_modules_requested {
             session
                 .send_command(next_message_id(), "Page.enable", json!({}))
                 .await?;

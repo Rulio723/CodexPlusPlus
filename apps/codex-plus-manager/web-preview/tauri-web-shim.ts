@@ -38,6 +38,7 @@ const demoSettings = {
   codexAppPluginMarketplaceUnlock: true,
   codexAppModelWhitelistUnlock: true,
   codexAppSessionDelete: true,
+  codexAppSessionDeleteSkipConfirm: false,
   codexAppMarkdownExport: true,
   codexAppUsageStatusLine: true,
   codexAppPasteFix: false,
@@ -129,6 +130,7 @@ const demoSettings = {
     standardOpenaiProtocol: false,
     webSearchHistoryCompat: false,
     strictResponsesReasoning: false,
+    stripImageGenerationTool: false,
     anthropicAuthHeader: "x-api-key",
     anthropicMaxTokens: 0,
     anthropicPromptCache: true,
@@ -152,6 +154,8 @@ const demoSettings = {
     size: 112,
     soundEnabled: true,
     soundSet: "duck",
+    customSoundPress: "",
+    customSoundRelease: "",
     volume: 0.6,
   },
 };
@@ -177,6 +181,13 @@ const agentPetCatalog: Array<[string, string, string]> = [
   ["robot", "机器人", "Robot/3D/robot_3d.png"],
   ["ghost", "小幽灵", "Ghost/3D/ghost_3d.png"],
 ];
+// 二次元图库是 Commons 直链，预览直接引用。
+const agentPetAnimeCatalog: Array<[string, string, string, string]> = [
+  ["chibi-bow", "蝴蝶结", "https://upload.wikimedia.org/wikipedia/commons/c/c1/Chibiw.png", "asrafil · CC0"],
+  ["chibi-girl", "Q版少女", "https://upload.wikimedia.org/wikipedia/commons/4/4c/Cute_girl.png", "dcatcherex · CC0"],
+  ["anime-girl", "马尾少女", "https://upload.wikimedia.org/wikipedia/commons/e/e7/Anime_girl_publicdomainq.png", "oksmith · CC0"],
+  ["anime-angry", "炸毛少女", "https://upload.wikimedia.org/wikipedia/commons/c/c5/Angry_anime_girl.png", "snoopingasusual · CC0"],
+];
 
 function agentPetPreviewImage(image: string, customImageUrl: string) {
   if (image === "custom") {
@@ -184,6 +195,8 @@ function agentPetPreviewImage(image: string, customImageUrl: string) {
       ? { status: "ok", image: customImageUrl }
       : { status: "failed", message: "自定义图片只支持 https:// 地址" };
   }
+  const anime = agentPetAnimeCatalog.find(([id]) => id === image);
+  if (anime) return { status: "ok", image: anime[2] };
   const entry = agentPetCatalog.find(([id]) => id === image);
   if (!entry) return { status: "failed", message: `未知的内置桌宠图片：${image}` };
   const path = entry[2].split("/").map(encodeURIComponent).join("/");
@@ -202,7 +215,7 @@ const overview = ok({
     debugger: { status: "disconnected", address: null, message: "等待 Codex 连接" },
     protocol_conversion_enabled: true,
   },
-  current_version: "2.0.0",
+  current_version: "2.1.0",
   update_status: "up_to_date",
   settings_path: "演示模式",
   logs_path: "演示模式",
@@ -362,9 +375,18 @@ export async function invoke<T = unknown>(command: string, args: Record<string, 
     case "load_gateway": return gateway as T;
     case "scan_agent_cache": return ok({ report: agentCacheReport }) as T;
     case "fetch_provider_models": return ok({ models: ["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"], endpoint: "https://api.anthropic.com/v1/models" }) as T;
-    case "agent_pet_catalog": return agentPetCatalog.map(([id, name]) => ({ id, name })) as T;
+    case "agent_pet_catalog": return [
+      ...agentPetCatalog.map(([id, name]) => ({ id, name })),
+      ...agentPetAnimeCatalog.map(([id, name, , credit]) => ({ id, name, credit })),
+    ] as T;
     // 演示模式没有内嵌音频，返回空表；页面照常显示，试听静音。
     case "agent_pet_sounds": return {} as T;
+    case "agent_pet_sound_catalog": return [
+      { id: "nya", name: "猫娘「にゃ」", author: "Mike_bes", license: "CC0", sourceUrl: "https://freesound.org/people/Mike_bes/sounds/336012/" },
+      { id: "sparkle", name: "魔法闪光", author: "Hemplock / MLaudio", license: "CC0", sourceUrl: "https://freesound.org/people/Hemplock/sounds/618961/" },
+    ] as T;
+    case "agent_pet_sound": return { status: "failed", message: "网页预览不提供音效下载" } as T;
+    case "agent_pet_import_sound": return { status: "ok", file: `${String(args.slot ?? "press")}-0123456789abcdef.mp3` } as T;
     case "agent_pet_image": return agentPetPreviewImage(String(args.image ?? ""), String(args.customImageUrl ?? "")) as T;
     case "lookup_model_prices": return ok({ source: "models.dev", fetchedAtMs: Date.now(), prices: ((args.models as string[]) ?? []).map((model) => ({ model, price: { providerId: "anthropic", providerName: "Anthropic", modelId: model, currency: "USD", input: 3, cachedInput: 0.3, output: 15, context: 200000 } })) }) as T;
     case "list_installed_skills":
@@ -412,7 +434,7 @@ export async function invoke<T = unknown>(command: string, args: Record<string, 
     case "load_pending_dream_skin_community": return ok({ versionId: "" }) as T;
     case "load_watcher_state": return ok({ enabled: false, running: false, status: "disabled", message: "演示模式" }) as T;
     case "load_auto_takeover_state": return ok({ running: false, enabled: false, message: "演示模式" }) as T;
-    case "update_check": return ok({ currentVersion: "2.0.0", latestVersion: "2.0.0", updateAvailable: false }) as T;
+    case "update_check": return ok({ currentVersion: "2.1.0", latestVersion: "2.1.0", updateAvailable: false }) as T;
     case "refresh_script_market": return ok({ market: { status: "ok", message: "演示模式", updatedAt: "2026-10-26T12:51:00Z", scripts: [
       { id: "relay-balance", name: "Codex Relay Balance", description: "通用中转站余额与模型用量监控，支持自动读取或手动填写接口、日期范围、Token 明细和实际扣费倍率。", version: "0.3.7", author: "Codex++ Community", tags: ["codex", "relay", "balance", "usage", "quota"], homepage: "https://github.com/demo/relay-balance", script_url: "", installed: false, installedVersion: "", updateAvailable: false },
       { id: "model-matrix", name: "Codex Model Matrix", description: "紧凑且适配主题的 Codex 模型选择器，配备可拖动吸附的推理强度滑块。", version: "1.0.0", author: "lx", tags: ["codex", "models", "reasoning"], homepage: "https://github.com/demo/model-matrix", script_url: "", installed: true, installedVersion: "1.0.0", updateAvailable: false },

@@ -436,7 +436,8 @@ pub trait LaunchHooks: Send + Sync {
         Ok(None)
     }
     async fn inject(&self, debug_port: u16, helper_port: u16) -> anyhow::Result<()>;
-    async fn apply_native_fast_unlock_on_launch(&self, _debug_port: u16) -> anyhow::Result<()> {
+    /// 原生模块补丁（Fast、输入预测）需要在启动时重载一次页面才能生效。
+    async fn apply_native_module_patches_on_launch(&self, _debug_port: u16) -> anyhow::Result<()> {
         Ok(())
     }
     async fn inject_bridge(
@@ -1026,11 +1027,11 @@ where
             timeline.mark("ensure_injection_done", 95);
             if injection_ready {
                 keep_launched_on_error = false;
-                if settings.codex_app_native_fast_unlock
-                    && let Err(error) = hooks.apply_native_fast_unlock_on_launch(debug_port).await
+                if (settings.codex_app_native_fast_unlock || settings.codex_app_native_predictions)
+                    && let Err(error) = hooks.apply_native_module_patches_on_launch(debug_port).await
                 {
                     let _ = crate::diagnostic_log::append_diagnostic_log(
-                        "launcher.native_fast_unlock_failed",
+                        "launcher.native_module_patch_failed",
                         serde_json::json!({ "message": error.to_string() }),
                     );
                 }
@@ -1133,26 +1134,6 @@ fn active_relay_profile_is_official_mix(settings: &BackendSettings) -> bool {
     let profile = settings.active_relay_profile();
     profile.relay_mode == crate::settings::RelayMode::Official && profile.official_mix_api_key
 }
-#[cfg(windows)]
-fn apply_codexplusplus_taskbar_after_launch(process_id: u32) {
-    tokio::spawn(async move {
-        for attempt in 1..=30 {
-            if crate::windows_integration::apply_codexplusplus_taskbar_to_process_window(process_id) {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            if attempt == 30 {
-                let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "launcher.taskbar.apply_failed",
-                    serde_json::json!({ "process_id": process_id }),
-                );
-            }
-        }
-    });
-}
-
-#[cfg(not(windows))]
-fn apply_codexplusplus_taskbar_after_launch(_process_id: u32) {}
 
 pub trait IntoLaunchHooks {
     fn into_launch_hooks(self) -> Arc<dyn LaunchHooks>;
@@ -1424,11 +1405,50 @@ impl LaunchHooks for DefaultLaunchHooks {
                                         None
                                     }
                                 };
+                            // issue #2700：Codex 26.1021 起，带调试参数的 AUMID 激活会让
+                            // 进程立即退出、调试端口永不监听。这里短暂观察激活结果，确认
+                            // 秒退后改走包上下文 wrapper，而不是空等注入预算耗尽。
+                            let verdict = verify_packaged_activation(
+                                process_id,
+                                process.as_ref(),
+                                debug_port,
+                            )
+                            .await;
+                            if verdict
+                                == crate::packaged_launch::AumidActivationVerdict::FallbackToPackageContext
+                            {
+                                let _ = crate::diagnostic_log::append_diagnostic_log(
+                                    "launcher.packaged_activation_exited_early",
+                                    serde_json::json!({
+                                        "app_user_model_id": app_user_model_id,
+                                        "activation_pid": process_id,
+                                        "debug_port": debug_port,
+                                    }),
+                                );
+                                launch_packaged_main_in_package_context(
+                                    app_dir,
+                                    app_user_model_id,
+                                    debug_port,
+                                    &launch_extra_args,
+                                )
+                                .await?;
+                                *self.packaged_executable.lock().await = Some(executable);
+                                *self.packaged_activation_process.lock().await = None;
+                                *self.packaged_launch_identity.lock().await = None;
+                                // 包上下文里拉起的是 cmd.exe，拿不到应用进程 PID；
+                                // 退出等待按调试端口归属去发现实际进程。
+                                return Ok(CodexLaunch::PackagedActivation {
+                                    app_user_model_id: app_user_model_id.clone(),
+                                    arguments: arguments.clone(),
+                                    process_id: None,
+                                });
+                            }
                             *self.packaged_executable.lock().await = Some(executable);
                             *self.packaged_activation_process.lock().await = process;
                             *self.packaged_launch_identity.lock().await = None;
                         }
-                        apply_codexplusplus_taskbar_after_launch(process_id);
+                        // 不改写打包版 Codex 窗口的 AppUserModelID：保留包身份，任务栏才能
+                        // 解析官方图标并与原应用合并分组（#2499、#2668）。
                         return Ok(match activation {
                             CodexLaunch::PackagedActivation {
                                 app_user_model_id,
@@ -1540,8 +1560,8 @@ impl LaunchHooks for DefaultLaunchHooks {
         retry_injection(debug_port, helper_port).await
     }
 
-    async fn apply_native_fast_unlock_on_launch(&self, debug_port: u16) -> anyhow::Result<()> {
-        apply_native_fast_unlock_on_launch(debug_port).await
+    async fn apply_native_module_patches_on_launch(&self, debug_port: u16) -> anyhow::Result<()> {
+        apply_native_module_patches_on_launch(debug_port).await
     }
 
     async fn capture_injected_launch_identity(&self, debug_port: u16) {
@@ -2811,11 +2831,29 @@ pub(crate) async fn handle_protocol_proxy_connection(
         let upstream_content_type = upstream.content_type.clone();
         let upstream_body = upstream.read_body().await?;
         request_log.record_usage_json(&upstream_body);
-        let error = crate::protocol_proxy::responses_error_from_upstream(
+        let mut error = crate::protocol_proxy::responses_error_from_upstream(
             upstream.status_code,
             &upstream_content_type,
             &upstream_body,
         );
+        // 上游的错误原文记进请求日志（#2741）：之前只转给了 Agent，日志里错误一栏是空的，没法排查。
+        // 日志里带上状态码、类型 / code 和响应体原文预览，提取出的消息丢掉的细节也能看到。
+        request_log.record_error(
+            &status,
+            crate::protocol_proxy::upstream_error_log_text(
+                upstream.status_code,
+                &error,
+                &upstream_body,
+            ),
+        );
+        // 网关池里有好几家：Agent 看到的错误补上是哪一家、哪个模型、什么状态码（#2741）。
+        if matches!(opener, ProxyOpener::Gateway(_)) {
+            crate::protocol_proxy::annotate_gateway_upstream_error(
+                &mut error,
+                upstream.status_code,
+                upstream.request_trace.as_ref(),
+            );
+        }
         let body = serde_json::to_vec(&error)?;
         write_http_response(stream, &status, "application/json; charset=utf-8", &body).await?;
         log_helper_response(
@@ -2858,8 +2896,10 @@ pub(crate) async fn handle_protocol_proxy_connection(
             // buffered 模式：整段 SSE 已由协议代理收齐并重试完成，这里一次性转发。
             let mut transformer =
                 crate::protocol_proxy::ResponsesSseTransformer::for_request(request_json.as_ref())
+                    .filling_message_phase(crate::protocol_proxy::message_phase_fill_enabled())
                     .stripping_backend_events(foreign_client);
-            let out = transformer.push_bytes(&body);
+            let mut out = transformer.push_bytes(&body);
+            out.extend(transformer.flush_pending());
             stream.write_all(&out).await?;
             let usage = transformer.take_usage();
             let detail = transformer.take_failure_detail();
@@ -2957,7 +2997,8 @@ pub(crate) async fn handle_protocol_proxy_connection(
         if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses
             && upstream.exec_adapted
         {
-            let mut converter = crate::responses_exec_sse::ExecSseAdapter::new();
+            let mut converter =
+                crate::responses_exec_sse::ExecSseAdapter::for_adaptation(upstream.tool_adaptation());
             let mut bytes_stream = upstream.take_response()?.bytes_stream();
             while let Some(chunk) = bytes_stream.next().await {
                 let converted = match chunk {
@@ -3074,7 +3115,10 @@ pub(crate) async fn handle_protocol_proxy_connection(
     }
     if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
         let body = if upstream.exec_adapted {
-            let (body, valid) = crate::responses_exec_transport::adapted_json(&upstream_body);
+            let (body, valid) = crate::responses_exec_transport::adapted_json(
+                &upstream_body,
+                &upstream.tool_adaptation(),
+            );
             write_http_response(stream, "200 OK", "application/json; charset=utf-8", &body).await?;
             if let Some(outcome) = upstream.exec_outcome.as_mut() {
                 outcome.finish(valid);
@@ -3711,6 +3755,7 @@ pub(crate) async fn forward_protocol_proxy_stream_for_client<S: SseSink>(
     let mut first_output_at_ms = None;
     if wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
         let mut transformer = crate::protocol_proxy::ResponsesSseTransformer::for_request(request)
+            .filling_message_phase(crate::protocol_proxy::message_phase_fill_enabled())
             .stripping_backend_events(foreign_client);
         // 代理预读过的开头必须先原样补写，否则 Codex 会丢掉 response.created 等事件。
         if !prefix.is_empty() {
@@ -3739,6 +3784,11 @@ pub(crate) async fn forward_protocol_proxy_stream_for_client<S: SseSink>(
                     }
                 }
                 Err(error) => {
+                    // 断流时仍在暂存的消息原样补写，不丢事件。
+                    let pending = transformer.flush_pending();
+                    if !pending.is_empty() {
+                        stream.send(&pending).await?;
+                    }
                     let usage = transformer.take_usage();
                     let detail = transformer.take_failure_detail();
                     return Ok((
@@ -3749,6 +3799,10 @@ pub(crate) async fn forward_protocol_proxy_stream_for_client<S: SseSink>(
                     ));
                 }
             }
+        }
+        let pending = transformer.flush_pending();
+        if !pending.is_empty() {
+            stream.send(&pending).await?;
         }
         let usage = transformer.take_usage();
         let detail = transformer.take_failure_detail();
@@ -4592,6 +4646,90 @@ async fn launch_packaged_multi_instance(
     }
 }
 
+/// 包上下文兜底启动后等待调试端口就绪的上限。超过即报错，不再进入 90 秒注入预算。
+#[cfg(windows)]
+const PACKAGED_CONTEXT_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// AUMID 激活后的观察：直到调试端口就绪、确认激活进程秒退、或验证窗口耗尽（issue #2700）。
+///
+/// 判定逻辑在 `packaged_launch::AumidActivationWatch`（纯函数，有单测）；这里只负责采样。
+#[cfg(windows)]
+async fn verify_packaged_activation(
+    process_id: u32,
+    process: Option<&crate::windows_integration::TrackedWindowsProcess>,
+    debug_port: u16,
+) -> crate::packaged_launch::AumidActivationVerdict {
+    use crate::packaged_launch::{AumidActivationVerdict, AumidActivationWatch};
+    let mut watch = AumidActivationWatch::new(std::time::Instant::now());
+    loop {
+        let cdp_ready =
+            tokio::task::spawn_blocking(move || crate::cdp::endpoint_available(debug_port))
+                .await
+                .unwrap_or(false);
+        let process_alive = match process {
+            Some(process) => process.is_alive().ok(),
+            // 激活后进程秒退时 OpenProcess 往往已经失败，拿不到句柄；
+            // 退回按进程快照判断该 PID 是否还在。
+            None => tokio::task::spawn_blocking(move || {
+                crate::windows_integration::enumerate_processes()
+                    .iter()
+                    .any(|info| info.process_id == process_id)
+            })
+            .await
+            .ok(),
+        };
+        let verdict = watch.observe(std::time::Instant::now(), cdp_ready, process_alive);
+        if verdict != AumidActivationVerdict::Pending {
+            return verdict;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+/// 主实例的包上下文兜底启动（issue #2700）：AUMID 激活后进程秒退时，改用
+/// `Invoke-CommandInDesktopPackage` wrapper 带同一份参数拉起 exe，并等待调试端口就绪。
+///
+/// 任一步失败都直接返回 Err，让用户立即看到错误，而不是空等注入预算耗尽。
+#[cfg(windows)]
+async fn launch_packaged_main_in_package_context(
+    app_dir: &Path,
+    app_user_model_id: &str,
+    debug_port: u16,
+    extra_args: &[String],
+) -> anyhow::Result<()> {
+    let executable = crate::app_paths::build_codex_executable(app_dir);
+    let arguments = build_codex_arguments(debug_port, extra_args);
+    let wrapper_path = crate::packaged_launch::prepare_main_instance_wrapper(
+        &crate::paths::default_app_state_dir(),
+        &executable,
+        &arguments,
+    )?;
+    crate::packaged_launch::activate_in_package_context(app_user_model_id, &wrapper_path)
+        .await
+        .context("Codex 通过 AUMID 激活后立即退出，改用包上下文启动也失败")?;
+    let ready = tokio::task::spawn_blocking(move || {
+        crate::packaged_launch::wait_for_instance_ready(debug_port, PACKAGED_CONTEXT_READY_TIMEOUT)
+    })
+    .await
+    .unwrap_or(false);
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "launcher.packaged_context_main_launch",
+        serde_json::json!({
+            "app_user_model_id": app_user_model_id,
+            "wrapper_path": wrapper_path,
+            "debug_port": debug_port,
+            "ready": ready,
+        }),
+    );
+    if !ready {
+        anyhow::bail!(
+            "Codex 通过 AUMID 激活后立即退出，改用包上下文启动后 {} 秒内调试端口 {debug_port} 仍未就绪",
+            PACKAGED_CONTEXT_READY_TIMEOUT.as_secs()
+        );
+    }
+    Ok(())
+}
+
 /// 从启动参数里取出实例自己的 `--user-data-dir`（多开由管理器注入）。
 fn multi_instance_user_data_dir_from_args(args: &[String]) -> Option<String> {
     args.iter()
@@ -5050,7 +5188,7 @@ async fn try_inject(debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
 }
 
 // 仅在用户启动 Codex 的流程里重载一次；心跳重注入不重载正在使用的页面。
-async fn apply_native_fast_unlock_on_launch(debug_port: u16) -> anyhow::Result<()> {
+async fn apply_native_module_patches_on_launch(debug_port: u16) -> anyhow::Result<()> {
     let targets = crate::cdp::list_targets(debug_port).await?;
     let target = crate::cdp::pick_injectable_codex_page_target(&targets)?;
     let websocket_url = target
@@ -5059,15 +5197,15 @@ async fn apply_native_fast_unlock_on_launch(debug_port: u16) -> anyhow::Result<(
         .ok_or_else(|| anyhow::anyhow!("selected CDP target has no websocket URL"))?;
     let probe = "JSON.stringify({ready:window.__codexPlusNativeFastAssetPatchReady===true,compiled:window.__codexPlusNativeFastCompiled==='v1',failed:['unsupported','failed'].includes(window.__codexPlusNativeFastPatchState)})";
     let state = crate::bridge::evaluate_script(websocket_url, probe).await?;
-    let state = native_fast_launch_state(&state);
+    let state = native_module_launch_state(&state);
     if state.1 {
         return Ok(());
     }
     anyhow::ensure!(
         !state.2,
-        "当前 Codex 资产不支持原生 Fast 补丁，保留原生身份限制"
+        "当前 Codex 资产不支持原生模块补丁，保留原生界面"
     );
-    anyhow::ensure!(state.0, "原生 Fast 资源补丁未就绪，保留原生界面");
+    anyhow::ensure!(state.0, "原生模块补丁未就绪，保留原生界面");
     crate::bridge::send_cdp_command(
         websocket_url,
         "Page.reload",
@@ -5078,24 +5216,24 @@ async fn apply_native_fast_unlock_on_launch(debug_port: u16) -> anyhow::Result<(
     while tokio::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         if let Ok(result) = crate::bridge::evaluate_script(websocket_url, probe).await {
-            let state = native_fast_launch_state(&result);
+            let state = native_module_launch_state(&result);
             anyhow::ensure!(
                 !state.2,
-                "当前 Codex 资产不支持原生 Fast 补丁，保留原生身份限制"
+                "当前 Codex 资产不支持原生模块补丁，保留原生界面"
             );
             if state.1 {
                 let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "launcher.native_fast_unlock_ready",
+                    "launcher.native_module_patch_ready",
                     serde_json::json!({ "debug_port": debug_port }),
                 );
                 return Ok(());
             }
         }
     }
-    anyhow::bail!("当前 Codex 版本未完成原生 Fast 补丁加载，保留原生身份限制")
+    anyhow::bail!("当前 Codex 版本未完成原生模块补丁加载，保留原生界面")
 }
 
-fn native_fast_launch_state(result: &Value) -> (bool, bool, bool) {
+fn native_module_launch_state(result: &Value) -> (bool, bool, bool) {
     let Some(text) = result.pointer("/result/result/value").and_then(Value::as_str) else {
         return (false, false, false);
     };

@@ -366,16 +366,46 @@ fn codex_model_metadata(gateway: &GatewaySettings, binding: &AgentBinding) -> St
             let Some(group) = gateway.group(id) else {
                 continue;
             };
-            let entry = crate::model_suffix::collect_catalog_entries(
-                &model,
-                &Default::default(),
-                &Default::default(),
-                &model,
-            );
-            let template: Value =
-                serde_json::from_str(&crate::model_suffix::build_model_catalog_json(&entry, None))
+            // 组的推理档位取第一个成员的；Fast 要每个成员都支持才开（#2740）：
+            // 请求轮到不支持的那家会被拒。成员一个都对不上时退回按组名生成的通用条目。
+            let mut member_fields = Vec::new();
+            for (relay, upstream) in route::model_entry_members(gateway, binding, &model) {
+                let Some(index) = relays.iter().position(|candidate| candidate.id == relay.id)
+                else {
+                    continue;
+                };
+                if let Some(entry) =
+                    member_catalog_entry(&mut member_catalogs, &relays, index, &upstream)
+                {
+                    member_fields.push(catalog_ui_fields(&entry));
+                }
+            }
+            let mut fields = match member_fields.first() {
+                Some(first) => first.clone(),
+                None => {
+                    let entry = crate::model_suffix::collect_catalog_entries(
+                        &model,
+                        &Default::default(),
+                        &Default::default(),
+                        &model,
+                    );
+                    let template: Value = serde_json::from_str(
+                        &crate::model_suffix::build_model_catalog_json(&entry, None),
+                    )
                     .unwrap_or(Value::Null);
-            let mut fields = catalog_ui_fields(&template["models"][0]);
+                    catalog_ui_fields(&template["models"][0])
+                }
+            };
+            let has_tiers = |fields: &Map<String, Value>| {
+                fields
+                    .get("service_tiers")
+                    .and_then(Value::as_array)
+                    .is_some_and(|tiers| !tiers.is_empty())
+            };
+            if member_fields.is_empty() || !member_fields.iter().all(has_tiers) {
+                fields.insert("service_tiers".into(), json!([]));
+                fields.insert("additional_speed_tiers".into(), json!([]));
+            }
             fields.insert("display_name".into(), json!(group.name));
             fields.insert("description".into(), json!(format!("{model} · 模型组")));
             fields.insert("codex_plus_group".into(), json!("模型组"));
@@ -391,20 +421,11 @@ fn codex_model_metadata(gateway: &GatewaySettings, binding: &AgentBinding) -> St
             continue;
         };
         let relay = relays[index];
-        let catalog = member_catalogs[index].get_or_insert_with(|| {
-            crate::aggregate_catalog::build_member_catalog(relay)
-                .ok()
-                .and_then(|payload| payload["models"].as_array().cloned())
-                .unwrap_or_default()
-        });
-        let Some(entry) = catalog.iter().find(|entry| {
-            entry["slug"]
-                .as_str()
-                .is_some_and(|slug| slug.eq_ignore_ascii_case(&upstream))
-        }) else {
+        let Some(entry) = member_catalog_entry(&mut member_catalogs, &relays, index, &upstream)
+        else {
             continue;
         };
-        let mut fields = catalog_ui_fields(entry);
+        let mut fields = catalog_ui_fields(&entry);
         // 没有元数据的模型，成员目录的显示名就是原始 ID：换成规范写法（gpt-6.1-sol → GPT-6.1-Sol）。
         let display = fields
             .get("display_name")
@@ -521,6 +542,29 @@ fn codex_group_suffix(relay: &RelayProfile, group: &str, relays: &[&RelayProfile
     } else {
         relay.id.clone()
     }
+}
+
+/// 池里第 `index` 家的成员目录里这个上游模型的条目（不分大小写）；每家的目录只生成一次。
+fn member_catalog_entry(
+    cache: &mut [Option<Vec<Value>>],
+    relays: &[&RelayProfile],
+    index: usize,
+    upstream: &str,
+) -> Option<Value> {
+    let catalog = cache[index].get_or_insert_with(|| {
+        crate::aggregate_catalog::build_member_catalog(relays[index])
+            .ok()
+            .and_then(|payload| payload["models"].as_array().cloned())
+            .unwrap_or_default()
+    });
+    catalog
+        .iter()
+        .find(|entry| {
+            entry["slug"]
+                .as_str()
+                .is_some_and(|slug| slug.eq_ignore_ascii_case(upstream))
+        })
+        .cloned()
 }
 
 /// 目录条目里选择器要用的字段；整条（含基础指令等大字段）不进设置文件。
@@ -1849,6 +1893,7 @@ pub fn copy_claude_provider(provider: &ClaudeProvider) -> anyhow::Result<RelayPr
         price: None,
         model_prices: None,
         proxy: None,
+        strip_image_generation_tool: None,
     })?;
     if bearer {
         profile.anthropic_auth_header =
@@ -1902,6 +1947,7 @@ pub fn copy_grok_profile(
         price: None,
         model_prices: None,
         proxy: None,
+        strip_image_generation_tool: None,
     })?;
     if !windows.is_empty() {
         relay.model_windows = serde_json::to_string(&windows)?;
@@ -2222,6 +2268,9 @@ pub struct ProviderInput {
     /// 这个供应商单独走的 HTTP 代理；不传表示不改，空串表示不单独走代理。
     #[serde(default)]
     pub proxy: Option<String>,
+    /// 转发前移除托管生图工具（#228）；不传表示不改（编辑时保留原来的）。
+    #[serde(default)]
+    pub strip_image_generation_tool: Option<bool>,
 }
 
 /// 代理地址只接受 http / https / socks5，空串表示不单独走代理。
@@ -2269,6 +2318,7 @@ fn build_relay(input: &ProviderInput) -> anyhow::Result<RelayProfile> {
         &[],
     )?;
     relay.relay_mode = RelayMode::PureApi;
+    relay.strip_image_generation_tool = input.strip_image_generation_tool.unwrap_or(false);
     if keys.len() > 1 {
         relay.api_keys = keys
             .iter()
@@ -2440,6 +2490,10 @@ fn update_provider_in(
     relay.anthropic_auth_header = provider.relay.anthropic_auth_header.clone();
     // 按模型的思考等级等模型资料也保留（在供应商池详情里单独编辑）。
     relay.model_metadata = provider.relay.model_metadata.clone();
+    // 没传「移除托管生图工具」时沿用原来的选择。
+    if input.strip_image_generation_tool.is_none() {
+        relay.strip_image_generation_tool = provider.relay.strip_image_generation_tool;
+    }
     provider.relay = relay;
     provider.price = clean_price(input.price.clone());
     if let Some(prices) = &input.model_prices {
@@ -2839,6 +2893,7 @@ mod tests {
                 routes: Vec::new(),
                 default_relay_id: String::new(),
                 sync_default_member_login: false,
+                auto_review_relay_id: String::new(),
             }],
             ..BackendSettings::default()
         };
