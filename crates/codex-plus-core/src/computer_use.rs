@@ -1865,6 +1865,8 @@ pub(crate) fn read_text(path: &Path) -> anyhow::Result<Option<String>> {
 }
 
 pub(crate) fn parse_json_object(text: &str, path: &Path) -> anyhow::Result<Map<String, Value>> {
+    // Windows 上的工具写出的 JSON 可能带 UTF-8 BOM（#2728），JSON 解析器不认，先去掉。
+    let text = text.trim_start_matches('\u{feff}');
     if text.trim().is_empty() {
         return Ok(Map::new());
     }
@@ -1907,6 +1909,10 @@ fn backup(path: &Path, contents: &str) -> anyhow::Result<PathBuf> {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "config".to_string());
     let backup_path = path.with_file_name(format!("{file_name}.codex-plus-backup-{stamp}"));
+    // 同一秒里连着保存两次：留第一份（改动前的原样）。直接覆盖写又不截断，会留下旧内容的尾巴。
+    if backup_path.exists() {
+        return Ok(backup_path);
+    }
     let mut file = open_private(&backup_path)?;
     file.write_all(contents.as_bytes())?;
     prune_backups(path);
@@ -2068,6 +2074,12 @@ mod tests {
             app_version: Some("26.1016.61520".into()),
             package_version: Some("0.1.2".into()),
         }
+    }
+
+    #[test]
+    fn json_object_with_utf8_bom_parses() {
+        let map = parse_json_object("\u{feff}{\"mcpServers\":{}}", Path::new("claude_desktop_config.json")).unwrap();
+        assert!(map.contains_key("mcpServers"));
     }
 
     #[test]

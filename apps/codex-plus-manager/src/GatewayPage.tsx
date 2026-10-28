@@ -27,7 +27,6 @@ import {
   slugify,
   type GatewayGroupEntry,
   type GatewayPayload,
-  type ImageOption,
   type GatewayResult,
   type GroupMember,
   type GroupMode,
@@ -49,7 +48,7 @@ import { shortProviderName } from "./GatewayModelMatrix";
 import { TopbarActions } from "./TopbarActions";
 import { GatewayNavContext } from "./gateway-store";
 import { useEscapeLayer } from "./use-escape-layer";
-import { publishGatewayPayload } from "./gateway-store";
+import { gatewayGeneration, publishGatewayPayload, subscribeGatewayPayload } from "./gateway-store";
 import "./GatewayPage.css";
 
 type Tab = "agents" | "sessions" | "providers" | "routing" | "usage" | "gateway";
@@ -106,6 +105,15 @@ export function GatewayPage({
   };
 
   const run: Run = makeRun(setBusy, accept, notify);
+  // 别处改了网关数据（如模型下拉里收藏）也同步过来，不然这里还拿着旧数据，下次保存会把新改的盖掉。
+  useEffect(
+    () =>
+      subscribeGatewayPayload((next) => {
+        memo.payload = next;
+        setPayload(next);
+      }),
+    [],
+  );
 
   const refresh = async (silent = true) => {
     setBusy("load");
@@ -131,9 +139,11 @@ export function GatewayPage({
   useEffect(() => {
     let cancelled = false;
     const onFocus = () => {
+      const started = gatewayGeneration();
       void invoke<GatewayResult>("load_gateway")
         .then((result) => {
-          if (!cancelled) accept(result);
+          // 读的过程中保存过：这份是旧的，不用。
+          if (!cancelled && started === gatewayGeneration()) accept(result);
         })
         .catch(() => undefined);
     };
@@ -150,9 +160,10 @@ export function GatewayPage({
     if (tab !== "routing") return;
     let cancelled = false;
     const timer = window.setInterval(() => {
+      const started = gatewayGeneration();
       void invoke<GatewayResult>("load_gateway")
         .then((result) => {
-          if (!cancelled) accept(result);
+          if (!cancelled && started === gatewayGeneration()) accept(result);
         })
         .catch(() => undefined);
     }, LIVE_REFRESH_MS);
@@ -187,7 +198,8 @@ export function GatewayPage({
       {/* 页面标题由外层框架显示，这里只放分段标签和刷新。 */}
       {controlledTab ? (
         // 由外层侧栏控制时不显示页内工具条，刷新按钮放进外壳顶栏。
-        <TopbarActions>{refreshButton}</TopbarActions>
+        // 用量页签有自己的刷新（读用量和余额），这里的只刷新网关状态，放在一起会让人以为刷新了用量。
+        <TopbarActions>{tab === "usage" ? null : refreshButton}</TopbarActions>
       ) : (
         <div className="gw-toolbar">
           <nav aria-label={t("本地网关")} className="gw-tabs" role="tablist">
@@ -774,7 +786,9 @@ function GatewayView({ payload, busy, run }: { payload: GatewayPayload | null; b
         <div className="gw-setting-row">
           <div>
             <strong>{t("退出 Codex++ 时恢复直连")}</strong>
-            <small>{t("网关只在 Codex++ 运行时可用。打开后退出时把 Agent 切回直连，下次启动再自动指回网关。")}</small>
+            <small>{restoreOnExit
+              ? t("网关只在 Codex++ 运行时可用。退出时把 Agent 切回直连，下次启动再自动指回网关。")
+              : t("Agent 一直指着网关：退出 Codex++ 后连不上，再打开就恢复。安装更新前照样会切回直连。")}</small>
           </div>
           <span />
           <Switch disabled={busy !== null} label={t("退出 Codex++ 时恢复直连")} on={restoreOnExit} onToggle={() => saveOptions(mode, !restoreOnExit)} />
@@ -792,56 +806,6 @@ function GatewayView({ payload, busy, run }: { payload: GatewayPayload | null; b
             label={t("模型名后带供应商")}
             on={modelSuffix}
             onToggle={() => void run("model-suffix", "save_gateway_model_suffix", { enabled: !modelSuffix }, t("保存网关选项"), true)}
-          />
-        </div>
-      </div>
-      <ImageModelCard busy={busy} payload={payload} run={run} />
-    </>
-  );
-}
-
-/** 一项生图选项的显示名：「ChatGPT Pro · gpt-image」。 */
-function imageOptionLabel(option: ImageOption): string {
-  return `${maskAccountName(shortProviderName(option.providerName))} · ${option.model}`;
-}
-
-/** 生图模型：Agent 的生图请求（如 Codex 的 imagegen）经网关发给这里选的模型。 */
-function ImageModelCard({ payload, busy, run }: { payload: GatewayPayload; busy: string | null; run: Run }) {
-  const value = payload.gateway.imageModel ?? "";
-  const options = payload.imageOptions ?? [];
-  const auto = payload.imageAuto ?? null;
-  const known = value === "" || value === "off" || options.some((option) => option.id === value);
-  const items = [
-    { value: "", label: auto ? tf("自动 · {0}", [imageOptionLabel(auto)]) : t("自动"), hint: t("ChatGPT 账号优先，其次按池里的顺序找有生图模型的供应商") },
-    ...options.map((option) => ({
-      value: option.id,
-      label: imageOptionLabel(option),
-      hint: option.vendorPicks ? t("ChatGPT 后端自己选生图模型") : undefined,
-    })),
-    ...(known ? [] : [{ value, label: tf("{0}（已不可用）", [value]), hint: t("所在的供应商已删除或关闭") }]),
-    { value: "off", label: t("关闭"), hint: t("生图请求直接报错") },
-  ];
-  const missing = value === "" && !auto;
-  return (
-    <>
-      <SectionLabel>{t("生图")}</SectionLabel>
-      <div className="gw-card">
-        <div className="gw-setting-row">
-          <div>
-            <strong>{t("生图模型")}</strong>
-            <small>{missing
-              ? t("池里还没有能生图的模型：登录一个 ChatGPT 账号，或给供应商加上生图模型（如 gpt-image-1）。")
-              : t("Agent 的生图请求（如 Codex 的生图）经网关发给它，出错时自动换下一家。生图模型不出现在聊天的模型列表里。")}</small>
-          </div>
-          <span />
-          <AppSelect
-            className="gw-image-select"
-            disabled={busy !== null}
-            label={t("生图模型")}
-            menuWidth={300}
-            onChange={(next) => void run("image-model", "save_gateway_image_model", { model: next }, t("保存生图模型"), true)}
-            options={items}
-            value={value}
           />
         </div>
       </div>
