@@ -121,8 +121,9 @@ import { AppDialogHost, appAlert, appConfirm, appPrompt } from "./app-dialog";
 import { GatewayPage, type GatewayTab } from "./GatewayPage";
 import { AgentGlyph, HubOverview, useGatewayPayload } from "./HubOverview";
 import { CommandPalette, type PaletteCommand } from "./CommandPalette";
+import { paletteShortcut } from "./command-palette-model";
 import { SessionsView, sessionDeleteSucceeded } from "./GatewaySessions";
-import { agentName, formatQueueWait, formatRequestCost, maskAccountName, queueWaitMs, QUEUE_REASON_PREFIX, usageRangeStart, type GatewayResult, type UsageCost, type UsageRange } from "./gateway-model";
+import { agentName, formatQueueWait, formatRequestCost, maskAccountName, queueWaitMs, QUEUE_REASON_PREFIX, foreignCompactionDropped, FOREIGN_COMPACTION_DROPPED_REASON, usageRangeStart, type GatewayResult, type UsageCost, type UsageRange } from "./gateway-model";
 import { SessionAgentTabs, type SessionTab } from "./SessionAgentTabs";
 import { UsageTabs, onOpenRequestLog, type RequestLogFocus } from "./UsageTabs";
 import { noticeDuration, noticeTone } from "./notice-model";
@@ -135,6 +136,7 @@ import { shouldShowTour, TOUR_STORAGE_KEY, TOUR_VERSION } from "./onboarding-mod
 import "./ToolPages.css";
 import { BACKEND_SETTINGS_CHANGED_EVENT, ComputerUsePage } from "./ComputerUsePage";
 import { PluginMarketScreen } from "./PluginMarketScreen";
+import { defaultMarketSort, localScriptState, parseMarketTime, relativeAge, sortMarketScripts, type LocalScriptState, type ScriptMarketSort } from "./script-market-model";
 import { ReleaseNotes } from "./ReleaseNotes";
 import { UPDATE_CHECK_INTERVAL_MS, UpdateNotifications, updatePreferencesFrom } from "./update-notification";
 import { McpPage, PageHeader } from "./ManagementPages";
@@ -244,6 +246,8 @@ import {
   normalizeAggregateDefaultRelayId,
 } from "./aggregate-members";
 import { relayAuthForLiveDraft, shouldBackfillRelayProfileBeforeSwitch } from "./relay-live-files";
+import { relayBillingCacheKey, relayBillingProbeEligible, type RelayBillingProbe } from "./relay-billing";
+import { RelayBillingLine, RelayBillingRetry, useRelayBillingProbe } from "./RelayBillingLine";
 import { apiKeyPreview, createRelayApiKey, normalizeRelayApiKeys, relayProfileWithNormalizedApiKeys, relayProfileWithUpdatedApiKey, type RelayApiKey } from "./provider-api-keys";
 import { relayHeadersValidationMessage, serializeRelayHeaders } from "./relay-headers";
 import { sessionProviderForProtocol } from "./relay-session";
@@ -935,11 +939,21 @@ type ProviderImportRequest = {
   relayMode: string;
   configContents: string;
   authContents: string;
+  /** 空为直连模式供应商；"pool" 为网关供应商池。 */
+  target?: string;
 };
 
 type PendingProviderImportResult = CommandResult<{
   pending: ProviderImportRequest | null;
+  /** pending 文件内容的指纹，确认 / 取消时带回。 */
+  fingerprint?: string | null;
 }>;
+
+type PendingProviderImport = { request: ProviderImportRequest; fingerprint: string };
+
+function pendingProviderImportFromResult(result: { pending: ProviderImportRequest | null; fingerprint?: string | null }): PendingProviderImport | null {
+  return result.pending ? { request: result.pending, fingerprint: result.fingerprint ?? "" } : null;
+}
 
 type EnvConflict = {
   name: string;
@@ -1185,6 +1199,8 @@ type ScriptMarketItem = {
   tags: string[];
   homepage: string;
   script_url: string;
+  /// 该脚本最近更新时间（ISO），清单逐条提供；老清单没有时为空（#2781）。
+  updatedAt?: string;
   installed: boolean;
   installedVersion: string;
   updateAvailable: boolean;
@@ -1378,6 +1394,8 @@ const gatewayRouteByTab = { ...Object.fromEntries(Object.entries(gatewayTabByRou
  * 要么不接入、照它自己的配置文件直连。
  */
 const agentHomeRoute: Record<string, Route> = { codex: "overview", claude: "claude", grok: "overview" };
+/** 轻量检查 Codex 进程是否还在的间隔（只在管理器窗口可见时查）。 */
+const codexRunningPollMs = 5_000;
 const agentEntryRoute = (toolId: ToolId) => agentTarget(agentRoutes(toolId), lastAgentRoute.get(toolId), agentHomeRoute[toolId] ?? "overview");
 
 const defaultSettings: BackendSettings = {
@@ -1551,7 +1569,7 @@ export function App() {
   const [envConflicts, setEnvConflicts] = useState<EnvConflictsResult | null>(null);
   const [relayEnvironment, setRelayEnvironment] = useState<RelayEnvironmentResult | null>(null);
   const [ccsProviders, setCcsProviders] = useState<CcsProvidersResult | null>(null);
-  const [pendingProviderImport, setPendingProviderImport] = useState<ProviderImportRequest | null>(null);
+  const [pendingProviderImport, setPendingProviderImport] = useState<PendingProviderImport | null>(null);
   const [localSessions, setLocalSessions] = useState<LocalSessionsResult | null>(null);
   const [liveContextEntries, setLiveContextEntries] = useState<CodexContextEntries | null>(null);
   const [logs, setLogs] = useState<LogsResult | null>(null);
@@ -1968,27 +1986,31 @@ export function App() {
   const refreshPendingProviderImport = async (silent = true) => {
     const result = await run(() => call<PendingProviderImportResult>("load_pending_provider_import"));
     if (result) {
-      setPendingProviderImport(result.pending);
+      setPendingProviderImport(pendingProviderImportFromResult(result));
       if (!silent && !isSuccessStatus(result.status)) showResultNotice(t("Codex++ 导入"), result, { silentSuccess: true });
     }
     return result;
   };
 
+  // 确认 / 取消都带上弹窗展示时的指纹：期间被新链接覆盖时后端拒绝写入，弹窗换成新的那条重新确认。
   const confirmPendingProviderImport = async () => {
-    const result = await run(() => call<SettingsResult>("confirm_pending_provider_import"));
+    const fingerprint = pendingProviderImport?.fingerprint ?? "";
+    const result = await run(() => call<SettingsResult>("confirm_pending_provider_import", { fingerprint }));
     if (result) {
-      setPendingProviderImport(null);
       setSettings(result);
       setSettingsForm(normalizeSettings(result.settings));
       showResultNotice(t("Codex++ 导入"), result);
+      if (isSuccessStatus(result.status)) setPendingProviderImport(null);
+      else await refreshPendingProviderImport(true);
       await refreshCcsProviders(true);
     }
   };
 
   const dismissPendingProviderImport = async () => {
-    const result = await run(() => call<PendingProviderImportResult>("dismiss_pending_provider_import"));
+    const fingerprint = pendingProviderImport?.fingerprint ?? null;
+    const result = await run(() => call<PendingProviderImportResult>("dismiss_pending_provider_import", { fingerprint }));
     if (result) {
-      setPendingProviderImport(null);
+      setPendingProviderImport(isSuccessStatus(result.status) ? pendingProviderImportFromResult(result) : null);
       showResultNotice(t("Codex++ 导入"), result, { silentSuccess: true });
     }
   };
@@ -4486,6 +4508,23 @@ export function App() {
   const isGlobalPage = globalNavigationRoutes.includes(route);
   const isManagementScreen = route === "relay" || route === "multiLaunch" || route === "sessions" || route === "context" || route === "skills";
   const codexAppRunning = overview?.runtime_health?.codex_app?.status === "running";
+  // Codex 可能在它自己的窗口里被退出，既不经过 Codex++ 也不触发窗口聚焦（#2778）。
+  // 窗口可见时每 5 秒只查一次进程是否还在，和当前显示不一致再完整刷新概览。
+  useEffect(() => {
+    let disposed = false;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState !== "visible") return;
+      void invoke<boolean | null>("codex_app_running")
+        .then((running) => {
+          if (!disposed && typeof running === "boolean" && running !== codexAppRunning) void refreshOverview(true);
+        })
+        .catch(() => undefined);
+    }, codexRunningPollMs);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [codexAppRunning]);
   // 「启动 / 重启 Codex」：Codex 页面的顶栏按钮和侧栏播放键共用一份状态，都走 actions.launch / actions.restart。
   const codexToolEntry = toolEntries.find((entry) => entry.id === "codex");
   const codexLaunch: CodexLaunchState = {
@@ -4921,7 +4960,7 @@ export function App() {
       ) : null}
       {pendingProviderImport ? (
         <PendingProviderImportDialog
-          request={pendingProviderImport}
+          request={pendingProviderImport.request}
           onConfirm={() => void confirmPendingProviderImport()}
           onDismiss={() => void dismissPendingProviderImport()}
         />
@@ -6236,13 +6275,18 @@ function requestLogRetryLabel(entry: RequestLogEntry) {
   // 网关因 Codex++ 本地限速排过队：标出排了多久。
   const queued = queueWaitMs(entry.retryReasons);
   const queue = queued === null ? "" : tf("限速排队 {0}", [formatQueueWait(queued)]);
-  return [base, queue].filter(Boolean).join(" · ") || "-";
+  // 换上游后去掉了别家签发的压缩上下文：较早的对话内容上游已看不到，必须让用户看得见。
+  const compaction = foreignCompactionDropped(entry.retryReasons) ? t("已去掉别家压缩上下文") : "";
+  return [base, queue, compaction].filter(Boolean).join(" · ") || "-";
 }
 
-/** 重试原因的展示：网关记的限速排队换成「限速排队 Xs」，其它原样。 */
+/** 重试原因的展示：网关记的限速排队换成「限速排队 Xs」，去掉别家压缩上下文换成说明，其它原样。 */
 function requestLogRetryReasons(entry: RequestLogEntry): string {
   return (entry.retryReasons ?? [])
     .map((reason) => {
+      if (reason === FOREIGN_COMPACTION_DROPPED_REASON) {
+        return t("已去掉别家签发的压缩上下文，较早的对话内容不可用");
+      }
       if (!reason.startsWith(QUEUE_REASON_PREFIX)) return reason;
       const queued = queueWaitMs([reason]);
       return queued === null ? reason : tf("限速排队 {0}", [formatQueueWait(queued)]);
@@ -6599,7 +6643,7 @@ function RequestLogScreen({ initialAgent = "all", initialFocus = {}, onConsumeIn
                     ) : null}
                   </span>
                   <span
-                    className={entry.autoRetries > 0 || queueWaitMs(entry.retryReasons) !== null ? "request-log-retry" : "request-log-muted"}
+                    className={entry.autoRetries > 0 || queueWaitMs(entry.retryReasons) !== null || foreignCompactionDropped(entry.retryReasons) ? "request-log-retry" : "request-log-muted"}
                     title={requestLogRetryReasons(entry)}
                   >
                     {requestLogRetryLabel(entry)}
@@ -9491,6 +9535,14 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
       return haystack.includes(query);
     });
   }, [marketSearch, marketScripts]);
+  // 用户没手动选排序时跟随数据：清单里每个脚本都标了更新时间就默认「最近更新」，否则保持清单原顺序。
+  const [marketSortChoice, setMarketSortChoice] = useState<ScriptMarketSort | null>(null);
+  const marketSort = marketSortChoice ?? defaultMarketSort(marketScripts);
+  const sortedMarketScripts = useMemo(
+    () => sortMarketScripts(filteredMarketScripts, marketSort),
+    [filteredMarketScripts, marketSort],
+  );
+  const hasMarketUpdateTimes = marketScripts.some((script) => parseMarketTime(script.updatedAt) !== null);
   const installedCount = marketScripts.filter((script) => script.installed).length;
   // market_id -> 本地脚本 key。只用 user 来源的脚本：内置脚本走的是 builtin: 前缀，
   // 后端 delete_user_script 只接受 user:，映射过去会直接报错。
@@ -9567,6 +9619,23 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
               value={marketSearch}
             />
           </div>
+          <AppSelect
+            ariaLabel={t("市场脚本排序")}
+            className="script-market-sort"
+            onChange={(value) => setMarketSortChoice(value)}
+            options={[
+              { value: "default", label: t("默认顺序") },
+              {
+                value: "updated",
+                label: t("最近更新"),
+                title: hasMarketUpdateTimes ? undefined : t("市场清单暂未提供脚本更新时间"),
+              },
+              { value: "name", label: t("名称") },
+            ]}
+            size="sm"
+            title={t("市场脚本排序")}
+            value={marketSort}
+          />
           <div className="script-market-view-toggle" role="group" aria-label={t("脚本排版")}>
             <Button aria-pressed={marketView === "grid"} onClick={() => setMarketView("grid")} size="sm" variant={marketView === "grid" ? "secondary" : "ghost"}>
               <LayoutGrid className="h-4 w-4" />
@@ -9583,7 +9652,7 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
         marketScripts.length ? (
           filteredMarketScripts.length ? (
             <div className={marketView === "list" ? "script-market-list" : "script-market-grid"}>
-              {filteredMarketScripts.map((script) => (
+              {sortedMarketScripts.map((script) => (
                 <MarketScriptCard
                   actions={actions}
                   installedKey={installedKeyByMarketId.get(script.id)}
@@ -9602,7 +9671,7 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
       ) : (
         <Panel>
           <div className="table">
-            {scripts.length ? scripts.map((script) => <ScriptRow key={script.key} script={script} actions={actions} />) : <div className="empty">{t("未发现用户脚本。")}</div>}
+            {scripts.length ? scripts.map((script) => <ScriptRow key={script.key} script={script} globalEnabled={localEnabled} actions={actions} />) : <div className="empty">{t("未发现用户脚本。")}</div>}
           </div>
         </Panel>
       )}
@@ -10801,6 +10870,10 @@ function SortableRelayProfileCard({
   const active = profile.id === form.activeRelayId;
   // 网关托管的供应商：由「Agent 接入」管理，这里只能「使用」（重新接入）。
   const gatewayManaged = profile.id === CODEX_GATEWAY_RELAY_ID;
+  const billing = useRelayBillingProbe(
+    !gatewayManaged && relayBillingProbeEligible(profile) ? relayBillingCacheKey(profile) : "",
+    () => invoke<CommandResult<RelayBillingProbe>>("probe_relay_billing", { profile }),
+  );
   const style: CSSProperties = {
     transform: CSS.Transform.toString(transform),
     transition,
@@ -10848,6 +10921,9 @@ function SortableRelayProfileCard({
             <span className="relay-tag" data-tone="protocol">{relayProtocolShortLabel(profile.protocol)}</span>
           ) : null}
           {active ? <span className="relay-active-badge">{t("使用中")}</span> : null}
+          {!billing.probe && billing.settled ? (
+            <RelayBillingRetry failure={billing.failure} loading={billing.loading} onRefresh={billing.refresh} />
+          ) : null}
         </strong>
         <small>
           {gatewayManaged
@@ -10860,6 +10936,9 @@ function SortableRelayProfileCard({
               : t("使用 Codex 当前登录的 ChatGPT 账号")
             : relayProfileConfigBrief(profile)}
         </small>
+        {billing.probe ? (
+          <RelayBillingLine failure={billing.failure} loading={billing.loading} onRefresh={billing.refresh} probe={billing.probe} />
+        ) : null}
       </span>
       <span className="relay-card-actions">
         <Button
@@ -10973,6 +11052,23 @@ function formatMarketUpdatedAt(value: string): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+/// 市场脚本更新时间的相对描述：刚刚 / N 小时前 / N 天前 / N 个月前 / N 年前。
+function formatRelativeAge(time: number, now = Date.now()): string {
+  const age = relativeAge(time, now);
+  switch (age.unit) {
+    case "justNow":
+      return t("刚刚");
+    case "hours":
+      return tf("{0} 小时前", [age.value]);
+    case "days":
+      return tf("{0} 天前", [age.value]);
+    case "months":
+      return tf("{0} 个月前", [age.value]);
+    case "years":
+      return tf("{0} 年前", [age.value]);
+  }
+}
+
 function MarketScriptCard({
   script,
   actions,
@@ -10993,12 +11089,20 @@ function MarketScriptCard({
   const hiddenTags = script.tags.slice(3);
   const isGitHubHomepage = script.homepage ? isGitHubRepositoryHomepage(script.homepage) : false;
   const githubSupportLabel = isGitHubHomepage ? tf("在 GitHub 上支持作者：{0}", [script.name]) : undefined;
+  const updatedTime = parseMarketTime(script.updatedAt);
   return (
     <div className="script-market-card" data-view={view}>
       <div className="script-market-title">
         <div>
           <strong>{script.name}</strong>
-          <span>{script.author || t("未知作者")} · v{script.version}</span>
+          <span>
+            {script.author || t("未知作者")} · v{script.version}
+            {updatedTime !== null ? (
+              <time dateTime={script.updatedAt} title={tf("更新于 {0}", [formatMarketUpdatedAt(script.updatedAt || "")])}>
+                {" · "}{tf("{0}更新", [formatRelativeAge(updatedTime)])}
+              </time>
+            ) : null}
+          </span>
         </div>
         {status ? <UiBadge className="script-market-status" variant={script.updateAvailable ? "default" : "secondary"}>{status}</UiBadge> : null}
       </div>
@@ -14828,23 +14932,30 @@ function PendingProviderImportDialog({
   onConfirm: () => void;
   onDismiss: () => void;
 }) {
+  const toPool = request.target === "pool";
   return (
     <div className="modal-backdrop" role="dialog" aria-modal="true">
       <div className="modal-card provider-import-modal">
         <div className="modal-head">
           <div>
             <h2>{t("导入 Codex++ 供应商")}</h2>
-            <p>{t("检测到来自网页的供应商配置导入请求，确认后会写入本机 Codex++。")}</p>
+            <p>{toPool ? t("检测到来自网页的供应商导入请求，确认后会加进网关供应商池，并自动从上游获取模型。") : t("检测到来自网页的供应商配置导入请求，确认后会写入本机 Codex++。")}</p>
           </div>
           <button className="toast-close" onClick={onDismiss} type="button">×</button>
         </div>
         <div className="metric-list">
           <Metric label={t("名称")} value={request.name || t("未命名供应商")} />
+          <Metric label={t("导入到")} value={toPool ? t("网关供应商池") : t("直连模式供应商")} />
           <Metric label="Base URL" value={request.baseUrl || t("未填写")} />
           <Metric label={t("协议")} value={providerImportWireApiLabel(request.wireApi)} />
-          <Metric label={t("模式")} value={providerImportRelayModeLabel(request.relayMode)} />
+          {toPool ? null : <Metric label={t("模式")} value={providerImportRelayModeLabel(request.relayMode)} />}
           <Metric label="API Key" value={maskSecret(request.apiKey)} />
         </div>
+        {toPool ? (
+          <div className="hint-line" role="note">
+            {t("导入后供应商默认启用，会按「Agent 接入」里各 Agent 的「添加供应商时自动加入」设置立即承接请求。")}
+          </div>
+        ) : null}
         <div className="hint-line" role="note">
           {t("安全提示：网页链接中的自定义 config.toml 和 auth.json 不会执行；管理工具只会使用上方字段生成受管配置。")}
         </div>
@@ -15745,7 +15856,7 @@ function AppSidebar({
       <button className="side-search" data-tour="palette" onClick={onOpenPalette} type="button">
         <Search aria-hidden="true" className="side-item-icon" />
         <span>{t("快速跳转")}</span>
-        <kbd>⌘K</kbd>
+        <kbd>{paletteShortcut}</kbd>
       </button>
 
       <nav aria-label={t("主导航")} className="side-nav">
@@ -15900,20 +16011,50 @@ function Metric({ label, value }: { label: string; value: string }) {
   );
 }
 
-function ScriptRow({ script, actions }: { script: NonNullable<UserScriptInventory["scripts"]>[number]; actions: Actions }) {
+/// 本地脚本合并状态的文案与悬停说明。
+function localScriptStateLabel(state: LocalScriptState): { label: string; hint: string } {
+  switch (state) {
+    case "off":
+      return { label: t("已关闭"), hint: t("该脚本已关闭，不会注入 Codex") };
+    case "globalOff":
+      return { label: t("整体已关闭"), hint: t("脚本开着，但「启用本地脚本」整体开关关着，暂不注入") };
+    case "loaded":
+      return { label: t("已加载"), hint: t("已在 Codex 里运行") };
+    case "loading":
+      return { label: t("加载中"), hint: t("正在 Codex 里加载") };
+    case "failed":
+      return { label: t("加载失败"), hint: t("脚本在 Codex 里运行出错") };
+    case "notLoaded":
+      return { label: t("未加载"), hint: t("Codex 未运行或尚未热重载脚本") };
+  }
+}
+
+/// 本地脚本一行：名称 / 来源 / 开关 + 状态 / 操作。
+/// 以前「启用 / 关闭」和 loaded / disabled 各占一列、还另有启用按钮，三处说同一件事（#2781）；
+/// 现在开关直接放进状态列，状态只补充开关之外的信息（是否真正加载、失败原因）。
+function ScriptRow({ script, globalEnabled, actions }: { script: NonNullable<UserScriptInventory["scripts"]>[number]; globalEnabled: boolean; actions: Actions }) {
   const source = script.market_id ? tf("市场 · {0}", [script.version || t("未知版本")]) : script.source === "builtin" ? t("内置") : t("用户");
   const canDelete = script.source === "user";
+  const state = localScriptState(script, globalEnabled);
+  const { label, hint } = localScriptStateLabel(state);
+  const stateHint = state === "failed" && script.error ? `${hint}\n${script.error}` : hint;
   return (
-    <div className="table-row">
+    <div className="table-row user-script-row">
       <span>{script.name}</span>
       <span>{source}</span>
-      <span>{script.enabled ? t("启用") : t("关闭")}</span>
-      <span>{script.status}</span>
+      <div className="user-script-state">
+        <label className="relay-bare-switch" title={script.enabled ? t("关闭该脚本") : t("启用该脚本")}>
+          <input
+            aria-label={tf("启用 {0}", [script.name])}
+            checked={script.enabled}
+            onChange={() => void actions.setUserScriptEnabled(script.key, !script.enabled)}
+            type="checkbox"
+          />
+          <ToggleVisual />
+        </label>
+        <span className="user-script-state-label" data-state={state} title={stateHint}>{label}</span>
+      </div>
       <div className="script-row-actions">
-        <Button onClick={() => void actions.setUserScriptEnabled(script.key, !script.enabled)} size="sm" variant="secondary">
-          {script.enabled ? <PowerOff className="h-4 w-4" /> : <Power className="h-4 w-4" />}
-          {script.enabled ? t("禁用") : t("启用")}
-        </Button>
         {canDelete ? (
           <Button onClick={() => void actions.deleteUserScript(script.key)} size="sm" variant="outline">
             <Trash2 className="h-4 w-4" />
@@ -17139,6 +17280,9 @@ function providerImportWireApiLabel(value: string): string {
   const normalized = value.trim().toLowerCase();
   if (normalized === "chat" || normalized === "chat_completions" || normalized === "chat-completions") {
     return "Chat Completions";
+  }
+  if (normalized === "anthropic" || normalized === "anthropic_messages" || normalized === "anthropic-messages" || normalized === "messages") {
+    return "Anthropic Messages";
   }
   return "Responses";
 }
