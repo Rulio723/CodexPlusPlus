@@ -78,6 +78,10 @@ export type GatewayPoolEntry = {
   contextWindow?: number | null;
   /** 网关供应商单独走的 HTTP 代理，空串表示不单独走代理。 */
   proxy?: string;
+  /** 主动限速：每个 Key 每分钟最多请求数；没有或 null 表示不限。旧版后端没有。 */
+  keyRpm?: number | null;
+  /** 主动限速：每个 Key 同时进行的最多请求数；没有或 null 表示不限。旧版后端没有。 */
+  keyConcurrency?: number | null;
   /** 转发前移除托管生图工具（image_generation，#228）。旧版后端没有。 */
   stripImageGenerationTool?: boolean;
   /** 登录得到的账号：chatgpt / copilot / grok；普通供应商为空。 */
@@ -294,6 +298,31 @@ export function parseContextWindow(value: string): number | null {
   const base = Number(match[1]);
   const scale = match[2] === "m" ? 1_000_000 : match[2] === "k" ? 1_000 : 1;
   return Math.round(base * scale);
+}
+
+/** 主动限速的上限：留空是不限（null），正整数是上限；0、小数、负数或别的写法无效（NaN）。 */
+export function parseKeyLimit(value: string): number | null {
+  const text = value.trim();
+  if (!text) return null;
+  if (!/^\d+$/.test(text)) return Number.NaN;
+  const limit = Number(text);
+  return limit > 0 && limit <= 1_000_000 ? limit : Number.NaN;
+}
+
+/** 请求日志「重试原因」里网关记的限速排队：`local_rate_limit_wait_ms:<毫秒>`。 */
+export const QUEUE_REASON_PREFIX = "local_rate_limit_wait_ms:";
+
+/** 这次请求因 Codex++ 本地限速排队了多久（毫秒）；没排过队返回 null。 */
+export function queueWaitMs(reasons: string[] | null | undefined): number | null {
+  const reason = (reasons ?? []).find((item) => item.startsWith(QUEUE_REASON_PREFIX));
+  if (reason === undefined) return null;
+  const ms = Number(reason.slice(QUEUE_REASON_PREFIX.length));
+  return Number.isFinite(ms) && ms >= 0 ? ms : null;
+}
+
+/** 排队时长的写法：10 秒内保留一位小数（0.4s、3.2s），再长取整（45s）。 */
+export function formatQueueWait(ms: number): string {
+  return ms < 10_000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms / 1000)}s`;
 }
 
 export function splitModels(text: string): string[] {
@@ -1095,14 +1124,27 @@ export function priceFromDraft(draft: ProviderDraft): ProviderPrice | null {
   return price.input || price.cachedInput || price.output ? price : null;
 }
 
+/** 供应商代理设成这个值：不走任何代理，直接连上游（与后端 `relay_proxy::DIRECT_PROXY` 一致，#2760）。 */
+export const DIRECT_PROXY = "direct";
+
+export function isDirectProxy(proxy: string | undefined): boolean {
+  return (proxy ?? "").trim().toLowerCase() === DIRECT_PROXY;
+}
+
+/** 代理地址格式错误时返回中文错误原文；留空或直连都合法。 */
+export function proxyAddressError(proxy: string): string | null {
+  const value = proxy.trim();
+  if (!value || isDirectProxy(value)) return null;
+  return /^(https?|socks5h?):\/\/\S+$/i.test(value) ? null : "代理地址要写成 http://主机:端口（也支持 https:// 与 socks5://）";
+}
+
 /** 表单校验：返回中文错误原文，没问题返回 null。编辑时可以不填 Key。 */
 export function validateProviderDraft(draft: ProviderDraft, editing = false): string | null {
   if (!draft.name.trim()) return "请填写名称";
   if (!/^https?:\/\/\S+$/i.test(draft.baseUrl.trim())) return "地址要以 http:// 或 https:// 开头";
   if (!editing && !draft.keys.trim()) return "请填写 API Key";
   if (!draft.model.trim() && splitModels(draft.modelList).length === 0) return "至少填一个模型";
-  if (draft.proxy.trim() && !/^(https?|socks5h?):\/\/\S+$/i.test(draft.proxy.trim())) return "代理地址要写成 http://主机:端口（也支持 https:// 与 socks5://）";
-  return null;
+  return proxyAddressError(draft.proxy);
 }
 
 /* —————————————— 用量 —————————————— */
@@ -1265,15 +1307,23 @@ export function relativeTime(ms: number, now: number): { text: string; args: Arr
   return { text: "{0}", args: [`${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`] };
 }
 
-/** 名字里的邮箱。前面紧挨着 `*` 等字符的不算（那是已经打过码的邮箱尾巴），保证打码可以重复调用。 */
-const EMAIL_PATTERN = /(?<![A-Za-z0-9._%+*-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+/**
+ * 名字里的邮箱。前面紧挨着 `*` 等字符的不算（那是已经打过码的邮箱尾巴），保证打码可以重复调用。
+ * 不用后行断言 `(?<!…)`：旧版系统 WebKit（16.4 以前的版本）不支持，模块一加载就抛 SyntaxError，
+ * 整个管理器白屏 / 黑屏（#2753）。改成把前一个字符（或行首）捕获进第 1 组，替换时原样放回。
+ */
+const EMAIL_PATTERN = /(^|[^A-Za-z0-9._%+*-])([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/g;
+
+function maskEmailsIn(text: string): string {
+  return text.replace(EMAIL_PATTERN, (_match, lead: string, email: string) => lead + maskEmail(email));
+}
 
 /**
  * 订阅账号的显示名打码：「ChatGPT Pro · me@example.com」「Copilot · octocat」这类名字里的账号部分只露头尾，
  * 名字里出现的邮箱也一样。只在显示时处理，存储的名字不变；普通供应商名不受影响。
  */
 export function maskAccountName(name: string): string {
-  const masked = name.replace(EMAIL_PATTERN, maskEmail);
+  const masked = maskEmailsIn(name);
   const match = /^((?:ChatGPT|Copilot|SuperGrok|GitHub Copilot)[^·]*·\s*)(.+)$/.exec(masked);
   // 已经打过码的（带 *）原样返回：名字可能先打码再传给头像等组件，再打一次会变形。
   if (!match || match[2].includes("@") || match[2].includes("*")) return masked;
@@ -1290,7 +1340,7 @@ export function maskAccountText(text: string): string {
     .split(/(「[^」]+」)/)
     .map((part) => (part.startsWith("「") && part.endsWith("」")
       ? `「${maskAccountName(part.slice(1, -1))}」`
-      : part.replace(EMAIL_PATTERN, maskEmail)))
+      : maskEmailsIn(part)))
     .join("");
 }
 

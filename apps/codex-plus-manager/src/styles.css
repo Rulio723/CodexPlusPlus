@@ -10525,6 +10525,37 @@ select {
 .claude-l10n-column .switch-row + .switch-row { margin-top: 14px; padding-top: 14px; border-top: 1px solid hsl(var(--border)); }
 .claude-l10n-column .switch-row strong { font-size: 14px; }
 .claude-l10n-column .switch-row small { margin-top: 5px; line-height: 1.6; }
+/* Bash 时间限制展开项：两个覆盖值各自启停，数字输入固定显示秒。 */
+.claude-bash-timeout-editor {
+  grid-column: 1 / -1;
+  display: grid; gap: 10px; margin-top: 12px; padding: 12px;
+  border: 1px solid hsl(var(--border)); border-radius: 8px;
+  background: hsl(var(--surface-sunken) / 0.45);
+}
+.claude-bash-timeout-editor > p {
+  margin: 0; color: hsl(var(--muted-foreground)); font-size: 12px; line-height: 1.6;
+}
+.claude-l10n-feature-grid > .claude-bash-timeout-master { grid-column: 1 / -1; }
+.claude-l10n-warning { padding: 10px 14px; border: 1px solid hsl(var(--status-warning) / 0.45); border-radius: 10px; background: hsl(var(--status-warning) / 0.08); color: hsl(var(--status-warning)); font-size: 13px; font-weight: 600; line-height: 1.6; overflow-wrap: anywhere; }
+.claude-l10n-column .claude-bash-timeout-editor .switch-row {
+  margin: 0; padding: 10px; background: hsl(var(--background) / 0.72);
+}
+.claude-l10n-column .claude-bash-timeout-editor .switch-row + .switch-row {
+  margin-top: 0; padding-top: 10px; border-top: 0;
+}
+.claude-bash-timeout-value {
+  display: grid; grid-template-columns: minmax(0, 1fr) 132px 18px;
+  gap: 8px; align-items: center; padding: 0 10px 10px;
+}
+.claude-bash-timeout-value > span:first-child {
+  color: hsl(var(--muted-foreground)); font-size: 12.5px;
+}
+.claude-bash-timeout-value > span:last-child {
+  color: hsl(var(--muted-foreground)); font-size: 12px;
+}
+@media (max-width: 560px) {
+  .claude-bash-timeout-value { grid-template-columns: minmax(0, 1fr) 108px 18px; padding-left: 0; padding-right: 0; }
+}
 /* 下方两栏卡片都偏窄：标题与说明改竖排、左对齐，否则说明会被挤成右对齐的两行。 */
 .claude-l10n-column .panel-head { display: grid; gap: 6px; align-items: start; }
 .claude-l10n-column .panel-head p { max-width: none; text-align: left; font-size: 12px; line-height: 1.6; }
@@ -13433,18 +13464,20 @@ button.side-item:hover {
 .shell .side-agent-wrap {
   position: relative;
 }
-/* 只给名字留出播放键的位置，状态点仍贴在行的最右边。 */
-.shell .side-agent-wrap:has(.side-agent-run) .side-item-label {
-  margin-right: 30px;
+/* 只给名字留出播放键的位置，状态点仍贴在行的最右边。
+   用 has-run 类而不是 :has()：旧版系统 WebKit（15.4 以前的版本）不认 :has()，整条规则会被丢掉。 */
+.shell .side-agent-wrap.has-run .side-item-label {
+  margin-right: 32px;
 }
+/* 播放键常显（不靠悬停才出现）：未运行时是绿色播放键加浅底，一眼能看到；点击区 24px。 */
 .shell .side-agent-run {
   position: absolute;
   top: 50%;
-  right: 22px;
+  right: 20px;
   display: grid;
   place-items: center;
-  width: 22px;
-  height: 22px;
+  width: 24px;
+  height: 24px;
   padding: 0;
   border: 0;
   border-radius: 6px;
@@ -13453,11 +13486,16 @@ button.side-item:hover {
   cursor: pointer;
   transform: translateY(-50%);
 }
+.shell .side-agent-run[data-running="false"] {
+  background: hsl(var(--status-success) / 0.14);
+  color: hsl(var(--status-success));
+}
 .shell .side-agent-run:hover:not(:disabled) {
   background: hsl(var(--accent));
   color: hsl(var(--foreground));
 }
 .shell .side-agent-run[data-running="false"]:hover:not(:disabled) {
+  background: hsl(var(--status-success) / 0.24);
   color: hsl(var(--status-success));
 }
 .shell .side-agent-run[data-running="true"]:hover:not(:disabled) {
@@ -13467,13 +13505,18 @@ button.side-item:hover {
   cursor: progress;
   opacity: 0.6;
 }
+.shell .side-agent-run[data-unavailable="true"] {
+  background: transparent;
+  color: hsl(var(--muted-foreground));
+  cursor: not-allowed;
+}
 .shell .side-agent-run:focus-visible {
   outline: 2px solid hsl(var(--ring));
   outline-offset: 1px;
 }
 .shell .side-agent-run svg {
-  width: 12px;
-  height: 12px;
+  width: 13px;
+  height: 13px;
 }
 .shell .side-agent-run[data-running="false"] svg {
   fill: currentColor;
@@ -13814,4 +13857,16 @@ button.side-item:hover {
 
 .shell .request-log-note {
   margin: 0;
+}
+
+/* 「启动 / 重启 Codex」主按钮（#2744 / #2745）：只在 Codex 的页面里放在顶栏最右侧。 */
+.shell .codex-launch {
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+.shell .codex-launch[data-unavailable="true"] {
+  cursor: not-allowed;
+}
+.shell .topbar-codex-launch .codex-launch-button {
+  padding: 0 12px;
 }

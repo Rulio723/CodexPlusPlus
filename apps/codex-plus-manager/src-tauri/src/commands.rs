@@ -83,6 +83,14 @@ pub async fn claude_localization_status() -> CommandResult<Value> {
 }
 
 #[tauri::command]
+pub async fn claude_localization_bash_timeout_status() -> CommandResult<Value> {
+    match tauri::async_runtime::spawn_blocking(codex_plus_core::claude_localization::bash_timeout_status).await {
+        Ok(status) => ok("Claude Bash 加载状态已读取。", serde_json::to_value(status).unwrap_or_else(|_| json!({}))),
+        Err(error) => failed(&format!("Claude Bash 状态读取失败：{error}"), json!({})),
+    }
+}
+
+#[tauri::command]
 pub async fn claude_localization_action(
     app: tauri::AppHandle,
     action: String,
@@ -173,6 +181,22 @@ pub async fn claude_localization_set_computer_use(enabled: bool) -> CommandResul
             } else {
                 "Computer Use 已关闭；重新准备副本后移除。"
             },
+            serde_json::to_value(status).unwrap_or_else(|_| json!({})),
+        ),
+        Ok(Err(error)) => failed(&error.to_string(), json!({})),
+        Err(error) => failed(&format!("Claude 设置失败：{error}"), json!({})),
+    }
+}
+
+#[tauri::command]
+pub async fn claude_localization_set_bash_timeout(
+    timeout: codex_plus_core::settings::ClaudeBashTimeoutSettings,
+) -> CommandResult<Value> {
+    match tauri::async_runtime::spawn_blocking(move || {
+        codex_plus_core::claude_localization::set_bash_timeout(timeout)
+    }).await {
+        Ok(Ok(status)) => ok(
+            "Bash 时间限制设置已保存；重启增强版后生效。",
             serde_json::to_value(status).unwrap_or_else(|_| json!({})),
         ),
         Ok(Err(error)) => failed(&error.to_string(), json!({})),
@@ -1138,9 +1162,12 @@ fn launch_codex_multi_instance_blocking(request: CodexMultiLaunchRequest) -> Com
     if let Ok(existing) = load_multi_instance_manifest(&root)
         && multi_instance_is_running(&existing)
     {
+        // 运行中的实例不会重新写入供应商配置（#2754：改了 Key 再点「启动」仍用旧配置），
+        // 明确告诉用户要点「重启」，前端据 alreadyRunning 直接展示这句提示。
         return ok(
-            "Codex 多开实例已经在运行。",
+            "Codex 多开实例已经在运行；如刚修改过供应商或 API Key，请在「当前运行实例」中点「重启」使新配置生效。",
             json!({
+                "alreadyRunning": true,
                 "instanceId": existing.instance_id,
                 "profileId": existing.profile_id,
                 "pid": existing.pid,
@@ -1368,6 +1395,7 @@ fn launch_codex_multi_instance_blocking(request: CodexMultiLaunchRequest) -> Com
         .arg("--codex-plus-multi-worker")
         .arg(&worker_options_path)
         .env("HOME", &worker_home)
+        .env_remove("CODEX_ELECTRON_USER_DATA_PATH")
         .env("CODEX_HOME", &codex_home)
         .env("CODEX_SQLITE_HOME", &sqlite_home)
         .env("CODEX_PLUS_MULTI_INSTANCE", "1")
@@ -2053,6 +2081,22 @@ fn multi_instance_slug(value: &str) -> String {
 }
 
 fn multi_instance_user_data_dir(slug: &str) -> PathBuf {
+    multi_instance_user_data_dir_with_root(
+        slug,
+        std::env::var_os("CODEX_ELECTRON_USER_DATA_PATH").map(PathBuf::from),
+    )
+}
+
+fn multi_instance_user_data_dir_with_root(slug: &str, electron_root: Option<PathBuf>) -> PathBuf {
+    // 多开根与主实例 userData 同级，避免主实例清理时连带删除多开数据。
+    if let Some(root) = electron_root.filter(|root| !root.as_os_str().is_empty()) {
+        let parent = root.parent().unwrap_or_else(|| Path::new("."));
+        let name = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("CodexPlusPlus");
+        return parent.join(format!("{name}-multi")).join(slug);
+    }
     directories::BaseDirs::new()
         .map(|dirs| {
             dirs.data_local_dir()
@@ -5320,16 +5364,28 @@ fn merge_manual_provider_sync_targets(
 
 #[tauri::command]
 pub async fn repair_session_index() -> CommandResult<Value> {
+    let debug_port = codex_plus_launcher::session_snapshot().debug_port;
     let result =
         tauri::async_runtime::spawn_blocking(|| codex_plus_data::repair_session_index(None))
             .await
             .map_err(|error| anyhow::anyhow!("session index repair task failed: {error}"))
             .and_then(|result| result);
     match result {
-        Ok(report) => ok(
-            &format!("会话索引检查完成，恢复 {} 条消息。", report.repaired_items),
-            json!(report),
-        ),
+        Ok(report) => {
+            codex_plus_core::history_turn_recovery::after_index_repair(
+                debug_port,
+                report.aborted_reason.is_some(),
+                report.checked_at_ms,
+            );
+            let mut payload = json!(report);
+            payload["frontendRecovery"] = json!({
+                "status": "pending", "loadedPages": 0, "metadataPages": 0,
+            });
+            ok(
+                &format!("会话索引检查完成，恢复 {} 条消息。", report.repaired_items),
+                payload,
+            )
+        }
         Err(error) => failed(&format!("修复会话索引失败：{error}"), json!({})),
     }
 }
@@ -5337,7 +5393,17 @@ pub async fn repair_session_index() -> CommandResult<Value> {
 #[tauri::command]
 pub async fn load_session_index_repair_report() -> CommandResult<Value> {
     let result = tauri::async_runtime::spawn_blocking(|| {
-        codex_plus_data::load_session_index_repair_report(None)
+        codex_plus_data::load_session_index_repair_report(None).map(|report| {
+            report.map(|report| {
+                let frontend = codex_plus_core::history_turn_recovery::load_report(
+                    &codex_plus_core::relay_config::default_codex_home_dir(),
+                    report.checked_at_ms,
+                );
+                let mut payload = json!(report);
+                payload["frontendRecovery"] = json!(frontend);
+                payload
+            })
+        })
     })
     .await
     .map_err(|error| anyhow::anyhow!("session index report task failed: {error}"))
@@ -8125,11 +8191,18 @@ pub async fn test_relay_profile(profile: RelayProfile) -> CommandResult<RelayPro
                 "ok"
             };
             let preview = result.response_preview.trim();
-            let detail = if preview.is_empty() {
+            let mut detail = if preview.is_empty() {
                 "响应内容为空".to_string()
             } else {
                 format!("响应：{preview}")
             };
+            // #2754：鉴权失败时说明本次用的是哪个 Key，用户才能和上游报错里的尾号比对。
+            if let Some(hint) = codex_plus_core::relay_config::relay_test_auth_failure_hint(
+                &profile,
+                result.http_status,
+            ) {
+                detail = format!("{detail} {hint}");
+            }
             CommandResult {
                 status: status.to_string(),
                 message: format!(
@@ -8423,16 +8496,25 @@ pub async fn diagnose_relay_profile(profile: RelayProfile) -> CommandResult<Prov
                 id: "request".to_string(),
                 title: "真实请求".to_string(),
                 status: status.to_string(),
-                detail: if preview.is_empty() {
-                    format!(
-                        "{} 返回 HTTP {}，响应内容为空。",
-                        result.endpoint, result.http_status
-                    )
-                } else {
-                    format!(
-                        "{} 返回 HTTP {}：{}",
-                        result.endpoint, result.http_status, preview
-                    )
+                detail: {
+                    let detail = if preview.is_empty() {
+                        format!(
+                            "{} 返回 HTTP {}，响应内容为空。",
+                            result.endpoint, result.http_status
+                        )
+                    } else {
+                        format!(
+                            "{} 返回 HTTP {}：{}",
+                            result.endpoint, result.http_status, preview
+                        )
+                    };
+                    match codex_plus_core::relay_config::relay_test_auth_failure_hint(
+                        &profile,
+                        result.http_status,
+                    ) {
+                        Some(hint) => format!("{detail} {hint}"),
+                        None => detail,
+                    }
                 },
             });
         }
@@ -9572,6 +9654,43 @@ fn default_log_lines() -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn multi_instance_user_data_respects_explicit_electron_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("electron data");
+        let first = multi_instance_user_data_dir_with_root("instance-a", Some(root.clone()));
+        let second = multi_instance_user_data_dir_with_root("instance-b", Some(root.clone()));
+        let multi_root = root.parent().unwrap().join("electron data-multi");
+        assert_eq!(first, multi_root.join("instance-a"));
+        assert_eq!(second, multi_root.join("instance-b"));
+        assert_ne!(first, second);
+        assert!(!first.exists());
+    }
+
+    #[test]
+    fn multi_instance_user_data_without_override_keeps_default_layout() {
+        let expected = directories::BaseDirs::new()
+            .map(|dirs| {
+                dirs.data_local_dir()
+                    .join("CodexPlusPlus")
+                    .join("multi")
+                    .join("instance-a")
+            })
+            .unwrap_or_else(|| {
+                codex_plus_core::paths::default_app_state_dir()
+                    .join("user-data")
+                    .join("instance-a")
+            });
+        assert_eq!(
+            multi_instance_user_data_dir_with_root("instance-a", None),
+            expected
+        );
+        assert_eq!(
+            multi_instance_user_data_dir_with_root("instance-a", Some(PathBuf::new())),
+            expected
+        );
+    }
+
     use super::*;
 
     #[test]

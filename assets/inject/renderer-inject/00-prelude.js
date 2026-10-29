@@ -94,21 +94,21 @@
       }
     };
 
-    // 走 codexStateCall（60-plugin-marketplace.js 的能力探测通道）：老版的
-    // electronBridge + vscode://codex/ 自定义消息在 issue #2399 后已不可靠，
-    // state API 会随构建换模块位置，按能力识别才能一直找到。
+    // 读写走 readCodexAppSetting / writeCodexAppSetting（20-menu.js）：先找宿主服务的
+    // settings.readAll / settings.write，找不到再退回 codexStateCall 的 get-setting /
+    // set-setting。issue #2755：Codex 26.10 起设置改由宿主服务读写，产物里已没有
+    // get-setting / set-setting / set-global-state，只走 state API 时 localeOverride
+    // 永远写不进去、也不会触发刷新，界面就一直是英文。
     //
-    // 但 state API 的 promise 是永久缓存的，且 asset 加载失败会留下 30 秒冷却
-    // （见 20-menu.js 的 codexAppModuleRetryCooldownMs）。注入发生在 App 的
-    // asset 就绪之前时第一次调用必然失败，而那次失败会被一直记住——所以这里
-    // 必须有界重试，不能像老版等 electronBridge 那样一次不成就算了。
+    // 两条通道都依赖 App 的 asset：模块 promise 会被缓存，asset 加载失败还会留下
+    // 30 秒冷却（见 20-menu.js 的 codexAppModuleRetryCooldownMs）。注入发生在 asset
+    // 就绪之前时第一次调用必然失败，所以这里必须有界重试，不能一次不成就算了。
     const localeSyncRetryDelaysMs = [500, 1500, 3000, 6000, 12000, 20000];
-    const callCodexSettingApiOnce = (method, params) => codexStateCall(method, { params });
-    const callCodexSettingApi = async (method, params) => {
+    const withLocaleSyncRetry = async (operation) => {
       let lastError;
       for (let attempt = 0; attempt <= localeSyncRetryDelaysMs.length; attempt += 1) {
         try {
-          return await callCodexSettingApiOnce(method, params);
+          return await operation();
         } catch (error) {
           lastError = error;
           const delay = localeSyncRetryDelaysMs[attempt];
@@ -118,6 +118,9 @@
       }
       throw lastError;
     };
+    // 未写过时宿主服务里没有这个键，按 Codex 的默认值 null 处理。
+    const readLocaleOverride = () => withLocaleSyncRetry(async () => (await readCodexAppSetting("localeOverride")) ?? null);
+    const writeLocaleOverride = (value) => withLocaleSyncRetry(() => writeCodexAppSetting("localeOverride", value));
     const reloadAfterLocaleChange = (value) => {
       const marker = JSON.stringify(value);
       try {
@@ -141,8 +144,7 @@
     const syncOfficialLocaleSetting = async () => {
       const managed = readManagedLocale();
       if (!enabled && !managed) return;
-      const response = await callCodexSettingApi("get-setting", { key: "localeOverride" });
-      const currentValue = response?.value ?? null;
+      const currentValue = await readLocaleOverride();
 
       if (enabled) {
         if (currentValue === locale) {
@@ -152,7 +154,7 @@
         if (!managed) {
           writeManagedLocale({ appliedLocale: locale, previousValue: currentValue });
         }
-        await callCodexSettingApi("set-setting", { key: "localeOverride", value: locale });
+        await writeLocaleOverride(locale);
         reloadAfterLocaleChange(locale);
         return;
       }
@@ -163,10 +165,7 @@
         return;
       }
       const previousValue = managed.previousValue ?? null;
-      await callCodexSettingApi("set-setting", {
-        key: "localeOverride",
-        value: previousValue,
-      });
+      await writeLocaleOverride(previousValue);
       writeManagedLocale(null);
       reloadAfterLocaleChange(previousValue);
     };
@@ -467,7 +466,7 @@
       ? Math.min(1, Math.max(0.01, configuredOpacity)) : 0.35;
     const fitMode = ["fill", "fit", "stretch", "tile", "center"].includes(config.fitMode)
       ? config.fitMode : "fit";
-    const reuse = !!(config.enabled && source && cached?.version === 29 && cached.ready && cached.source === source);
+    const reuse = !!(config.enabled && source && cached?.version === 30 && cached.ready && cached.source === source);
     if (reuse && cached.opacity === opacity && cached.fitMode === fitMode &&
       document.getElementById(codexPlusImageOverlayId)?.getAttribute("data-codex-plus-ext") === "image-overlay") return;
     window.__codexPlusImageOverlayGeometryCleanup?.();
@@ -520,13 +519,15 @@
     const browserPortalAttribute = "data-codex-plus-image-browser-portal";
     const popupMaterialAttribute = "data-codex-plus-image-popup-material";
     const popupBoundaryAttribute = "data-codex-plus-image-popup-boundary";
+    const popupPortalAttribute = "data-codex-plus-image-popup-portal";
+    const popupPortalSelector = ".fixed.inset-0.pointer-events-none.zoom-adjusted-viewport.contain-layout";
     const controlAttribute = "data-codex-plus-image-control";
     const paintAttribute = "data-codex-plus-image-paint";
     const topControlAttribute = "data-codex-plus-image-top-control";
     const footerAttribute = "data-codex-plus-image-footer-gutter";
     const footerSelector = "[data-thread-scroll-footer]";
     const topControlSelector = [
-      '[role="menu"]', '[role="listbox"]', '[role="dialog"]', '[role="tooltip"]',
+      '[role="menu"]', '[role="listbox"]', '[role="dialog"]', '[role="tooltip"]', '[class*="_Tooltip_"]',
       "[data-radix-popper-content-wrapper]", '[data-slot="popover-content"]', "[popover]", composerOverlaySelector,
     ].join(", ");
     // Extensions keep their own layers; their full-page shell is the one wallpaper surface.
@@ -559,6 +560,7 @@
       [${mediaAttribute}="footer"] { z-index:${wallpaperLayer + 1}!important; }
       [${mediaAttribute}^="header"] { z-index:${wallpaperLayer + 1}!important; }
       [${mediaAttribute}="header-flow"] { position:relative!important; }
+      [${mediaAttribute}^="header"][class~="after:bg-linear-to-b"][class~="after:from-surface"][class~="after:to-transparent"]::after { background-image:none!important; }
       ${composerSelector} .top-full [data-composer-placement="home"].bg-background-composer-action-bar { background:none!important; }
       [${mediaAttribute}="page"], [${mediaAttribute}="composer"] { isolation:isolate!important; }
       [${mediaAttribute}="composer"]:not([${mediaAttribute}="footer"] *) { z-index:${wallpaperLayer + 1}!important; }
@@ -575,6 +577,7 @@
       }
       [${controlAttribute}] { z-index:${wallpaperLayer}!important; }
       [${topControlAttribute}] { z-index:${wallpaperLayer + 2}!important; }
+      [${popupPortalAttribute}] { z-index:${wallpaperLayer + 2}!important; }
       [${topControlAttribute}="flow"] { position:relative!important; }
     `;
     const ns = "http://www.w3.org/2000/svg";
@@ -866,13 +869,15 @@
       if (previous) removePopup(surface, previous);
       removeWithin(controls, boundary, removeControl);
       const paint = computed(surface);
-      const record = { boundary, owner: surface.closest(composerOverlaySelector) || boundary,
+      const record = { boundary, portal: boundary.closest(popupPortalSelector), owner: surface.closest(composerOverlaySelector) || boundary,
         id: ++nextControl, backgroundKey: popupBackgroundKey(surface),
         nativeBackground: paint.backgroundColor,
         className: surface.getAttribute("class"), rule: "" };
       // Only the background is translucent; native contents and positioning stay intact.
       record.rule = `[${popupMaterialAttribute}="${record.id}"]{background-color:color-mix(in srgb, ${paint.backgroundColor} ${(1 - opacity) * 100}%, transparent)!important;}`;
       popups.set(surface, record);
+      // Native tooltips share a fixed portal; lifting only its children cannot clear the composer.
+      if (record.portal) mark(record.portal, popupPortalAttribute, "");
       mark(boundary, popupBoundaryAttribute, "");
       mark(boundary, topControlAttribute, computed(boundary).position === "static" ? "flow" : "positioned");
       mark(surface, popupMaterialAttribute, String(record.id));
@@ -918,6 +923,8 @@
     const removePopup = (surface, record) => {
       popups.delete(surface);
       unmark(surface, popupMaterialAttribute);
+      if (record.portal && ![...popups.values()].some(other => other.portal === record.portal))
+        unmark(record.portal, popupPortalAttribute);
       if (![...popups.values()].some(other => other.boundary === record.boundary)) {
         unmark(record.boundary, popupBoundaryAttribute);
         unmark(record.boundary, topControlAttribute);
@@ -1731,7 +1738,7 @@
         for (let index = 0; index < decoded.length; index++) bytes[index] = decoded.charCodeAt(index);
         blobUrl = URL.createObjectURL(new Blob([bytes], { type: data[1] }));
       }
-      resource = { version: 29, source, blobUrl, imageSource: blobUrl || source };
+      resource = { version: 30, source, blobUrl, imageSource: blobUrl || source };
       window.__codexPlusImageOverlayResource = resource;
       window.__codexPlusImageOverlayBlobUrl = blobUrl;
       image.onload = install;

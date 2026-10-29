@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 
-use crate::gateway::key_pool::{self, KeyRef};
+use crate::gateway::key_pool::{self, KeyLimits, KeyRef};
 use crate::gateway::store::{
     AgentBinding, AutoGroupSettings, GROUP_MODEL_PREFIX, GatewayGroup, GatewayProvider,
     GatewaySettings, GroupMember, GroupMode, GroupSticky, UnknownModelPolicy,
@@ -27,6 +27,9 @@ const MAX_GROUP_DEPTH: usize = 4;
 pub const CACHE_STICKY_TTL: Duration = Duration::from_secs(10 * 60);
 /// 「整个会话固定」也不会永远记着：这么久没用的会话忘掉。
 const SESSION_STICKY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// 依次 / 额度优先的组里，前面的成员答不了、换到别的成员回答时只临时固定这么久
+/// （从第一次换过去算起，期间再成功也不续期），之后先回去试排在前面的成员（#2767）。
+pub const FALLBACK_STICKY_TTL: Duration = Duration::from_secs(10 * 60);
 /// 记住的会话数上限：到了上限先按各组的有效期清掉过期的，还多就淘汰最久没用的。
 const STICKY_LIMIT: usize = 2048;
 /// 淘汰时一次清到上限的这个比例，免得每个请求都整表扫一遍。
@@ -40,6 +43,8 @@ pub struct GatewayCandidate {
     pub upstream_model: String,
     /// 这家这个模型的上下文窗口（供应商池里写了才有）：请求比它还长时排到最后再试。
     pub window: Option<u64>,
+    /// 这家每个 Key 的主动限速上限（没填就是不限）；候选循环发请求前按它占名额。
+    pub limits: KeyLimits,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +58,12 @@ pub struct RoutePlan {
     pub conversation: Option<String>,
     /// 模型组「固定」的有效期；不是模型组或组设成不固定时为 None（不记会话）。
     pub sticky_ttl: Option<Duration>,
+    /// 「依次」组本来该先试的上游 (供应商 id, 模型)，不管它是否在冷却；别的成员回答时只算临时顶替。
+    /// 其余模式为 None。
+    pub preferred: Option<(String, String)>,
+    /// 「额度优先」组：顺序每次按实时额度重排，不能拿排第一的当首选（额度接近时会来回判成顶替）；
+    /// 只有这次请求里确实换了成员（或延续还没到期的顶替），才算临时顶替。
+    pub hold_on_switch: bool,
     pub candidates: Vec<GatewayCandidate>,
     /// 候选为空且是因为 Key 都在冷却/熔断时，最近一个恢复的等待时间。
     pub cooling: Option<Duration>,
@@ -701,8 +712,8 @@ fn sort_by_speed(relays: &mut [(RelayProfile, String)]) {
     });
 }
 
-/// (组 id, 会话) → (供应商 id, 模型, 记下的时间, 这条的有效期)。
-type StickyTable = HashMap<(String, String), (String, String, Instant, Duration)>;
+/// (组 id, 会话) → (供应商 id, 模型, 记下的时间, 这条的有效期, 是否临时顶替)。
+type StickyTable = HashMap<(String, String), (String, String, Instant, Duration, bool)>;
 
 fn sticky_table() -> &'static Mutex<StickyTable> {
     static TABLE: OnceLock<Mutex<StickyTable>> = OnceLock::new();
@@ -710,6 +721,8 @@ fn sticky_table() -> &'static Mutex<StickyTable> {
 }
 
 /// 记下这个会话在组里是哪个上游回答的。没有组、组不固定或没有会话标识时不记。
+/// 按优先级排序的组里由后面的成员顶替回答时，只临时固定 [`FALLBACK_STICKY_TTL`]，
+/// 而且从第一次顶替算起，不随后续成功续期。
 pub fn remember_answer(plan: &RoutePlan, candidate: &GatewayCandidate) {
     let (Some(group), Some(conversation), Some(ttl)) =
         (&plan.group_id, &plan.conversation, plan.sticky_ttl)
@@ -724,13 +737,47 @@ pub fn remember_answer(plan: &RoutePlan, candidate: &GatewayCandidate) {
     if table.len() >= STICKY_LIMIT && !table.contains_key(&key) {
         trim_sticky(&mut table, now);
     }
+    let same = |relay: &str, model: &str| {
+        relay == candidate.relay.id && model == candidate.upstream_model
+    };
+    let fallback = match &plan.preferred {
+        Some((relay, model)) => !same(relay, model),
+        None if plan.hold_on_switch => {
+            let switched = plan
+                .candidates
+                .first()
+                .is_some_and(|first| !same(&first.relay.id, &first.upstream_model));
+            // 顶替期内同一个成员接着回答：仍按顶替算，到期才重新按额度排。
+            let holding = table.get(&key).is_some_and(|(relay, model, at, ttl, was_fallback)| {
+                *was_fallback && same(relay, model) && now.duration_since(*at) < *ttl
+            });
+            switched || holding
+        }
+        None => false,
+    };
+    let (ttl, at) = if fallback {
+        // 同一个顶替成员还在临时固定期内：保留第一次顶替的时间，到期就回去试前面的成员。
+        let since = table
+            .get(&key)
+            .filter(|(relay, model, at, ttl, was_fallback)| {
+                *was_fallback
+                    && *relay == candidate.relay.id
+                    && *model == candidate.upstream_model
+                    && now.duration_since(*at) < *ttl
+            })
+            .map_or(now, |(_, _, at, _, _)| *at);
+        (ttl.min(FALLBACK_STICKY_TTL), since)
+    } else {
+        (ttl, now)
+    };
     table.insert(
         key,
         (
             candidate.relay.id.clone(),
             candidate.upstream_model.clone(),
-            now,
+            at,
             ttl,
+            fallback,
         ),
     );
 }
@@ -738,15 +785,15 @@ pub fn remember_answer(plan: &RoutePlan, candidate: &GatewayCandidate) {
 /// 表满了：先按各条自己的有效期清掉过期的；还多就从最久没用的开始淘汰，清到上限的 3/4，
 /// 之后一段时间的请求不用再扫表。
 fn trim_sticky(table: &mut StickyTable, now: Instant) {
-    table.retain(|_, (_, _, at, ttl)| now.duration_since(*at) < *ttl);
+    table.retain(|_, (_, _, at, ttl, _)| now.duration_since(*at) < *ttl);
     if table.len() < STICKY_TRIM_TO {
         return;
     }
-    let mut ages: Vec<Instant> = table.values().map(|(_, _, at, _)| *at).collect();
+    let mut ages: Vec<Instant> = table.values().map(|(_, _, at, _, _)| *at).collect();
     ages.sort_unstable();
     // 比这一刻早（或同时）记下的都淘汰，剩下的不超过 STICKY_TRIM_TO 条。
     let cutoff = ages[table.len() - STICKY_TRIM_TO];
-    table.retain(|_, (_, _, at, _)| *at > cutoff);
+    table.retain(|_, (_, _, at, _, _)| *at > cutoff);
 }
 
 /// 这个会话在组里该先试的上游 (供应商 id, 模型)：按组的固定方式，过期或不固定时返回 None。
@@ -759,8 +806,10 @@ fn recall_answer(
     let table = sticky_table()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (relay, model, at, _) = table.get(&(group.id.clone(), conversation.to_string()))?;
-    (now.duration_since(*at) < ttl).then(|| (relay.clone(), model.clone()))
+    let (relay, model, at, stored_ttl, _) =
+        table.get(&(group.id.clone(), conversation.to_string()))?;
+    // 临时顶替记的有效期比组的短，按两者中短的算。
+    (now.duration_since(*at) < ttl.min(*stored_ttl)).then(|| (relay.clone(), model.clone()))
 }
 
 /// 组的固定方式对应的有效期；不固定返回 None。
@@ -886,6 +935,15 @@ fn resolve_plan_with(
     let group_id = group.as_ref().map(|group| group.id.clone());
     let sticky_ttl = group.as_ref().and_then(|group| sticky_ttl(group.sticky));
     let mut relays = expand_model(gateway, binding, &model, 0, &mut Vec::new(), advance);
+    // 依次：排序本身就是优先级，记下本来该先试的成员（会话固定挪动顺序之前）。
+    let preferred = group
+        .as_ref()
+        .filter(|group| group.mode == GroupMode::InOrder)
+        .and_then(|_| relays.first())
+        .map(|(relay, model)| (relay.id.clone(), model.clone()));
+    let hold_on_switch = group
+        .as_ref()
+        .is_some_and(|group| group.mode == GroupMode::Usage);
     if let (Some(group), Some(conversation)) = (group.as_ref(), conversation.as_deref())
         && group.mode != GroupMode::Manual
         && let Some(remembered) = recall_answer(group, conversation, Instant::now())
@@ -914,9 +972,12 @@ fn resolve_plan_with(
     let mut candidates = Vec::new();
     let mut cooling: Option<Duration> = None;
     for (relay, upstream_model) in relays {
-        let window = gateway
-            .provider(&relay.id)
-            .and_then(|provider| provider.window_for(&upstream_model));
+        let provider = gateway.provider(&relay.id);
+        let window = provider.and_then(|provider| provider.window_for(&upstream_model));
+        // 限速满了的 Key 照样进候选：是否跳过、排队由候选循环在发请求时按实时名额决定。
+        let limits = provider
+            .map(GatewayProvider::key_limits)
+            .unwrap_or_default();
         let (keys, soonest) = key_pool::order_keys_with(
             &relay,
             gateway.key_policy.mode,
@@ -933,6 +994,7 @@ fn resolve_plan_with(
                 key: key.key,
                 upstream_model: upstream_model.clone(),
                 window,
+                limits,
             });
         }
     }
@@ -943,6 +1005,8 @@ fn resolve_plan_with(
         group_id,
         conversation,
         sticky_ttl,
+        preferred,
+        hold_on_switch,
         candidates,
         cooling,
     })
@@ -962,6 +1026,8 @@ mod tests {
             model_windows: Default::default(),
             context_window: None,
             proxy: String::new(),
+            key_rpm: None,
+            key_concurrency: None,
             upstream_new: Vec::new(),
             upstream_gone: Vec::new(),
             models_checked_at_ms: 0,
@@ -1452,6 +1518,149 @@ mod tests {
     }
 
     #[test]
+    fn in_order_groups_only_hold_a_fallback_member_briefly() {
+        // #2767：依次 + 整个会话固定，第一家答不了换到第二家后，不能把会话永久钉在第二家。
+        let mut gateway = gateway("group/prio");
+        let mut prio = group(
+            "prio",
+            GroupMode::InOrder,
+            vec![member("ds/deepseek-v4-flash"), member("kimi-k3")],
+        );
+        prio.sticky = GroupSticky::Session;
+        gateway.groups.push(prio);
+        let plan = |conversation: &str| {
+            resolve_plan(&gateway, &ToolId::Claude, "group/prio", Some(conversation)).unwrap()
+        };
+        let key = ("prio".to_string(), "prio-conv".to_string());
+
+        let first = plan("prio-conv");
+        assert_eq!(
+            first.preferred,
+            Some(("ds".to_string(), "deepseek-v4-flash".to_string()))
+        );
+        let fallback = first
+            .candidates
+            .iter()
+            .find(|candidate| candidate.relay.id == "kimi")
+            .unwrap()
+            .clone();
+        remember_answer(&first, &fallback);
+        let held = sticky_table().lock().unwrap().get(&key).cloned().unwrap();
+        assert_eq!(held.3, FALLBACK_STICKY_TTL, "顶替只临时固定");
+        assert!(held.4);
+        assert_eq!(
+            plan("prio-conv").candidates[0].relay.id,
+            "kimi",
+            "临时固定期内继续用顶替的成员，保住它的缓存"
+        );
+        // 期间再成功也不续期：仍按第一次顶替的时间算。
+        remember_answer(&plan("prio-conv"), &fallback);
+        assert_eq!(sticky_table().lock().unwrap().get(&key).unwrap().2, held.2);
+
+        // 临时固定到期后先回去试排在前面的成员。
+        sticky_table().lock().unwrap().get_mut(&key).unwrap().2 =
+            Instant::now() - FALLBACK_STICKY_TTL - Duration::from_secs(1);
+        let back = plan("prio-conv");
+        assert_eq!(back.candidates[0].relay.id, "ds");
+        // 排在前面的成员回答后按组的设置固定整个会话。
+        let primary = back.candidates[0].clone();
+        remember_answer(&back, &primary);
+        let pinned = sticky_table().lock().unwrap().get(&key).cloned().unwrap();
+        assert_eq!(pinned.3, SESSION_STICKY_TTL);
+        assert!(!pinned.4);
+        assert_eq!(plan("prio-conv").candidates[0].relay.id, "ds");
+    }
+
+    #[test]
+    fn usage_groups_only_hold_when_this_request_switched_member() {
+        // 额度优先每次按实时额度重排：固定在 A 后 A 的余量落到 B 后面，A 照常回答不能被判成顶替，
+        // 否则额度接近的两个账号会每 10 分钟来回切、缓存反复失效。
+        use crate::gateway::quota::{ProviderQuota, QuotaWindow, record};
+        let quota = |used: f64| ProviderQuota {
+            windows: vec![QuotaWindow {
+                window_minutes: Some(300),
+                used_percent: used,
+                resets_at_ms: None,
+            }],
+            updated_at_ms: 0,
+        };
+        let mut gateway = gateway("group/usage-pin");
+        gateway.providers.extend([
+            provider("us-a", "usage-pin-model"),
+            provider("us-b", "usage-pin-model"),
+        ]);
+        let mut usage = group("usage-pin", GroupMode::Usage, vec![member("usage-pin-model")]);
+        usage.sticky = GroupSticky::Session;
+        gateway.groups.push(usage);
+        let plan = |gateway: &GatewaySettings| {
+            resolve_plan(gateway, &ToolId::Claude, "group/usage-pin", Some("usage-conv")).unwrap()
+        };
+        let key = ("usage-pin".to_string(), "usage-conv".to_string());
+        let entry = || sticky_table().lock().unwrap().get(&key).cloned().unwrap();
+
+        record("us-a", quota(20.0));
+        record("us-b", quota(40.0));
+        let first = plan(&gateway);
+        assert_eq!(first.candidates[0].relay.id, "us-a");
+        assert_eq!(first.preferred, None);
+        remember_answer(&first, &first.candidates[0].clone());
+        assert_eq!(entry().3, SESSION_STICKY_TTL);
+
+        // A 用掉额度后排到 B 后面，但会话记着 A、A 照常回答：仍整会话固定。
+        record("us-a", quota(60.0));
+        let pinned = plan(&gateway);
+        assert_eq!(pinned.candidates[0].relay.id, "us-a", "会话固定把 A 挪到最前");
+        remember_answer(&pinned, &pinned.candidates[0].clone());
+        assert_eq!(entry().3, SESSION_STICKY_TTL);
+        assert!(!entry().4);
+
+        // 这次 A 答不了、换到 B：临时固定，期间 B 接着回答也不续期。
+        let switched = plan(&gateway);
+        let b = switched
+            .candidates
+            .iter()
+            .find(|candidate| candidate.relay.id == "us-b")
+            .unwrap()
+            .clone();
+        remember_answer(&switched, &b);
+        let held = entry();
+        assert_eq!(held.3, FALLBACK_STICKY_TTL);
+        assert!(held.4);
+        let again = plan(&gateway);
+        assert_eq!(again.candidates[0].relay.id, "us-b");
+        remember_answer(&again, &again.candidates[0].clone());
+        assert_eq!(entry().2, held.2, "顶替期内不续期");
+        assert!(entry().4);
+    }
+
+    #[test]
+    fn rotating_groups_keep_session_sticky_for_any_member() {
+        let mut gateway = gateway("group/spin-session");
+        let mut spin = group(
+            "spin-session",
+            GroupMode::Rotate,
+            vec![member("ds/deepseek-v4-flash"), member("kimi-k3")],
+        );
+        spin.sticky = GroupSticky::Session;
+        gateway.groups.push(spin);
+        let first = resolve_plan(
+            &gateway,
+            &ToolId::Claude,
+            "group/spin-session",
+            Some("spin-conv"),
+        )
+        .unwrap();
+        assert_eq!(first.preferred, None, "轮换没有优先级，不算顶替");
+        remember_answer(&first, &first.candidates[1].clone());
+        let table = sticky_table().lock().unwrap();
+        let entry = table
+            .get(&("spin-session".to_string(), "spin-conv".to_string()))
+            .unwrap();
+        assert_eq!(entry.3, SESSION_STICKY_TTL);
+        assert!(!entry.4);
+    }
+
+    #[test]
     fn sticky_off_groups_are_not_remembered_and_the_table_stays_bounded() {
         let mut gateway = gateway("deepseek-v4-pro");
         let mut off = group(
@@ -1489,6 +1698,7 @@ mod tests {
                     "m".to_string(),
                     start + Duration::from_millis(index as u64),
                     SESSION_STICKY_TTL,
+                    false,
                 ),
             );
         }
@@ -1500,7 +1710,7 @@ mod tests {
         let mut table = StickyTable::new();
         table.insert(
             ("g".to_string(), "short".to_string()),
-            ("r".to_string(), "m".to_string(), start, CACHE_STICKY_TTL),
+            ("r".to_string(), "m".to_string(), start, CACHE_STICKY_TTL, false),
         );
         trim_sticky(
             &mut table,
@@ -1720,5 +1930,39 @@ mod tests {
             !models.iter().any(|m| m == "kimi-k3"),
             "fast 组的成员 kimi-k3 被隐藏：{models:?}"
         );
+    }
+
+    /// 主动限速：上限按供应商带到每个候选上；没填（或填 0）就是不限。限速满了的 Key 不从候选里去掉。
+    #[test]
+    fn candidates_carry_their_provider_key_limits() {
+        let mut gateway = gateway("deepseek-v4-pro");
+        gateway.providers[0].key_rpm = Some(10);
+        gateway.providers[0].key_concurrency = Some(2);
+        gateway.providers[2].key_rpm = Some(0);
+        let plan = resolve_plan(&gateway, &ToolId::Claude, "deepseek-v4-pro", None).unwrap();
+        let limits: Vec<(String, KeyLimits)> = plan
+            .candidates
+            .iter()
+            .map(|candidate| (candidate.relay.id.clone(), candidate.limits))
+            .collect();
+        assert_eq!(
+            limits,
+            vec![
+                (
+                    "ds".to_string(),
+                    KeyLimits {
+                        rpm: Some(10),
+                        concurrency: Some(2)
+                    }
+                ),
+                ("mirror".to_string(), KeyLimits::default()),
+            ]
+        );
+        let key = plan.candidates[0].key.clone();
+        let _slot = key_pool::try_acquire(&key, plan.candidates[0].limits, Instant::now());
+        let _second = key_pool::try_acquire(&key, plan.candidates[0].limits, Instant::now());
+        let again = resolve_plan(&gateway, &ToolId::Claude, "deepseek-v4-pro", None).unwrap();
+        assert_eq!(again.candidates.len(), 2, "并发满了也不算冷却");
+        assert_eq!(again.cooling, None);
     }
 }

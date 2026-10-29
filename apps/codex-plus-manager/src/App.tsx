@@ -122,12 +122,13 @@ import { GatewayPage, type GatewayTab } from "./GatewayPage";
 import { AgentGlyph, HubOverview, useGatewayPayload } from "./HubOverview";
 import { CommandPalette, type PaletteCommand } from "./CommandPalette";
 import { SessionsView, sessionDeleteSucceeded } from "./GatewaySessions";
-import { agentName, formatRequestCost, maskAccountName, usageRangeStart, type GatewayResult, type UsageCost, type UsageRange } from "./gateway-model";
+import { agentName, formatQueueWait, formatRequestCost, maskAccountName, queueWaitMs, QUEUE_REASON_PREFIX, usageRangeStart, type GatewayResult, type UsageCost, type UsageRange } from "./gateway-model";
 import { SessionAgentTabs, type SessionTab } from "./SessionAgentTabs";
 import { UsageTabs, onOpenRequestLog, type RequestLogFocus } from "./UsageTabs";
 import { noticeDuration, noticeTone } from "./notice-model";
 import { agentTabGroups, agentTarget } from "./page-groups";
 import { TopbarActions } from "./TopbarActions";
+import { CodexLaunchButton, type CodexLaunchState } from "./CodexLaunchButton";
 import { OnboardingTour } from "./OnboardingTour";
 import { AgentDashboard, type DashboardAgent, type DashboardStat, type DashboardStatus } from "./AgentDashboard";
 import { shouldShowTour, TOUR_STORAGE_KEY, TOUR_VERSION } from "./onboarding-model";
@@ -246,6 +247,7 @@ import { relayAuthForLiveDraft, shouldBackfillRelayProfileBeforeSwitch } from ".
 import { apiKeyPreview, createRelayApiKey, normalizeRelayApiKeys, relayProfileWithNormalizedApiKeys, relayProfileWithUpdatedApiKey, type RelayApiKey } from "./provider-api-keys";
 import { relayHeadersValidationMessage, serializeRelayHeaders } from "./relay-headers";
 import { sessionProviderForProtocol } from "./relay-session";
+import { historyRecoveryStatusLabel, type FrontendRecoveryReport } from "./history-recovery-report";
 import { usePopoverLayer } from "./use-popover-layer";
 import { resolveAnchoredMenuLayout, type AnchoredMenuLayout } from "./popover-layer";
 import { providerAvatarText, resolveProviderName } from "./provider-name";
@@ -372,6 +374,8 @@ type LaunchCommandResult = CommandResult<{
 }>;
 
 type MultiLaunchResult = CommandResult<{
+  /** 实例已在运行、本次没有重新写入供应商配置（需要「重启」才生效）。 */
+  alreadyRunning?: boolean;
   instanceId?: string;
   profileId?: string;
   pid?: number;
@@ -425,6 +429,7 @@ type BackendSettings = {
   codexAppThreadIdBadge: boolean;
   codexAppConversationView: boolean;
   codexAppThreadScrollRestore: boolean;
+  codexAppHistoryTurnRecovery: boolean;
   codexAppNativeMenuPlacement: boolean;
   codexAppNativeBrowserRequireIdentification: boolean;
   codexAppNativeFastUnlock: boolean;
@@ -1070,6 +1075,7 @@ type UpdateProgressEvent = {
 };
 
 type SessionIndexRepairReport = {
+  frontendRecovery?: FrontendRecoveryReport | null;
   scannedFiles: number;
   cachedFiles: number;
   repairedItems: number;
@@ -1407,6 +1413,7 @@ const defaultSettings: BackendSettings = {
   codexAppThreadIdBadge: false,
   codexAppConversationView: false,
   codexAppThreadScrollRestore: true,
+  codexAppHistoryTurnRecovery: false,
   codexAppNativeMenuPlacement: true,
   codexAppNativeBrowserRequireIdentification: false,
   codexAppNativeFastUnlock: false,
@@ -2712,6 +2719,11 @@ export function App() {
         request: { profileId: profile.id },
       }));
       if (!result) return;
+      if (result.alreadyRunning) {
+        showNotice(t("Codex多开"), result.message, result.status);
+        await refreshMultiLaunchInstances(true);
+        return;
+      }
       // 父进程只知道「worker 已拉起」，真正起来没有要等它就绪（最长 90 秒），
       // 所以这里不直接报成功，改为轮询到有结论再给提示。
       await refreshMultiLaunchInstances(true);
@@ -4474,6 +4486,22 @@ export function App() {
   const isGlobalPage = globalNavigationRoutes.includes(route);
   const isManagementScreen = route === "relay" || route === "multiLaunch" || route === "sessions" || route === "context" || route === "skills";
   const codexAppRunning = overview?.runtime_health?.codex_app?.status === "running";
+  // 「启动 / 重启 Codex」：Codex 页面的顶栏按钮和侧栏播放键共用一份状态，都走 actions.launch / actions.restart。
+  const codexToolEntry = toolEntries.find((entry) => entry.id === "codex");
+  const codexLaunch: CodexLaunchState = {
+    running: codexAppRunning,
+    busy: launchPending,
+    unavailableReason: overview?.codex_app?.status === "missing"
+      ? t("没有找到 Codex 应用，请先安装 Codex")
+      : codexToolEntry && !codexToolEntry.switchable
+        ? t("Codex 暂未接入，无法从这里启动")
+        : null,
+    onLaunch: () => void actions.launch(),
+    onRestart: () => void actions.restart(),
+  };
+  // 当前页面属于 Codex：routes 里 tool 为 codex 的页面，以及当前 Agent 是 Codex 时的 Agent 概览。
+  // 网关、全局管理、工具类页面和 Claude Code / Grok 的页面都不算（Codex++ 不只服务 Codex）。
+  const onCodexPage = routeTool(route) === "codex" || (route === "overview" && activeTool === "codex");
   const activeToolName = toolEntries.find((entry) => entry.id === activeTool)?.name ?? t("当前 Agent");
 
   const isGatewayPage = gatewayNavigationRoutes.includes(route);
@@ -4521,7 +4549,7 @@ export function App() {
         onOpenPalette={() => setPaletteOpen(true)}
         pendingUpdateVersion={update?.updateAvailable && update.latestVersion ? update.latestVersion : null}
         onOpenUpdate={() => { if (update) setUpdatePrompt(update); }}
-        codexRun={{ running: codexAppRunning, busy: launchPending, onStart: () => void actions.launch(), onStop: () => void actions.stopCodex() }}
+        codexRun={{ running: codexAppRunning, busy: launchPending, unavailableReason: codexLaunch.unavailableReason, onStart: codexLaunch.onLaunch, onStop: () => void actions.stopCodex() }}
       />
       <CommandPalette commands={paletteCommands} onClose={() => setPaletteOpen(false)} open={paletteOpen} />
       {tourOpen ? <OnboardingTour onClose={closeTour} /> : null}
@@ -4540,9 +4568,11 @@ export function App() {
             </p>
           </div>
           <div className="topbar-actions">
-            {/* data-topbar-actions：页面级操作的挂载点（TopbarActions / PageHeader），Claude 增强页把「启动增强版」portal 进来。
-                Codex 的启动 / 停止在侧栏 Codex 行的播放键上，顶栏不再重复。 */}
+            {/* data-topbar-actions：页面级操作的挂载点（TopbarActions / PageHeader），Claude 增强页把「启动增强版」portal 进来。 */}
             <div className="topbar-page-actions" data-topbar-actions />
+            {/* 「启动 / 重启 Codex」：只在 Codex 的页面里放在顶栏最右侧（#2744 / #2745）；
+                其它页面靠侧栏 Codex 行常驻的播放键启动，停止也在那里。 */}
+            {onCodexPage ? <CodexLaunchButton className="topbar-codex-launch" size="sm" state={codexLaunch} /> : null}
           </div>
         </header>
         <section
@@ -6198,9 +6228,26 @@ function formatRequestLogDuration(durationMs: number) {
 }
 
 function requestLogRetryLabel(entry: RequestLogEntry) {
-  if (entry.autoRetries > 0) return tf("自动重试 ×{0}", [String(entry.autoRetries)]);
-  if (entry.attempts > 1) return tf("切换 ×{0}", [String(entry.attempts)]);
-  return "-";
+  const base = entry.autoRetries > 0
+    ? tf("自动重试 ×{0}", [String(entry.autoRetries)])
+    : entry.attempts > 1
+      ? tf("切换 ×{0}", [String(entry.attempts)])
+      : "";
+  // 网关因 Codex++ 本地限速排过队：标出排了多久。
+  const queued = queueWaitMs(entry.retryReasons);
+  const queue = queued === null ? "" : tf("限速排队 {0}", [formatQueueWait(queued)]);
+  return [base, queue].filter(Boolean).join(" · ") || "-";
+}
+
+/** 重试原因的展示：网关记的限速排队换成「限速排队 Xs」，其它原样。 */
+function requestLogRetryReasons(entry: RequestLogEntry): string {
+  return (entry.retryReasons ?? [])
+    .map((reason) => {
+      if (!reason.startsWith(QUEUE_REASON_PREFIX)) return reason;
+      const queued = queueWaitMs([reason]);
+      return queued === null ? reason : tf("限速排队 {0}", [formatQueueWait(queued)]);
+    })
+    .join("、");
 }
 
 /** 请求来自哪个 Agent：网关记录带 agent 字段，Codex 直连代理的记录没有。 */
@@ -6552,8 +6599,8 @@ function RequestLogScreen({ initialAgent = "all", initialFocus = {}, onConsumeIn
                     ) : null}
                   </span>
                   <span
-                    className={entry.autoRetries > 0 ? "request-log-retry" : "request-log-muted"}
-                    title={(entry.retryReasons ?? []).join("、")}
+                    className={entry.autoRetries > 0 || queueWaitMs(entry.retryReasons) !== null ? "request-log-retry" : "request-log-muted"}
+                    title={requestLogRetryReasons(entry)}
                   >
                     {requestLogRetryLabel(entry)}
                   </span>
@@ -6627,7 +6674,7 @@ function RequestLogScreen({ initialAgent = "all", initialFocus = {}, onConsumeIn
                       <div><dt>{t("首字耗时")}</dt><dd>{entry.firstTokenMs == null ? (entry.state === "running" ? t("进行中") : "-") : formatRequestLogDuration(entry.firstTokenMs)}</dd></div>
                       <div><dt>{t("尝试次数")}</dt><dd>{entry.attempts || "-"}</dd></div>
                       <div><dt>{t("自动重试")}</dt><dd>{entry.autoRetries}</dd></div>
-                      <div><dt>{t("重试原因")}</dt><dd>{(entry.retryReasons ?? []).join("、") || "-"}</dd></div>
+                      <div><dt>{t("重试原因")}</dt><dd>{requestLogRetryReasons(entry) || "-"}</dd></div>
                       {entry.attemptDetails?.length ? (
                         <div className="request-log-attempts">
                           <dt>{t("尝试明细")}</dt>
@@ -7452,6 +7499,8 @@ function CodexMultiLaunchScreen({
           <CardHeader>
             <CardTitle>{t("选择供应商身份启动 Codex")}</CardTitle>
             <CardDescription>{t("每个身份使用独立的配置、会话和用户数据目录，可与其他单一 Responses 或 Chat Completions 供应商同时运行。")}</CardDescription>
+            {/* #2754：新版的 API 多加在「供应商池」，多开却只读旧版供应商配置，用户以为 Key 没生效。 */}
+            <CardDescription>{t("多开只使用「旧版供应商配置」里的供应商和 API Key，「供应商池」（网关）里添加的供应商与 Key 不会出现在这里。修改供应商或 Key 后，需在上方对运行中的实例点「重启」才会生效。")}</CardDescription>
           </CardHeader>
           <CardContent>
             <div className="relay-profile-list">
@@ -9719,6 +9768,18 @@ function SessionRepairPanel({ dirty, form, providerSyncProgress, sessionIndexRep
               <p>
                 {t("恢复消息")} {sessionIndexRepairReport.repairedItems} · {t("已存在")} {sessionIndexRepairReport.alreadyPresent} · {t("短暂等待")} {sessionIndexRepairReport.deferredItems ?? 0} · {t("需核查")} {sessionIndexRepairReport.skippedItems}
               </p>
+              {sessionIndexRepairReport.frontendRecovery ? (
+                <p role="status" className="break-all">
+                  <strong>{t("历史轮次补载：")}</strong>
+                  {t(historyRecoveryStatusLabel(sessionIndexRepairReport.frontendRecovery))}
+                  {" · "}{sessionIndexRepairReport.frontendRecovery.status}
+                  {" · "}{t("消息页")} {sessionIndexRepairReport.frontendRecovery.loadedPages}
+                  {" · "}{t("元数据页")} {sessionIndexRepairReport.frontendRecovery.metadataPages}
+                  {sessionIndexRepairReport.frontendRecovery.reason ? (
+                    <small> · {t("原因：")}{sessionIndexRepairReport.frontendRecovery.reason}</small>
+                  ) : null}
+                </p>
+              ) : null}
               <small>{t("仅恢复有本地原文且可确认位置的消息；已打开的会话可能需要重新打开才能显示。")}</small>
               <p><small>{t("自动检查需要从此界面启动 Codex，并保持 Codex++ 运行，且自动修复开关已开启并保存；每次检查完成后间隔 30 分钟复查。此页面每 15 秒刷新报告，不会单独启动修复；再次检查不保证恢复。")}</small></p>
               <p><small>{t("短暂等待最长 30 分钟；原文和记录文件都已超过 24 小时未更新的项目直接转入需核查。缺少对应轮次或结束状态，当前证据不足以安全补回；后续检查仍会核验。")}</small></p>
@@ -13439,6 +13500,10 @@ function AggregateRelayProfileEditor({
   const selectedCandidates = candidates.filter((candidate) => memberIds.has(candidate.id));
   const defaultCandidate = selectedCandidates.find((candidate) => candidate.id === aggregate.defaultRelayId);
   const bareModelCount = defaultCandidate ? memberModelCount(defaultCandidate) : 0;
+  // 官方登录成员一个模型都没填时，后端按 Codex 缓存的官方模型目录发布（#2763），这里给不出确切数量。
+  const defaultUsesOfficialDirectory = !!defaultCandidate
+    && isOfficialLoginMemberProfile(defaultCandidate)
+    && bareModelCount === 0;
   const prefixedModelCount = selectedCandidates
     .filter((candidate) => candidate.id !== defaultCandidate?.id)
     .reduce((sum, candidate) => sum + memberModelCount(candidate), 0);
@@ -13506,7 +13571,9 @@ function AggregateRelayProfileEditor({
             </span>
             {modelMode && selectedCandidates.length ? (
               <span className="aggregate-model-summary">
-                {defaultCandidate
+                {defaultCandidate && defaultUsesOfficialDirectory
+                  ? tf("Codex 将看到 {0} 的官方模型目录（裸名）+ {1} 个 cpx- 前缀模型", [defaultCandidate.name || t("未命名供应商"), prefixedModelCount])
+                  : defaultCandidate
                   ? tf("Codex 将看到 {0} 个裸名模型（来自 {1}）+ {2} 个 cpx- 前缀模型", [bareModelCount, defaultCandidate.name || t("未命名供应商"), prefixedModelCount])
                   : tf("Codex 将看到 {0} 个 cpx- 前缀模型；还没指定默认成员，不带前缀的请求会报错", [prefixedModelCount])}
               </span>
@@ -13557,7 +13624,7 @@ function AggregateRelayProfileEditor({
                         {memberModelNames.length
                           ? tf("{0} 个模型", [memberModelNames.length])
                           : (isOfficialLoginMemberProfile(candidate)
-                            ? t("请填写该官方账号的模型列表")
+                            ? t("未填写：用 Codex 的官方模型目录")
                             : t("未填写模型"))}
                       </span>
                       {checked ? (isDefaultMember ? (
@@ -14875,6 +14942,14 @@ function Panel({ children, fill = false, className = "", id }: { children: React
   );
 }
 
+type ClaudeBashTimeoutSettings = {
+  enabled: boolean;
+  defaultEnabled: boolean;
+  defaultSeconds: number;
+  maxEnabled: boolean;
+  maxSeconds: number;
+};
+
 type ClaudeLocalizationStatus = {
   supported: boolean;
   sourceApp: string;
@@ -14893,6 +14968,9 @@ type ClaudeLocalizationStatus = {
   computerUse: boolean;
   /** 当前平台能否真正应用 Computer Use；Windows 为 false（#2673）。 */
   computerUseSupported: boolean;
+  bashTimeout: ClaudeBashTimeoutSettings;
+  bashTimeoutWarning?: string | null;
+  bashTimeoutPending?: boolean;
 };
 
 /**
@@ -14916,6 +14994,17 @@ function ClaudeLocalizationScreen() {
   const [progress, setProgress] = useState<{ percent: number; message: string } | null>(null);
   const mounted = useRef(true);
   const pending = useRef(false);
+  const statusGeneration = useRef(0);
+  const [bashTimeoutDraft, setBashTimeoutDraft] = useState<ClaudeBashTimeoutSettings | null>(
+    claudeLocalizationMemo.status?.status === "ok"
+      ? claudeLocalizationMemo.status.bashTimeout
+      : null,
+  );
+  // 编辑时保留空字符串，避免清空输入框立刻补 1 后把新数字拼在后面。
+  const [bashTimeoutDefaultText, setBashTimeoutDefaultText] = useState<string | null>(null);
+  const [bashTimeoutMaxText, setBashTimeoutMaxText] = useState<string | null>(null);
+  const bashTimeoutSaving = useRef(false);
+  const bashTimeoutQueued = useRef<ClaudeBashTimeoutSettings | null>(null);
   /**
    * 页头右上角的操作槽：「启动增强版」放在和 Codex 页「启动 Codex」相同的位置。
    * 页头与本页都按路由重建、同一次提交挂载，所以在 layout effect 里取，首帧绘制前就到位。
@@ -14939,12 +15028,18 @@ function ClaudeLocalizationScreen() {
     // 先记下有效结果再判断挂载：检测中切走页面，回来时仍能看到这次的结果。
     if (result.status === "ok") claudeLocalizationMemo.status = result;
     if (!mounted.current) return;
-    if (result.status === "ok") setStatus(result);
+    if (result.status === "ok") {
+      setStatus(result);
+      setBashTimeoutDraft(result.bashTimeout);
+      setBashTimeoutDefaultText(null);
+      setBashTimeoutMaxText(null);
+    }
     else setError(result.message);
   };
   const refresh = async () => {
     if (pending.current) return;
     pending.current = true;
+    statusGeneration.current++;
     setBusy("detect"); setError(null);
     try { accept(await invoke<CommandResult<ClaudeLocalizationStatus>>("claude_localization_status")); }
     catch (cause) { if (mounted.current) setError(stringifyError(cause)); }
@@ -14976,14 +15071,30 @@ function ClaudeLocalizationScreen() {
   const act = async (action: "prepare" | "launch" | "restore" | "check") => {
     if (pending.current) return;
     pending.current = true;
+    statusGeneration.current++;
     setBusy(action); setError(null);
+    const launching = action === "launch" || action === "restore";
+    const clearLaunchNotice = () => {
+      setStatus((current) => current?.status === "ok"
+        ? { ...current, bashTimeoutWarning: null, bashTimeoutPending: false } : current);
+    };
+    if (launching) {
+      const timeout = bashTimeoutDraft ?? (status?.status === "ok" ? status.bashTimeout : null);
+      const awaitingConfirmation = Boolean(timeout?.enabled && (timeout.defaultEnabled || timeout.maxEnabled));
+      setStatus((current) => current?.status === "ok" ? {
+        ...current,
+        bashTimeoutWarning: awaitingConfirmation ? "已准备，暂未确认。将在增强版启动后自动确认。" : null,
+        bashTimeoutPending: awaitingConfirmation,
+      } : current);
+    }
     if (action === "prepare") setProgress({ percent: 0, message: t("准备开始…") });
     try {
       const result = await invoke<CommandResult<ClaudeLocalizationStatus>>("claude_localization_action", { action });
       // 失败响应里的 data 是空对象：直接覆盖状态会让下面的渲染读到不存在的字段
       // （曾经就是这样整页白屏的），所以只有成功时才更新状态。
+      if (launching && result.status !== "ok") clearLaunchNotice();
       accept(result);
-    } catch (cause) { if (mounted.current) setError(stringifyError(cause)); }
+    } catch (cause) { if (mounted.current) { if (launching) clearLaunchNotice(); setError(stringifyError(cause)); } }
     finally {
       pending.current = false;
       if (mounted.current) setBusy(null);
@@ -14993,6 +15104,7 @@ function ClaudeLocalizationScreen() {
   const toggleVoiceInput = async (enabled: boolean) => {
     if (pending.current) return;
     pending.current = true;
+    statusGeneration.current++;
     setBusy("voiceInput"); setError(null);
     try {
       const result = await invoke<CommandResult<ClaudeLocalizationStatus>>(
@@ -15011,6 +15123,7 @@ function ClaudeLocalizationScreen() {
   const toggleComputerUse = async (enabled: boolean) => {
     if (pending.current) return;
     pending.current = true;
+    statusGeneration.current++;
     setBusy("computerUse"); setError(null);
     try {
       const result = await invoke<CommandResult<ClaudeLocalizationStatus>>(
@@ -15024,9 +15137,48 @@ function ClaudeLocalizationScreen() {
       if (mounted.current) setBusy(null);
     }
   };
+  const saveBashTimeout = async (next: ClaudeBashTimeoutSettings) => {
+    if (pending.current && !bashTimeoutSaving.current) return;
+    bashTimeoutQueued.current = next;
+    setBashTimeoutDraft(next);
+    if (bashTimeoutSaving.current) return;
+    let confirmed = status?.status === "ok" ? status.bashTimeout : null;
+    pending.current = true;
+    statusGeneration.current++;
+    bashTimeoutSaving.current = true;
+    setBusy("bashTimeout"); setError(null);
+    try {
+      // 失焦保存先于开关点击；串行处理后续草稿，避免吞掉这次点击。
+      while (bashTimeoutQueued.current) {
+        const timeout = bashTimeoutQueued.current;
+        bashTimeoutQueued.current = null;
+        const result = await invoke<CommandResult<ClaudeLocalizationStatus>>(
+          "claude_localization_set_bash_timeout",
+          { timeout },
+        );
+        if (result.status !== "ok") throw new Error(result.message);
+        confirmed = result.bashTimeout;
+        claudeLocalizationMemo.status = result;
+        if (mounted.current) setStatus(result);
+        if (!bashTimeoutQueued.current) accept(result);
+      }
+    } catch (cause) {
+      bashTimeoutQueued.current = null;
+      if (mounted.current) {
+        setBashTimeoutDraft(confirmed);
+        setError(stringifyError(cause));
+      }
+    }
+    finally {
+      bashTimeoutSaving.current = false;
+      pending.current = false;
+      if (mounted.current) setBusy(null);
+    }
+  };
   const toggleLocalization = async (enabled: boolean) => {
     if (pending.current) return;
     pending.current = true;
+    statusGeneration.current++;
     setBusy("localization"); setError(null);
     try {
       const result = await invoke<CommandResult<ClaudeLocalizationStatus>>(
@@ -15043,6 +15195,35 @@ function ClaudeLocalizationScreen() {
     }
   };
   const s = status;
+  const bashTimeout = bashTimeoutDraft ?? s?.bashTimeout;
+  useEffect(() => {
+    if (!s?.bashTimeoutPending || !s.running || busy !== null) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const generation = statusGeneration.current;
+    const poll = async () => {
+      try {
+        const result = await invoke<CommandResult<{ warning: string | null; pending: boolean }>>(
+          "claude_localization_bash_timeout_status",
+        );
+        if (cancelled || !mounted.current || pending.current || statusGeneration.current !== generation) return;
+        if (result.status === "ok") {
+          // 只同步提示，不覆盖正在编辑的秒数或其他设置草稿。
+          const update = { bashTimeoutWarning: result.warning, bashTimeoutPending: result.pending };
+          setStatus((current) => current?.status === "ok" ? { ...current, ...update } : current);
+          if (claudeLocalizationMemo.status?.status === "ok") {
+            claudeLocalizationMemo.status = { ...claudeLocalizationMemo.status, ...update };
+          }
+          if (!result.pending) return;
+        }
+      } catch { /* 临时读取失败保留提示，下一轮继续确认。 */ }
+      if (!cancelled && mounted.current && statusGeneration.current === generation) {
+        timer = setTimeout(() => void poll(), 1000);
+      }
+    };
+    timer = setTimeout(() => void poll(), 1000);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [s?.bashTimeoutPending, s?.running, busy]);
   const canLaunch = Boolean(s?.prepared && !s.needsRebuild && s.nodeAvailable);
   const statusTone = !s ? "pending" : s.prepared ? (s.needsRebuild ? "warn" : "ok") : "idle";
   const statusText = busy === "detect" ? t("检测中…") : !s ? t("未检测") : !s.supported ? t("未检测到 Claude") : s.prepared ? (s.needsRebuild ? t("需要更新") : t("已准备")) : t("未准备");
@@ -15111,6 +15292,9 @@ function ClaudeLocalizationScreen() {
             <p className="claude-l10n-hint">{t("未检测到 Claude，请先安装官方应用。你可以继续使用 Codex++ 的其他功能。")}</p>
           ) : null}
           {error ? <div className="claude-l10n-error" role="alert">{error}</div> : null}
+          {bashTimeout?.enabled && s?.bashTimeoutWarning ? (
+            <div className="claude-l10n-warning" role="status">{t("Bash时限解锁增强:")} {t(s.bashTimeoutWarning)}</div>
+          ) : null}
           {progress ? (
             <div
               aria-valuemax={100}
@@ -15216,6 +15400,109 @@ function ClaudeLocalizationScreen() {
                   {t("这里的电脑控制和「Computer Use」页给 Claude Desktop 接入的 codex-plus-cu 是两套独立实现，同一个 Claude Desktop 里二选一即可，不要同时开。")}
                 </p>
               )
+            ) : null}
+            <label className="switch-row compact claude-bash-timeout-master">
+              <input
+                aria-label={t("解锁 Bash 时间限制")}
+                checked={Boolean(bashTimeout?.enabled)}
+                disabled={(busy !== null && busy !== "bashTimeout") || !bashTimeout}
+                onChange={(event) => {
+                  if (bashTimeout) void saveBashTimeout({ ...bashTimeout, enabled: event.currentTarget.checked });
+                }}
+                type="checkbox"
+              />
+              <span>
+                <strong>{t("解锁 Bash 时间限制")}</strong>
+                <small>{t("配置 Claude Code Bash 的默认值与最大值；Cowork 还需启动注入成功且模块版本兼容。适配失败时提示并保持该项原生时限，不影响其他增强。重启增强版后应用。")}</small>
+              </span>
+              <ToggleVisual />
+            </label>
+            {bashTimeout?.enabled ? (
+              <div className="claude-bash-timeout-editor">
+                <p>{t("两项可分别启停，单位均为秒。修改数字后离开输入框即保存。")}</p>
+                <label className="switch-row compact claude-bash-timeout-toggle">
+                  <input
+                    aria-label={t("修改默认等待时间")}
+                    checked={bashTimeout.defaultEnabled}
+                    disabled={busy !== null && busy !== "bashTimeout"}
+                    onChange={(event) => void saveBashTimeout({
+                      ...bashTimeout,
+                      defaultEnabled: event.currentTarget.checked,
+                    })}
+                    type="checkbox"
+                  />
+                  <span>
+                    <strong>{t("修改默认等待时间")}</strong>
+                    <small>{t("未显式传 timeout / timeout_ms 时使用；Claude Code 与本地 Cowork Bash 原生默认 120 秒。")}</small>
+                  </span>
+                  <ToggleVisual />
+                </label>
+                <div className="claude-bash-timeout-value">
+                  <span>{t("默认等待时间")}</span>
+                  <Input
+                    aria-label={t("默认等待时间（秒）")}
+                    disabled={busy !== null || !bashTimeout.defaultEnabled}
+                    max={2147423}
+                    min={1}
+                    onChange={(event) => {
+                      setBashTimeoutDefaultText(event.currentTarget.value);
+                      const seconds = clampNumber(Number(event.currentTarget.value), 1, 2147423);
+                      setBashTimeoutDraft((current) => current ? { ...current, defaultSeconds: seconds } : current);
+                    }}
+                    onBlur={() => {
+                      setBashTimeoutDefaultText(null);
+                      void saveBashTimeout(bashTimeout);
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") event.currentTarget.blur();
+                    }}
+                    type="number"
+                    value={bashTimeoutDefaultText ?? bashTimeout.defaultSeconds}
+                  />
+                  <span>{t("秒")}</span>
+                </div>
+                <label className="switch-row compact claude-bash-timeout-toggle">
+                  <input
+                    aria-label={t("修改最大等待时间")}
+                    checked={bashTimeout.maxEnabled}
+                    disabled={busy !== null && busy !== "bashTimeout"}
+                    onChange={(event) => void saveBashTimeout({
+                      ...bashTimeout,
+                      maxEnabled: event.currentTarget.checked,
+                    })}
+                    type="checkbox"
+                  />
+                  <span>
+                    <strong>{t("修改最大等待时间")}</strong>
+                    <small>{t("显式传 timeout / timeout_ms 时的上限；原生参数上限 600 秒，Cowork 还受外层等待时限约束。")}</small>
+                  </span>
+                  <ToggleVisual />
+                </label>
+                <div className="claude-bash-timeout-value">
+                  <span>{t("最大等待时间")}</span>
+                  <Input
+                    aria-label={t("最大等待时间（秒）")}
+                    disabled={busy !== null || !bashTimeout.maxEnabled}
+                    max={2147423}
+                    min={1}
+                    onChange={(event) => {
+                      setBashTimeoutMaxText(event.currentTarget.value);
+                      const seconds = clampNumber(Number(event.currentTarget.value), 1, 2147423);
+                      setBashTimeoutDraft((current) => current ? { ...current, maxSeconds: seconds } : current);
+                    }}
+                    onBlur={() => {
+                      setBashTimeoutMaxText(null);
+                      void saveBashTimeout(bashTimeout);
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") event.currentTarget.blur();
+                    }}
+                    type="number"
+                    value={bashTimeoutMaxText ?? bashTimeout.maxSeconds}
+                  />
+                  <span>{t("秒")}</span>
+                </div>
+              </div>
             ) : null}
             {s?.supported && !s.prepared ? (
               <p className="claude-l10n-hint">
@@ -15372,8 +15659,9 @@ function AppSidebar({
   onOpenUpdate,
   codexRun,
 }: {
-  /** Codex 行的播放 / 停止：只有桌面应用的 Codex 有，命令行 Agent 没有常驻进程可启停。 */
-  codexRun: { running: boolean; busy: boolean; onStart: () => void; onStop: () => void };
+  /** Codex 行的播放 / 停止：只有桌面应用的 Codex 有，命令行 Agent 没有常驻进程可启停。
+      unavailableReason 非空（如没找到 Codex 应用）时播放键置灰，悬停显示原因。 */
+  codexRun: { running: boolean; busy: boolean; unavailableReason: string | null; onStart: () => void; onStop: () => void };
   tools: ToolEntry[];
   activeTool: ToolId;
   route: Route;
@@ -15466,11 +15754,6 @@ function AppSidebar({
           <div className="side-group-items">{gatewayNavigationRoutes.map((routeId) => renderItem(routeId))}</div>
         </section>
 
-        <section className={`side-group ${collapsed.includes("management") ? "collapsed" : ""}`} data-tour="management">
-          {groupLabel("management", t("全局管理"))}
-          <div className="side-group-items">{managementNavigationRoutes.map((routeId) => renderItem(routeId))}</div>
-        </section>
-
         <section className={`side-group ${collapsed.includes("agents") ? "collapsed" : ""}`} data-tour="agents">
           {groupLabel(
             "agents",
@@ -15495,7 +15778,7 @@ function AppSidebar({
                   ? { tone: "direct", label: t("Codex 的供应商配置由 Codex++ 直接管理") }
                   : { tone: "off", label: t("未接入网关") };
               return (
-                <div className="side-agent-wrap" key={tool.id}>
+                <div className={`side-agent-wrap ${tool.id === "codex" && tool.switchable ? "has-run" : ""}`.trim()} key={tool.id}>
                   <button
                     aria-current={current && !onGlobalPage ? "true" : undefined}
                     aria-label={tool.switchable ? `${tool.name} · ${access.label}` : `${tool.name} · ${t("待接入")}`}
@@ -15514,9 +15797,10 @@ function AppSidebar({
                       aria-label={codexRun.running ? t("停止 Codex") : t("启动 Codex")}
                       className="side-agent-run"
                       data-running={codexRun.running}
-                      disabled={codexRun.busy}
+                      data-unavailable={!codexRun.running && Boolean(codexRun.unavailableReason)}
+                      disabled={codexRun.busy || (!codexRun.running && Boolean(codexRun.unavailableReason))}
                       onClick={codexRun.running ? codexRun.onStop : codexRun.onStart}
-                      title={codexRun.busy ? t("处理中…") : codexRun.running ? t("停止 Codex") : t("启动 Codex")}
+                      title={codexRun.busy ? t("处理中…") : codexRun.running ? t("停止 Codex") : codexRun.unavailableReason ?? t("启动 Codex")}
                       type="button"
                     >
                       {codexRun.busy ? <Loader2 aria-hidden="true" className="animate-spin" /> : codexRun.running ? <Square aria-hidden="true" /> : <Play aria-hidden="true" />}
@@ -15526,6 +15810,11 @@ function AppSidebar({
               );
             })}
           </div>
+        </section>
+
+        <section className={`side-group ${collapsed.includes("management") ? "collapsed" : ""}`} data-tour="management">
+          {groupLabel("management", t("全局管理"))}
+          <div className="side-group-items">{managementNavigationRoutes.map((routeId) => renderItem(routeId))}</div>
         </section>
 
         <section className={`side-group ${collapsed.includes("tools") ? "collapsed" : ""}`}>

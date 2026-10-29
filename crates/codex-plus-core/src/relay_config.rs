@@ -2019,12 +2019,11 @@ pub fn merge_common_config_into_config(
 /// 用户表现为「编辑通用配置后 MCP 连接配置丢失」，实际是整份配置都没加载
 /// （#2147 / #1997 / #2123 同源）。
 fn mcp_server_entry_has_transport(table: &dyn TableLike) -> bool {
-    ["command", "url"].iter().any(|key| {
-        table
-            .get(key)
-            .and_then(Item::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
-    })
+    // 和 Codex 的判断一致：只看有没有 command / url 字符串，空串 Codex 也能加载（只是起不来那一个），
+    // 不能当成残缺条目删掉。
+    ["command", "url"]
+        .iter()
+        .any(|key| table.get(key).and_then(Item::as_str).is_some())
 }
 
 /// 落盘前的 MCP 完整性校验（#2147）。
@@ -2555,7 +2554,7 @@ fn remove_provider_specific_common_keys(table: &mut dyn TableLike) {
     table.remove("model_providers");
 }
 
-fn is_provider_specific_common_root_key(key: &str) -> bool {
+pub(crate) fn is_provider_specific_common_root_key(key: &str) -> bool {
     let key = key.trim().trim_matches(['\"', '\'']);
     PROVIDER_SPECIFIC_COMMON_ROOT_KEYS.contains(&key) || is_provider_credential_root_key(key)
 }
@@ -3075,9 +3074,11 @@ fn preserve_live_app_settings(home: &Path, config_text: &str) -> anyhow::Result<
     remove_unsupported_approval_policies(&mut target_doc);
     let live_text = read_optional_text(&home.join("config.toml"))?;
     if live_text.trim().is_empty() {
+        repair_merged_mcp_servers(&mut target_doc, &HashMap::new());
         return Ok(normalize_optional_toml(target_doc));
     }
     let Ok(live_doc) = parse_toml_document(&live_text) else {
+        repair_merged_mcp_servers(&mut target_doc, &HashMap::new());
         return Ok(normalize_optional_toml(target_doc));
     };
     if let Some(live_desktop) = live_doc.get("desktop").cloned() {
@@ -3100,6 +3101,9 @@ fn preserve_live_app_settings(home: &Path, config_text: &str) -> anyhow::Result<
     // 以 live 为准，避免旧快照把已删除的目录写回（#2583）。
     prefer_live_codex_managed_entries(&mut target_doc, &live_doc);
     repair_mcp_servers_from_live(&mut target_doc, &live_doc);
+    // 写盘前兜底：用 live 补过仍缺 command / url 的条目（模板减出来的残表，或 live 里本来就坏的），
+    // Codex 会以 invalid transport 拒绝整份 config.toml、桌面版起不来，这里去掉并记诊断（#2765）。
+    repair_merged_mcp_servers(&mut target_doc, &HashMap::new());
     // Preserve user-managed feature flags such as multi_agent_v2 and memories.
     // #2683：补回前先记下目标是否自己声明了 multi_agent_v2（v1 闸门写入或模板自带），
     // 补回之后据此决定要不要还原 v1 压下的闸门。
@@ -5580,6 +5584,44 @@ pub fn relay_profile_api_key(profile: &RelayProfile) -> String {
         })
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| profile.api_key.trim().to_string())
+}
+
+/// 供应商测试被上游以 401 / 403 拒绝时，附在结果里的「本次实际用了哪个 Key」（#2754）。
+///
+/// 测试、切换与多开实例都取 [`relay_profile_api_key`]，即 API Keys 列表里打勾的当前 Key；
+/// 「添加 Key」不会自动切换，用户在新行里填了新 Key 却没勾选时，请求一直带着旧 Key，
+/// 上游只回「Key 无效」，用户看不出是哪个 Key。这里只露名称和末 4 位，
+/// 与 DeepSeek 等上游报错里的 `****xxxx` 对得上，方便比对，不泄露整串 Key。
+pub fn relay_test_auth_failure_hint(profile: &RelayProfile, http_status: u16) -> Option<String> {
+    if !matches!(http_status, 401 | 403)
+        || profile.uses_no_auth()
+        || profile.relay_mode == RelayMode::Aggregate
+        || crate::official_login::is_official_login_profile(profile)
+    {
+        return None;
+    }
+    let api_key = relay_profile_api_key(profile);
+    let chars: Vec<char> = api_key.trim().chars().collect();
+    // 太短的 Key 露末 4 位等于露了大半，不给提示。
+    if chars.len() < 12 {
+        return None;
+    }
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    let key_label = match profile.selected_api_key() {
+        Some(selected) if profile.api_keys.len() > 1 && !selected.name.trim().is_empty() => {
+            format!("「{}」（末 4 位 {tail}）", selected.name.trim())
+        }
+        _ => format!("末 4 位 {tail}"),
+    };
+    let mut hint = format!("本次测试用的是当前 Key：{key_label}。");
+    if profile.api_keys.len() > 1 {
+        hint.push_str(
+            "该供应商存了多个 Key，「添加 Key」不会自动切换；如果新 Key 填在了别的行，请在编辑页点它左侧的勾设为当前 Key 并保存。",
+        );
+    } else {
+        hint.push_str("如与供应商后台的 Key 对不上，请编辑该供应商重新填写并保存。");
+    }
+    Some(hint)
 }
 
 /// 写进 `[model_providers.<id>].name` 的供应商显示名（issue #192）。
