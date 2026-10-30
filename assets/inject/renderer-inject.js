@@ -2934,6 +2934,7 @@
       .codex-plus-row:first-child { border-top: 0; }
       .codex-plus-row-title { font-weight: 550; line-height: 1.35; }
       .codex-plus-row-description { margin-top: 2px; color: #a1a1aa; font-size: 13px; line-height: 1.4; }
+      .codex-plus-row-description[data-codex-plus-native-fast-status][data-failed="true"] { color: #f59e0b; }
       .codex-plus-model-compat-warning { margin-top: 6px; color: #fbbf24; font-size: 13px; line-height: 1.45; }
       .codex-plus-toggle {
         width: 42px;
@@ -7706,6 +7707,30 @@
       const description = item ? codexPlusSettingsCatalogDescription(item) : "";
       if (item && node.textContent !== description) node.textContent = description;
     });
+    syncCodexPlusNativeFastStatus();
+  }
+
+  // 原生 Fast 的自检结果：补丁是否真的打进了当前 Codex。Codex 更新后结构变了时，
+  // 用户在这里就能看到「暂未适配」和原因，不用再猜按钮为什么不见了。
+  function codexPlusNativeFastStatusText() {
+    if (codexPlusBackendSettings.enhancementsEnabled === false || codexPlusBackendSettings.codexAppNativeFastUnlock !== true) return "";
+    const state = window.__codexPlusNativeFastPatchState;
+    if (window.__codexPlusNativeFastCompiled === "v1" || state === "patched") return "已生效：当前 Codex 版本已适配。";
+    if (state === "failed" || state === "unsupported") {
+      const reason = String(window.__codexPlusNativeFastFailureReason || window.__codexPlusNativeFastModuleDiagnostics?.reason || "").slice(0, 120);
+      return `当前 Codex 版本暂未适配，Fast 开关不会出现${reason ? `（${reason}）` : ""}。请把 codex-plus.log 里 bridge.native_module_patch_prepared 那一行反馈给我们。`;
+    }
+    return "";
+  }
+
+  function syncCodexPlusNativeFastStatus() {
+    document.querySelectorAll("[data-codex-plus-native-fast-status]").forEach((node) => {
+      const text = codexPlusNativeFastStatusText();
+      const failed = String(!!text && !text.startsWith("已生效"));
+      if (node.textContent !== text) node.textContent = text;
+      if (node.hidden !== !text) node.hidden = !text;
+      if (node.dataset.failed !== failed) node.dataset.failed = failed;
+    });
   }
 
   // 与管理器增强页一致：「（实验）」从标题里拿出来做成小标签；说明里写了要重启 Codex 的，标题旁加「需重启」。
@@ -7741,7 +7766,7 @@
     const descriptionData = item.descriptionWhenEnhancementsOn ? ` data-codex-plus-setting-description="${escapeHtml(item.key)}"` : "";
     return `
                 <div class="codex-plus-row" data-codex-plus-setting-row="${escapeHtml(item.key)}">
-                  <div><div class="codex-plus-row-title">${renderCodexPlusSettingsCatalogTitle(item, rawDescription)}</div><div class="codex-plus-row-description"${descriptionData}>${description}</div></div>
+                  <div><div class="codex-plus-row-title">${renderCodexPlusSettingsCatalogTitle(item, rawDescription)}</div><div class="codex-plus-row-description"${descriptionData}>${description}</div>${item.key === "codexAppNativeFastUnlock" ? '<div class="codex-plus-row-description" data-codex-plus-native-fast-status="true" role="status" hidden></div>' : ""}</div>
                   ${control}
                 </div>`;
   }
@@ -9083,9 +9108,15 @@
   function clearPluginMarketplaceQueryCache() {
     clearPluginMarketplaceRemoteCatalogUnavailable();
     try {
-      const queryClient = window.__REACT_QUERY_CLIENT__ || window.__codexQueryClient;
+      // 新版 Codex 不再把 queryClient 挂到 window 上：从 React 树里找（与官方用量共用，找到后缓存）。
+      // 插件列表、搜索、详情的查询键都以 `plugins` 开头，按前缀一起失效。
+      const explicit = window.__REACT_QUERY_CLIENT__ || window.__codexQueryClient;
+      const queryClient = explicit && typeof explicit.invalidateQueries === "function" ? explicit : findCodexQueryClient();
       if (queryClient && typeof queryClient.invalidateQueries === "function") {
-        queryClient.invalidateQueries({ queryKey: ["plugins"] });
+        Promise.resolve(queryClient.invalidateQueries({ queryKey: ["plugins"] })).catch(() => {});
+      } else if (!window.__codexPlusPluginQueryClientMissingReported) {
+        window.__codexPlusPluginQueryClientMissingReported = true;
+        sendCodexPlusDiagnostic("plugin_marketplace_query_client_missing", {});
       }
     } catch {
     }
@@ -10640,7 +10671,7 @@
     const sourceNote = panel.querySelector("[data-codex-plugin-source-note]");
     if (sourceNote) {
       sourceNote.hidden = state.source !== "full";
-      sourceNote.textContent = "完整市场需要 GitHub 私有仓库访问权限。请使用有权限的账号执行 gh auth login 后刷新目录。";
+      sourceNote.textContent = "完整市场收录全部插件，索引较大，首次加载可能需要几秒。";
     }
     const status = panel.querySelector("[data-codex-plugin-market-status]");
     if (status) status.textContent = catalog.loading ? "正在加载插件目录…" : catalog.message || `${catalog.plugins.length.toLocaleString()} 个插件${catalog.cached ? " · 使用缓存目录" : ""}`;
@@ -10896,6 +10927,11 @@
   function codexPlusPluginNativeListAllowed(operation) {
     if (!codexPlusPluginNativeLocal(operation)) return false;
     if (operation.method === "installed-plugins") return true;
+    if (operation.method === "search-plugins") {
+      // 只在「全部 / OpenAI」目录的首页结果里补索引条目；个人、工作区目录与翻页不混入。
+      const scope = operation.params?.scope;
+      return (scope == null || scope === "global") && operation.params?.cursor == null;
+    }
     if (operation.method !== "list-plugins") return false;
     const kinds = operation.params?.marketplaceKinds;
     return !Array.isArray(kinds) || kinds.length === 0 || kinds.includes("local");
@@ -10985,8 +11021,60 @@
     return result;
   }
 
+  function codexPlusPluginNativeSearchTerms(value) {
+    return String(value || "").trim().toLowerCase().split(/\s+/).filter(Boolean);
+  }
+
+  /** 返回 -1 表示不匹配；0 表示名称命中，排在描述 / 关键词命中（1）之前。 */
+  function codexPlusPluginNativeSearchRank(plugin, terms) {
+    const ui = plugin?.interface || {};
+    const title = [plugin?.name, ui.displayName].filter((value) => typeof value === "string").join(" ").toLowerCase();
+    const text = [title, ui.shortDescription, ui.developerName, ...(Array.isArray(plugin?.keywords) ? plugin.keywords : [])]
+      .filter((value) => typeof value === "string").join(" ").toLowerCase();
+    if (!terms.every((term) => text.includes(term))) return -1;
+    return terms.every((term) => title.includes(term)) ? 0 : 1;
+  }
+
+  /**
+   * 新版 Codex（app-server ≥ 0.147.0-alpha.6，API Key / ChatGPT 登录都走）的插件页搜索改成
+   * 服务端 plugin/search，不再在 plugin/list 结果里本地过滤，所以只合并列表时搜不到索引插件（#2790）。
+   * 这里按同一份索引目录本地匹配，追加到原生结果后面；原生已返回的同 id 条目不重复。
+   */
+  async function codexPlusPluginNativeSearchExtend(operation, original) {
+    const base = original && typeof original === "object" ? original : {};
+    const data = Array.isArray(base.data) ? base.data : [];
+    const terms = codexPlusPluginNativeSearchTerms(operation.params?.searchTerm);
+    const result = { ...base, data, nextCursor: base.nextCursor ?? null, __codexPlusIndexMerged: true };
+    if (terms.length === 0) return result;
+    let catalog;
+    try {
+      // 与插件页列表共用同一个目录缓存键，连续输入不会反复拉索引。
+      catalog = await codexPlusPluginNativeCatalog({ ...operation, method: "list-plugins", params: {} });
+    } catch {
+      // 索引暂不可用时保留原生搜索结果；列表页会显示具体加载错误。
+      return result;
+    }
+    const seen = new Set(data.map((entry) => entry?.plugin?.id).filter(Boolean));
+    const limit = Number.isInteger(operation.params?.limit) && operation.params.limit > 0 ? operation.params.limit : 50;
+    const matches = [];
+    for (const market of catalog.marketplaces || []) {
+      if (!codexPlusPluginNativeSource({ marketplacePath: market.path, localMarketplaceName: market.name })) continue;
+      for (const plugin of market.plugins || []) {
+        if (typeof plugin?.id !== "string" || seen.has(plugin.id)) continue;
+        const rank = codexPlusPluginNativeSearchRank(plugin, terms);
+        if (rank < 0) continue;
+        seen.add(plugin.id);
+        matches.push({ rank, entry: { marketplaceName: market.name, marketplacePath: market.path, plugin } });
+      }
+    }
+    matches.sort((left, right) => left.rank - right.rank);
+    result.data = [...data, ...matches.slice(0, limit).map((match) => match.entry)];
+    return result;
+  }
+
   async function codexPlusPluginNativeExtend(operation, original) {
     if (original?.__codexPlusIndexMerged) return original;
+    if (operation.method === "search-plugins") return await codexPlusPluginNativeSearchExtend(operation, original);
     try {
       return codexPlusPluginNativeMerge(original, await codexPlusPluginNativeCatalog(operation), operation.method);
     } catch (error) {
@@ -11069,7 +11157,9 @@
         result = await original({ ...(options || {}), [codexPlusPluginNativeBypass]: true });
       } catch (error) {
         if (!pluginMarketplaceRemoteAuthError(error)) throw error;
-        result = { marketplaces: [], marketplaceLoadErrors: [], featuredPluginIds: [] };
+        result = operation.method === "search-plugins"
+          ? { data: [], nextCursor: null }
+          : { marketplaces: [], marketplaceLoadErrors: [], featuredPluginIds: [] };
       }
       return await codexPlusPluginNativeExtend(operation, result);
     })();
@@ -11850,6 +11940,8 @@
     if (method === "plugin/install") return "install-plugin";
     if (method === "plugin/read") return "read-plugin";
     if (method === "plugin/installed") return "installed-plugins";
+    // 新版 app-server 的服务端插件搜索（#2790）：插件页输入关键词后不再本地过滤 plugin/list。
+    if (method === "plugin/search") return "search-plugins";
     if (method === "plugin/uninstall") return "uninstall-plugin";
     return String(method || "");
   }
@@ -13429,12 +13521,65 @@
    * 为什么还要轮询：React 复用行节点时不会产生 childList 变更，只靠 MutationObserver
    * 会漏掉"标签变了"这种情况。600ms 一次、且只在菜单开着时跑，开销可以忽略。
    */
+  /**
+   * 模型菜单开着却认不出来时（#2753：旧版 Codex 上分组不出现），记一次结构快照，
+   * 好据此补上旧版的识别规则。只在页面上真有一个装着目录里模型的原生单选菜单时记，
+   * 每个页面最多一次；只记标记数量和结构特征，不记模型名等文本。
+   */
+  function codexPlusModelPickerReportUnrecognized() {
+    const state = codexPlusModelPickerGroupsState;
+    if (state.unrecognizedReported) return;
+    let exact = null;
+    for (const menu of document.querySelectorAll('[role="menu"]')) {
+      if (!visibleElement(menu) || menu.closest("[data-codex-plus-ext]")) continue;
+      const radios = [...menu.querySelectorAll('[role="menuitemradio"]')];
+      if (radios.length < 2) continue;
+      // 先过廉价的 DOM 条件，真有候选菜单时才建目录映射（扫描每 600ms 一次）。
+      exact ||= codexPlusModelPickerCatalogExactMap();
+      if (!exact.size) return;
+      const known = radios.filter((row) => {
+        const text = (row.textContent || "").replace(/\s+/g, " ").trim();
+        return exact.has(`raw\u0000${text}`) || exact.has(codexPlusModelPickerNormalizeLoose(text));
+      }).length;
+      if (!known) continue;
+      state.unrecognizedReported = true;
+      const count = (selector) => {
+        try { return menu.querySelectorAll(selector).length; } catch (_) { return -1; }
+      };
+      const modulePrefixes = new Set();
+      for (const node of [menu, ...menu.querySelectorAll("[class]")].slice(0, 400)) {
+        for (const token of String(node.getAttribute("class") || "").split(/\s+/)) {
+          const match = /^_([A-Za-z]+)_/.exec(token);
+          if (match) modulePrefixes.add(match[1]);
+        }
+      }
+      const dataAttributes = (node) => (node ? [...node.attributes].map((item) => item.name).filter((name) => name.startsWith("data-")) : []);
+      try {
+        Promise.resolve(sendCodexPlusDiagnostic("model_picker_groups_menu_unrecognized", {
+          radios: radios.length,
+          catalogMatches: known,
+          pickerView: document.querySelectorAll("[data-model-picker-view]").length,
+          modelList: count('[class*="_ModelList_"]'),
+          rowContent: count("[data-menu-row-content]"),
+          flex1: count("span.flex-1, span[class*='flex-1']"),
+          menuData: dataAttributes(menu),
+          rowData: dataAttributes(radios[0]),
+          modulePrefixes: [...modulePrefixes].slice(0, 16),
+        })).catch(() => {});
+      } catch (_) {
+        // 诊断失败不能影响原生菜单。
+      }
+      return;
+    }
+  }
+
   function codexPlusModelPickerScan() {
     const state = codexPlusModelPickerGroupsState;
     if (state.disposed) return;
     const menu = codexPlusModelPickerMenu();
     const list = codexPlusModelPickerList(menu);
     if (!list) {
+      codexPlusModelPickerReportUnrecognized();
       if (state.activeList) {
         codexPlusModelPickerClear(state.activeList);
         state.activeList = null;
@@ -14070,7 +14215,8 @@
     const rules = new Set();
     for (const id of deletedSessionRowIds) {
       const uuid = normalizedCodexThreadUuid(id);
-      if (uuid) rules.add(`[data-app-action-sidebar-thread-id$="${CSS.escape(uuid)}"]{display:none !important}`);
+      // uuid 后缀按不区分大小写匹配，属性里大写写法的重建行也能在首帧隐藏（#2791）。
+      if (uuid) rules.add(`[data-app-action-sidebar-thread-id$="${CSS.escape(uuid)}" i]{display:none !important}`);
       else rules.add(`[data-app-action-sidebar-thread-id="${CSS.escape(id)}"]{display:none !important}`);
     }
     // 属性里看不出 uuid 的重建行（临时 client-new-thread id、只在 href / React props
@@ -14105,6 +14251,41 @@
     if (!uuids.size && !document.querySelector(`[${deletedSessionRowMarker}]`)) return;
     for (const row of sessionRows()) {
       const hidden = uuids.size > 0 && uuids.has(deletedSessionUuid(sessionRefFromRow(row).session_id));
+      if (hidden && row.getAttribute(deletedSessionRowMarker) !== "true") row.setAttribute(deletedSessionRowMarker, "true");
+      else if (!hidden && row.getAttribute(deletedSessionRowMarker) !== null) row.removeAttribute(deletedSessionRowMarker);
+    }
+  }
+
+  /**
+   * 在观察器回调里同步给新出现的已删会话行打隐藏标记（#2791）。
+   *
+   * filterDeletedSessionRows 挂在扫描里，要等 200ms 定时器再加一帧 rAF 才执行：
+   * 折叠再展开项目分组时，Codex 按缓存重建出的已删会话行会先画出来、再被藏起，
+   * 用户能看到「闪一下再消失」。MutationObserver 回调是微任务，在浏览器绘制下一帧
+   * 之前就会执行，这里只检查本批变更里新增、或身份属性（thread id / href）变了的
+   * 侧栏行，判定方式与 filterDeletedSessionRows 相同，行在首帧就不可见。
+   * 没有已删记录时立即返回，平时不增加开销；标记属性不在扫描 observer 的
+   * attributeFilter 里，写标记不会引发自喂扫描。
+   */
+  function hideDeletedSessionRowsInMutations(mutations) {
+    if (!deletedSessionRowIds.size || !mutations?.length) return;
+    const uuids = deletedSessionUuids();
+    if (!uuids.size) return;
+    const rowSelector = selectors.sidebarThread;
+    const rows = new Set();
+    const collect = (node) => {
+      if (node?.nodeType !== 1) return;
+      // 节点本身或其祖先是侧栏行（行内的链接 / 标题被替换）；以及新插入子树里的行。
+      const owner = node.closest?.(rowSelector);
+      if (owner) rows.add(owner);
+      node.querySelectorAll?.(rowSelector)?.forEach?.((row) => rows.add(row));
+    };
+    for (const mutation of mutations) {
+      if (mutation.type === "attributes") collect(mutation.target);
+      else mutation.addedNodes?.forEach?.(collect);
+    }
+    for (const row of rows) {
+      const hidden = uuids.has(deletedSessionUuid(sessionRefFromRow(row).session_id));
       if (hidden && row.getAttribute(deletedSessionRowMarker) !== "true") row.setAttribute(deletedSessionRowMarker, "true");
       else if (!hidden && row.getAttribute(deletedSessionRowMarker) !== null) row.removeAttribute(deletedSessionRowMarker);
     }
@@ -14856,7 +15037,9 @@
    * `/thread-usage-live`，宿主只读文件尾部。
    *
    * 节点挂在输入卡片（[data-composer-surface-variant]）之后、同一父容器内，也就是
-   * 「输入框下方、卡片外」。节点带 data-codex-plus-ext，扫描调度器会把它排除在
+   * 「输入框下方、卡片外」。旧版 Codex 没有这个属性，退回旧类名或输入框所在的 form，
+   * 会话 id 退回侧边栏当前行 + 地址栏，挂不上时写诊断日志（issue #2753）。
+   * 节点带 data-codex-plus-ext，扫描调度器会把它排除在
    * 自喂循环之外（issue #1960）。
    */
   registerCodexPlusExtensionSelector('[data-codex-plus-ext="builtin-usage-statusline"]');
@@ -14886,6 +15069,10 @@
     lastFingerprint: "",
     cache: new Map(),
     observer: null,
+    /** 页面里出现过新版 composer 标记后就不再走旧版兜底。 */
+    modernDom: false,
+    /** 已经写过的诊断原因，每个页面生命周期一条只记一次。 */
+    diagnosed: new Set(),
   };
 
   const codexPlusUsageSvgNs = "http://www.w3.org/2000/svg";
@@ -15011,43 +15198,201 @@
     return parts;
   }
 
+  /** 当前版本 Codex（26.825 起）的输入卡片。 */
+  const codexPlusUsageCardSelector = "[data-composer-surface-variant]";
+  /**
+   * 旧版 Codex 的输入卡片（issue #2753）：26.825 之前没有 data-composer-surface-variant，
+   * 卡片是 `.composer-surface-chrome`，或带 CSS Modules 类名 `_ComposerLayoutRoot_` 的容器，
+   * 和 Dream Skin 选择器契约里 composer-chrome 的几代写法一致。Intel Mac 拿不到新版
+   * Codex（新版只发 arm64），只能停在旧版，所以这条兜底在 macOS 上最常用到。
+   */
+  const codexPlusUsageLegacyCardSelector = '.composer-surface-chrome, [class*="_ComposerLayoutRoot_"]';
+  const codexPlusUsageEditorSelector = '.ProseMirror[contenteditable="true"], textarea:not(:disabled):not([readonly]), [role="textbox"][contenteditable="true"]';
+  /** 同一页面生命周期内诊断事件的上限，避免 DOM 反复变化时刷屏。 */
+  const codexPlusUsageDiagnosticLimit = 8;
+
+  /**
+   * 找输入卡片，返回 `{ card, source }`；source 记录走的是哪条路径，写进诊断日志。
+   *
+   * 旧版兜底只在页面从没出现过新版输入卡片标记时启用：新版 Codex 停在设置页等没有 composer 的
+   * 页面时，不能把别处的 form 当成输入框。
+   *
+   * 「新版」只认 data-composer-surface-variant：部分旧版 Codex 已经有 data-codex-composer-root，
+   * 却还没有新版卡片标记（#2753 的 Intel Mac 日志：composerRoot=1、surfaceVariant=0），
+   * 把根标记也算作新版会让旧版永远走不到兜底。
+   */
   function codexPlusUsageComposerCard() {
-    const cards = [...document.querySelectorAll("[data-composer-surface-variant]")];
     let fallback = null;
-    for (const card of cards) {
+    for (const card of document.querySelectorAll(codexPlusUsageCardSelector)) {
       if (!visibleElement(card) || card.closest('[data-codex-plus-ext]')) continue;
       fallback = card;
       // 首页可能同时挂着多个 composer 外壳；带真实输入框的那个才是当前会话。
-      if (card.querySelector('.ProseMirror[contenteditable="true"], textarea:not(:disabled):not([readonly]), [role="textbox"][contenteditable="true"]')) {
-        return card;
-      }
+      if (card.querySelector(codexPlusUsageEditorSelector)) return { card, source: "surface-variant" };
     }
-    return fallback;
+    if (fallback) return { card: fallback, source: "surface-variant" };
+    if (!codexPlusUsageState.modernDom && document.querySelector(codexPlusUsageCardSelector)) {
+      codexPlusUsageState.modernDom = true;
+    }
+    if (codexPlusUsageState.modernDom) return null;
+    for (const card of document.querySelectorAll(codexPlusUsageLegacyCardSelector)) {
+      if (!visibleElement(card) || card.closest('[data-codex-plus-ext]')) continue;
+      // 旧版类名也可能挂在装饰容器上，必须真的包着输入框才算。
+      if (card.querySelector(codexPlusUsageEditorSelector)) return { card, source: "legacy-chrome" };
+    }
+    // 有 composer 根标记、没有旧类名的过渡版本：根节点包着输入框时就挂在根上。
+    for (const card of document.querySelectorAll("[data-codex-composer-root]")) {
+      if (!visibleElement(card) || card.closest('[data-codex-plus-ext]')) continue;
+      if (card.querySelector(codexPlusUsageEditorSelector)) return { card, source: "composer-root" };
+    }
+    // 类名也对不上时按输入框本身找：取 ProseMirror 所在的 form。
+    for (const editor of document.querySelectorAll('.ProseMirror[contenteditable="true"]')) {
+      if (!visibleElement(editor) || editor.closest('[data-codex-plus-ext], [role="dialog"]')) continue;
+      const form = editor.closest("form");
+      if (form && visibleElement(form)) return { card: form, source: "editor-form" };
+    }
+    return null;
+  }
+
+  function codexPlusUsageValidThreadId(value) {
+    const id = String(value || "").replace(/^local:/, "").trim();
+    if (!id || id === "__proto__" || id === "prototype" || id === "constructor") return "";
+    return /^[A-Za-z0-9_.-]{8,128}$/.test(id) ? id : "";
   }
 
   /**
-   * 当前会话 id。
+   * 旧版 Codex 的当前会话：侧边栏当前行 + 地址栏（currentSessionRef，删除 / 导出也靠它
+   * 认当前会话）。测试沙箱里没有这个函数，按缺失处理。
+   */
+  function codexPlusUsageLegacyThreadId() {
+    if (typeof currentSessionRef !== "function") return "";
+    try {
+      return currentSessionRef()?.session_id || "";
+    } catch (_) {
+      return "";
+    }
+  }
+
+  /**
+   * 当前会话，返回 `{ id, source, reason, placement }`；拿不到 id 时 reason 说明原因。
    *
    * `[data-above-composer-conversation-id]` 是 Codex 自己挂在 composer 上的会话标识，
    * 比侧边栏选中行更贴近「这个输入框属于哪个会话」。侧边栏只作兜底，而且**只在
    * placement=thread 时用**：首页/新会话草稿的 composer 是 placement=home，此时侧边栏
    * 仍选中着上一个 thread，兜底会把上一个会话的读数挂到新会话上。
    * 新会话草稿的 id 形如 `local:client-new-thread:<uuid>`，还没有 rollout，直接当作无会话。
+   *
+   * 旧版 Codex 的 composer 上既没有 data-codex-composer-root / data-composer-placement，
+   * 也没有会话标识（issue #2753），这时 placement 为空，退回侧边栏当前行 + 地址栏。
    */
-  function codexPlusUsageThreadId(card) {
-    const composerRoot = card?.closest("[data-codex-composer-root]");
+  function codexPlusUsageResolveThread(card) {
+    const none = (reason, placement = "") => ({ id: "", source: "", reason, placement });
+    if (!card) return none("no-card");
+    const composerRoot = card.closest?.("[data-codex-composer-root]") || null;
+    const placement = String(composerRoot?.getAttribute("data-composer-placement") || "");
     const fromComposer = composerRoot
       ?.querySelector("[data-above-composer-conversation-id]")
       ?.getAttribute("data-above-composer-conversation-id");
-    const inThread = composerRoot?.getAttribute("data-composer-placement") === "thread";
-    const fromSidebar = inThread
-      ? document
+    if (fromComposer) {
+      const id = codexPlusUsageValidThreadId(fromComposer);
+      if (id) return { id, source: "composer", reason: "", placement };
+      return none(/client-new-thread:/i.test(fromComposer) ? "draft" : "invalid-id", placement);
+    }
+    if (placement === "home") return none("home", placement);
+    if (placement === "thread") {
+      const fromSidebar = codexPlusUsageValidThreadId(document
         .querySelector('[data-app-action-sidebar-thread-selected="true"][data-app-action-sidebar-thread-id]')
-        ?.getAttribute("data-app-action-sidebar-thread-id")
-      : null;
-    const id = String(fromComposer || fromSidebar || "").replace(/^local:/, "").trim();
-    if (!id || id === "__proto__" || id === "prototype" || id === "constructor") return "";
-    return /^[A-Za-z0-9_.-]{8,128}$/.test(id) ? id : "";
+        ?.getAttribute("data-app-action-sidebar-thread-id"));
+      if (fromSidebar) return { id: fromSidebar, source: "sidebar", reason: "", placement };
+    } else if (placement) {
+      // 其它显式 placement（侧边对话等）不认侧边栏，和原来的行为一致。
+      return none("other-placement", placement.slice(0, 32));
+    }
+    const legacy = codexPlusUsageValidThreadId(codexPlusUsageLegacyThreadId());
+    if (legacy) return { id: legacy, source: "legacy", reason: "", placement };
+    return none("no-thread-id", placement);
+  }
+
+  function codexPlusUsageThreadId(card) {
+    return codexPlusUsageResolveThread(card).id;
+  }
+
+  /** 同一原因每个页面生命周期只记一次。 */
+  function codexPlusUsageDiagnoseOnce(event, key, detail) {
+    const seen = codexPlusUsageState.diagnosed;
+    const fullKey = `${event}:${key}`;
+    if (seen.has(fullKey) || seen.size >= codexPlusUsageDiagnosticLimit) return;
+    seen.add(fullKey);
+    try {
+      Promise.resolve(sendCodexPlusDiagnostic(event, detail)).catch(() => {});
+    } catch (_) {
+      // 诊断失败不能影响状态栏本身。
+    }
+  }
+
+  /** 挂载失败时的 DOM 快照：只记数量和布尔值，不记会话 id 与内容。 */
+  function codexPlusUsageDomProbe() {
+    const count = (selector) => {
+      try {
+        return document.querySelectorAll(selector).length;
+      } catch (_) {
+        return -1;
+      }
+    };
+    return {
+      surfaceVariant: count(codexPlusUsageCardSelector),
+      composerRoot: count("[data-codex-composer-root]"),
+      conversationMarker: count("[data-above-composer-conversation-id]"),
+      legacyChrome: count(".composer-surface-chrome"),
+      layoutRoot: count('[class*="_ComposerLayoutRoot_"]'),
+      editors: count('.ProseMirror[contenteditable="true"]'),
+      sidebarRows: count("[data-app-action-sidebar-thread-id]"),
+      sidebarSelected: count('[data-app-action-sidebar-thread-selected="true"]'),
+      locationHasThread: typeof locationThreadId === "function" ? !!locationThreadId() : null,
+    };
+  }
+
+  function codexPlusUsageVisibleEditor() {
+    return [...document.querySelectorAll('.ProseMirror[contenteditable="true"]')]
+      .some((editor) => visibleElement(editor) && !editor.closest("[data-codex-plus-ext]"));
+  }
+
+  /**
+   * 把挂载结果写进诊断日志（issue #2753：同样设置 Windows 有、Mac 没有，用户侧无从排查）。
+   *   - 页面上有输入框却找不到卡片、或找到卡片却认不出会话 → usage_statusline_mount_missing；
+   *   - 走了旧版兜底才挂上 → usage_statusline_fallback_mount，方便确认用户是旧版 Codex。
+   * 首页、新会话草稿、没有输入框的页面本来就不显示，不记。
+   */
+  function codexPlusUsageReportPlacement(found, thread) {
+    let event = "";
+    let detail = null;
+    if (!found) {
+      if (!codexPlusUsageVisibleEditor()) return;
+      event = "usage_statusline_mount_missing";
+      detail = { reason: "no-composer-card" };
+    } else if (!thread?.id) {
+      const reason = thread?.reason || "no-thread-id";
+      if (reason === "home" || reason === "draft") return;
+      event = "usage_statusline_mount_missing";
+      detail = { reason, card: found.source, placement: thread?.placement || "" };
+    } else if (found.source !== "surface-variant" || thread.source === "legacy") {
+      event = "usage_statusline_fallback_mount";
+      detail = { card: found.source, thread: thread.source };
+    } else {
+      return;
+    }
+    codexPlusUsageDiagnoseOnce(event, Object.values(detail).join("|"), { ...detail, dom: codexPlusUsageDomProbe() });
+  }
+
+  /** 旧版 Codex 的 rollout 可能缺窗口或轮 id：照样显示（对应项为 --），只记一次缺了什么。 */
+  function codexPlusUsageNoteDataGaps(events) {
+    if (!Array.isArray(events) || !events.length) return;
+    const latest = events[events.length - 1] || {};
+    const missing = [];
+    if (!(Number(latest.context_window) > 0)) missing.push("context_window");
+    if (!events.some((item) => typeof item?.turn_id === "string" && item.turn_id)) missing.push("turn_id");
+    if (!events.some((item) => Number.isFinite(Date.parse(item?.t)))) missing.push("t");
+    if (!missing.length) return;
+    codexPlusUsageDiagnoseOnce("usage_statusline_data_partial", missing.join(","), { missing, events: events.length });
   }
 
   function codexPlusUsageEnsureNode(card) {
@@ -15218,8 +15563,12 @@
 
   /** 挂载与取数分开：切换时先恢复栏位，网络请求只更新数值。 */
   function codexPlusUsageSyncPlacement() {
-    const card = codexPlusUsageEnabled() ? codexPlusUsageComposerCard() : null;
-    const threadId = codexPlusUsageThreadId(card);
+    const enabled = codexPlusUsageEnabled();
+    const found = enabled ? codexPlusUsageComposerCard() : null;
+    const card = found?.card || null;
+    const thread = codexPlusUsageResolveThread(card);
+    if (enabled) codexPlusUsageReportPlacement(found, thread);
+    const threadId = thread.id;
     if (!card || !threadId) {
       codexPlusUsageHide();
       codexPlusUsageState.threadId = "";
@@ -15252,7 +15601,8 @@
   /** 只观察输入框结构和会话标识，忽略状态栏自身的写入，避免自喂循环。 */
   function codexPlusUsageObserve() {
     if (!document.body || typeof MutationObserver !== "function") return;
-    const selector = "[data-codex-composer-root], [data-composer-surface-variant], [data-above-composer-conversation-id]";
+    // 旧版 Codex 没有前三个标记，输入框结构变化只能靠旧类名感知（issue #2753）。
+    const selector = `[data-codex-composer-root], ${codexPlusUsageCardSelector}, [data-above-composer-conversation-id], ${codexPlusUsageLegacyCardSelector}`;
     codexPlusUsageState.observer = new MutationObserver((records) => {
       const relevant = records.some((record) => {
         if (record.target?.closest?.("[data-codex-plus-ext]")) return false;
@@ -15272,6 +15622,8 @@
       attributeFilter: [
         "data-above-composer-conversation-id", "data-composer-placement",
         "data-app-action-sidebar-thread-selected", "data-app-action-sidebar-thread-id",
+        // 旧版侧边栏用 active / aria-current 标当前行。
+        "data-app-action-sidebar-thread-active", "aria-current",
       ],
     });
   }
@@ -15282,7 +15634,16 @@
     try {
       const result = await postJson("/thread-usage-live", { session_id: threadId });
       codexPlusUsageState.failures = 0;
-      if (result?.status !== "ok" || !Array.isArray(result.events)) return null;
+      if (result?.status !== "ok" || !Array.isArray(result.events)) {
+        // 栏位照样显示占位符；这里只把宿主给的原因记一次，便于区分「没挂上」和「没数据」。
+        const status = String(result?.status || "invalid").slice(0, 32);
+        codexPlusUsageDiagnoseOnce("usage_statusline_data_unavailable", status, {
+          status,
+          message: String(result?.message || "").slice(0, 200),
+        });
+        return null;
+      }
+      codexPlusUsageNoteDataGaps(result.events);
       return result.events;
     } finally {
       codexPlusUsageState.inFlight = false;
@@ -20827,7 +21188,11 @@
   };
   window.addEventListener("resize", window.__codexPlusResizeHandler);
   window.__codexSessionDeleteObserver?.disconnect();
-  window.__codexSessionDeleteObserver = new MutationObserver(scheduleScan);
+  window.__codexSessionDeleteObserver = new MutationObserver((mutations) => {
+    // 先同步藏起已删会话的重建行（首帧前生效，#2791），再按原规则排扫描。
+    runScanStep(() => hideDeletedSessionRowsInMutations(mutations));
+    scheduleScan(mutations);
+  });
   window.__codexSessionDeleteObserver.observe(document.body || document.documentElement, {
     childList: true,
     subtree: true,
