@@ -13,7 +13,7 @@
     {
       "name": "10-style.js",
       "description": "样式注入、默认设置、后端设置映射、梦皮主题变量与持久化",
-      "lines": 2799
+      "lines": 2801
     },
     {
       "name": "20-menu.js",
@@ -29,6 +29,11 @@
       "name": "31-config-read-deadline.js",
       "description": "原生只读配置请求超时取消与等待释放",
       "lines": 67
+    },
+    {
+      "name": "32-fork-readiness-fallback.js",
+      "description": "无账号时原生 Fork 放置门控读不到的兜底（#2826）",
+      "lines": 77
     },
     {
       "name": "40-backend-settings.js",
@@ -88,7 +93,7 @@
     {
       "name": "84-proxy-request-status.js",
       "description": "输入框上方的请求避震状态条：正在请求 / 等待上游 / 正在重试 / 正在生成",
-      "lines": 280
+      "lines": 294
     },
     {
       "name": "85-history-turn-recovery.js",
@@ -173,7 +178,7 @@
     {
       "name": "99-startup.js",
       "description": "启动序列：resize 处理、MutationObserver 与事件绑定",
-      "lines": 100
+      "lines": 101
     },
     {
       "name": "99-tail.js",
