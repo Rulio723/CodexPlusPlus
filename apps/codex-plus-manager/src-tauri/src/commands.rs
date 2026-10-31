@@ -2024,14 +2024,21 @@ pub fn run_codex_multi_worker(options_path: &Path) -> anyhow::Result<()> {
         let _ = codex_plus_launcher::shutdown();
         return Ok(());
     };
-    while tauri::async_runtime::block_on(
-        codex_plus_core::multi_worker::codex_instance_identity_matches(&identity),
-    )
-    .unwrap_or(false)
-    {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
-    codex_plus_launcher::shutdown()
+    #[cfg(windows)]
+    let lifetime = codex_plus_core::multi_worker::wait_for_codex_instance_exit(&identity);
+    #[cfg(not(windows))]
+    let lifetime = {
+        while tauri::async_runtime::block_on(
+            codex_plus_core::multi_worker::codex_instance_identity_matches(&identity),
+        )
+        .unwrap_or(false)
+        {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    let cleanup = codex_plus_launcher::shutdown();
+    lifetime.and(cleanup)
 }
 
 /// 多开实例启动结果文件名（与 `worker-options.json` 同目录）。
@@ -3385,12 +3392,57 @@ pub async fn weixin_connect_qr_status() -> CommandResult<WeixinQrPayload> {
 }
 
 #[tauri::command]
+pub async fn weixin_connect_catalog() -> Value {
+    codex_plus_core::model_catalog::read_codex_model_catalog().await
+}
+
+#[tauri::command]
+pub async fn weixin_connect_projects(
+    codex_path: Option<String>,
+    work_dir: Option<String>,
+) -> Result<Value, String> {
+    let settings = SettingsStore::default()
+        .load()
+        .map_err(|error| format!("读取微信连接设置失败：{error}"))?;
+    let executable = codex_path.unwrap_or(settings.weixin_connect_codex_path);
+    let work_dir = work_dir.unwrap_or(settings.weixin_connect_work_dir);
+    let work_dir = if work_dir.trim().is_empty() {
+        std::env::current_dir().map_err(|error| format!("无法读取当前工作目录：{error}"))?
+    } else {
+        PathBuf::from(work_dir.trim())
+    };
+    codex_plus_core::connect::projects::list_projects(executable.trim().to_string(), work_dir)
+        .await
+        .map_err(|error| format!("读取微信连接项目失败：{error:#}"))
+}
+
+#[tauri::command]
 pub fn weixin_connect_status() -> CommandResult<codex_plus_core::connect::WeixinConnectStatus> {
     let status = weixin_status()
         .lock()
         .map(|status| status.clone())
         .unwrap_or_default();
     ok("微信连接状态已读取。", status)
+}
+
+#[tauri::command]
+pub fn weixin_connect_reset_session(peer_id: String, account_id: String) -> Result<(), String> {
+    let settings = SettingsStore::default()
+        .load()
+        .map_err(|error| error.to_string())?;
+    if settings.weixin_connect_account_id.trim() != account_id.trim() {
+        return Err("账号设置尚未保存，请保存后重试".to_string());
+    }
+    let peer = peer_id.trim();
+    if peer.is_empty() {
+        return Err("请填写需要重置的微信联系人 ID".to_string());
+    }
+    codex_plus_core::connect::controls::SessionOptionsStore::for_peer(
+        &settings.weixin_connect_account_id,
+        peer,
+    )
+    .request_reset()
+    .map_err(|error| format!("保存重置请求失败：{error}"))
 }
 
 #[tauri::command]
@@ -3594,6 +3646,8 @@ fn spawn_weixin_connect(
         route_tag: settings.weixin_connect_route_tag,
         work_dir: settings.weixin_connect_work_dir,
         model: settings.weixin_connect_model,
+        reasoning_effort: settings.weixin_connect_reasoning_effort,
+        project_id: settings.weixin_connect_project_id,
         sandbox: settings.weixin_connect_sandbox,
         codex_path: settings.weixin_connect_codex_path,
     }
@@ -3832,6 +3886,13 @@ pub fn save_settings(
                 && let Some(runtime) = runtime.as_ref()
             {
                 runtime.codex_path.set(&settings.weixin_connect_codex_path);
+                runtime.codex_path.set_defaults(codex_plus_core::connect::SessionDefaults {
+                    model: settings.weixin_connect_model.clone(),
+                    reasoning_effort: settings.weixin_connect_reasoning_effort.clone(),
+                    project_id: settings.weixin_connect_project_id.clone(),
+                    work_dir: settings.weixin_connect_work_dir.clone(),
+                    sandbox: settings.weixin_connect_sandbox.clone(),
+                });
             }
             // 自动接管是常驻行为，保存后立刻生效，不必重启管理器。
             crate::auto_takeover::apply_enabled(settings.codex_app_auto_takeover);
@@ -6394,6 +6455,10 @@ pub async fn update_skill(repo_key: String, id: String) -> CommandResult<SkillsP
     install_or_update_skill(&repo_key, &id, "Skill 已更新。", "更新 Skill 失败").await
 }
 
+fn skill_install_failure_message(failure_prefix: &str, error: &anyhow::Error) -> String {
+    format!("{failure_prefix}：{error:#}")
+}
+
 async fn install_or_update_skill(
     repo_key: &str,
     id: &str,
@@ -6417,7 +6482,7 @@ async fn install_or_update_skill(
         }
         Err(error) => {
             return failed(
-                &format!("{failure_prefix}：{error}"),
+                &skill_install_failure_message(failure_prefix, &error),
                 current_skills_payload(&manager),
             );
         }
@@ -6455,7 +6520,7 @@ async fn install_or_update_skill(
         Ok(bytes) => bytes,
         Err(error) => {
             return failed(
-                &format!("{failure_prefix}：{error}"),
+                &skill_install_failure_message(failure_prefix, &error),
                 current_skills_payload(&manager),
             );
         }
@@ -6463,7 +6528,7 @@ async fn install_or_update_skill(
     match manager.install_from_zip(&skill, &zip) {
         Ok(_) => ok(success_message, current_skills_payload(&manager)),
         Err(error) => failed(
-            &format!("{failure_prefix}：{error}"),
+            &skill_install_failure_message(failure_prefix, &error),
             current_skills_payload(&manager),
         ),
     }
@@ -9884,6 +9949,17 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn skill_install_failure_message_preserves_the_error_chain() {
+        let error = anyhow::anyhow!("root cause")
+            .context("download context")
+            .context("repository context");
+        assert_eq!(
+            skill_install_failure_message("update failed", &error),
+            "update failed：repository context: download context: root cause"
+        );
+    }
 
     #[test]
     fn skills_payload_hides_disabled_repository_catalog() {
