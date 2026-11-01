@@ -28,8 +28,9 @@
   };
 
   // 设置开关（#2824）：关闭时不显示、不轮询；切回开启后下一轮轮询自动接上。
+  // 设置开关与内置拓展「请求状态条」都开着才显示、才轮询。
   function codexPlusProxyStatusEnabled() {
-    return codexPlusSettings().proxyRequestStatus !== false;
+    return codexPlusSettings().proxyRequestStatus !== false && !globalThis?.__codexPlusBuiltinInactive?.has("proxy-request-status");
   }
 
   function codexPlusProxyStatusVisibleElement(element) {
@@ -123,6 +124,9 @@
     // 放进只包住输入框的 relative 容器里，插在卡片前会跑到输入框内部。
     const anchor = card?.closest("[data-codex-composer-root]") || card;
     if (!anchor?.parentElement) return null;
+    // 内置拓展经公开的 composer.above 插槽登记了容器（见 96-builtin-extensions.js）：放进紧挨着这个输入框的那个。
+    const slotHost = [...(codexPlusProxyStatusState.slotHosts || [])]
+      .find((container) => container.isConnected && container.closest("[data-codex-plus-ui-slot]")?.nextElementSibling === anchor);
     let node = codexPlusProxyStatusState.node;
     if (!node) {
       node = document.createElement("div");
@@ -131,7 +135,9 @@
       node.setAttribute("role", "status");
       codexPlusProxyStatusState.node = node;
     }
-    if (!node.isConnected || node.nextElementSibling !== anchor) {
+    if (slotHost) {
+      if (node.parentElement !== slotHost) slotHost.appendChild(node);
+    } else if (!node.isConnected || node.nextElementSibling !== anchor) {
       anchor.insertAdjacentElement("beforebegin", node);
     }
     return node;
@@ -269,17 +275,30 @@
     if (!codexPlusProxyStatusState.disposed) codexPlusProxyStatusRender();
   }
 
-  codexPlusProxyStatusInstallStyle();
-  codexPlusProxyStatusRender();
-  codexPlusProxyStatusState.pollTimer = window.setInterval(
-    () => void codexPlusProxyStatusRefresh(),
-    codexPlusProxyStatusPollMs,
-  );
-  codexPlusProxyStatusState.tickTimer = window.setInterval(() => {
-    codexPlusProxyStatusState.nowMs = Date.now();
+  /** 轮询与倒计时随内置拓展「请求状态条」装卸（96-builtin-extensions.js）：没装着时不轮询。 */
+  function startCodexPlusProxyStatus() {
+    if (codexPlusProxyStatusState.disposed || codexPlusProxyStatusState.pollTimer) return;
     codexPlusProxyStatusRender();
-  }, codexPlusProxyStatusTickMs);
-  void codexPlusProxyStatusRefresh();
+    codexPlusProxyStatusState.pollTimer = window.setInterval(
+      () => void codexPlusProxyStatusRefresh(),
+      codexPlusProxyStatusPollMs,
+    );
+    codexPlusProxyStatusState.tickTimer = window.setInterval(() => {
+      codexPlusProxyStatusState.nowMs = Date.now();
+      codexPlusProxyStatusRender();
+    }, codexPlusProxyStatusTickMs);
+    void codexPlusProxyStatusRefresh();
+  }
+
+  function stopCodexPlusProxyStatus() {
+    window.clearInterval(codexPlusProxyStatusState.pollTimer);
+    window.clearInterval(codexPlusProxyStatusState.tickTimer);
+    codexPlusProxyStatusState.pollTimer = 0;
+    codexPlusProxyStatusState.tickTimer = 0;
+    codexPlusProxyStatusHide();
+  }
+
+  codexPlusProxyStatusInstallStyle();
 
   window.__codexPlusProxyRequestStatusRuntime = {
     refresh: codexPlusProxyStatusRefresh,

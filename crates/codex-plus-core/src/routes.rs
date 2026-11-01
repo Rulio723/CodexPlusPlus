@@ -117,6 +117,10 @@ pub trait BridgeRuntimeService: Send + Sync {
     async fn cdp_evaluate(&self, _payload: Value) -> anyhow::Result<Value> {
         anyhow::bail!("CDP evaluate is unavailable")
     }
+    /// 按需开启 app-server 客户端捕获（拓展的 codex/request 中间件需要）。默认不可用。
+    async fn request_app_server_client_capture(&self) -> anyhow::Result<Value> {
+        anyhow::bail!("app-server client capture is unavailable")
+    }
     /// 拉市场清单，并合并本地已安装状态。
     async fn script_market_list(&self) -> anyhow::Result<Value> {
         anyhow::bail!("script market is unavailable")
@@ -350,6 +354,23 @@ pub async fn handle_bridge_request(
         "/user-scripts/reload" => ctx.runtime.reload_user_scripts().await,
         "/cdp/targets" => ctx.runtime.cdp_targets().await,
         "/cdp/evaluate" => ctx.runtime.cdp_evaluate(payload.clone()).await,
+        // Codex++ 内部用：拓展要改写发往 app-server 的请求时补开客户端捕获。不进拓展路由白名单。
+        "/extensions/request-capture" => ctx.runtime.request_app_server_client_capture().await,
+        // 拓展常驻后台：页面侧 ctx.backend 用。进程由处理桥接的这个进程托管，与具体运行时无关。
+        "/extensions/backend/call" => crate::extension_backend::route_call(&payload).await,
+        "/extensions/backend/events" => crate::extension_backend::route_events(&payload).await,
+        "/extensions/backend/stop" => crate::extension_backend::route_stop(&payload).await,
+        "/extensions/services/call" => crate::extension_backend::route_service_call(&payload).await,
+        // 拓展自己调模型（ctx.llm）：经协议代理用当前供应商，不跑拓展网关中间件。
+        "/extensions/llm/complete" => crate::extension_llm::route_complete(&payload).await,
+        "/extensions/llm/models" => crate::extension_llm::route_models(),
+        "/extensions/history" => {
+            let payload = payload.clone();
+            tokio::task::spawn_blocking(move || crate::extension_history::route(&payload))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+        }
         "/devtools/open" => ctx.runtime.open_devtools().await,
         "/manager/open" => ctx.runtime.open_manager(payload.clone()).await,
         "/manager/open-transient" => ctx.runtime.open_transient_manager(payload.clone()).await,
@@ -715,7 +736,10 @@ impl BridgeRuntimeService for CoreRuntimeService {
     async fn set_user_script_enabled(&self, key: String, enabled: bool) -> anyhow::Result<Value> {
         match &self.user_scripts {
             Some(user_scripts) => {
-                user_scripts.set_script_enabled(&key, enabled)?;
+                let result = user_scripts.set_script_enabled(&key, enabled);
+                // 与管理器一致：拓展带的钩子 / Codex 资产跟着启停写回 Codex 配置。
+                crate::extension_hooks::sync_default(user_scripts);
+                result?;
                 user_scripts.inventory()
             }
             None => Ok(empty_user_script_inventory()),
@@ -725,7 +749,9 @@ impl BridgeRuntimeService for CoreRuntimeService {
     async fn delete_user_script(&self, key: String) -> anyhow::Result<Value> {
         match &self.user_scripts {
             Some(user_scripts) => {
-                user_scripts.delete_user_script(&key)?;
+                let result = user_scripts.delete_user_script(&key);
+                crate::extension_hooks::sync_default(user_scripts);
+                result?;
                 user_scripts.inventory()
             }
             None => Ok(empty_user_script_inventory()),
@@ -787,6 +813,15 @@ impl BridgeRuntimeService for CoreRuntimeService {
 
     async fn cdp_evaluate(&self, payload: Value) -> anyhow::Result<Value> {
         evaluate_extension_cdp(self.debug_port, &payload).await
+    }
+
+    async fn request_app_server_client_capture(&self) -> anyhow::Result<Value> {
+        let websocket_url = self
+            .websocket_url
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Codex 页面尚未连接"))?;
+        let started = crate::bridge::request_app_server_client_capture(websocket_url);
+        Ok(json!({ "status": "ok", "started": started }))
     }
 
     async fn open_devtools(&self) -> anyhow::Result<Value> {
