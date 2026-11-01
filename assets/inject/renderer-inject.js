@@ -385,17 +385,13 @@
   const zedRemoteButtonClass = "codex-zed-remote-button";
   const zedRemoteOpenInMenuItemClass = "codex-zed-open-in-menu-item";
   const sessionShareButtonClass = "codex-session-share-button";
-  const sessionShareButtonVersion = "1";
-  const codexPlusShareBaseUrl = "https://share.codexpp.cc";
-  const codexPlusShareFallbackBaseUrl = "https://codexpp-share.pages.dev";
-  const codexPlusShareMaxCharacters = 900000;
   const zedRemoteToastClass = "codex-zed-remote-toast";
   const upstreamWorktreeDialogClass = "codex-upstream-worktree-dialog";
   const upstreamBranchOptionAttribute = "data-codex-upstream-branch-option";
   const styleId = "codex-delete-style";
   // 改 10-style.js 里的任何 CSS 都要把它 +1：installStyle 靠这个版本号判断
   // 页面里已有的 <style> 是否过期，不升的话新样式在旧标签存在时会被直接跳过。
-  const codexDeleteStyleVersion = "35";
+  const codexDeleteStyleVersion = "37";
   const codexPlusMenuId = "codex-plus-menu";
   const codexPlusMenuFloatingClass = "codex-plus-menu-floating";
   const codexPlusSidebarNavId = "codex-plus-sidebar-nav";
@@ -445,7 +441,6 @@
   const codexThreadScrollRouteHooksVersion = "dispatcher:2";
   const codexThreadScrollListenerVersion = "4";
   const codexThreadScrollUserIntentVersion = "dispatcher:2";
-  const codexPlusImageOverlayId = "codex-plus-image-overlay";
   const codexPlusDreamSkinStyleId = "codex-dream-skin-style";
   const codexPlusDreamSkinPlatform = String(window.__CODEX_PLUS_DREAM_SKIN_PLATFORM__ || "macos");
   const codexPlusDreamSkinRevision = String(window.__CODEX_PLUS_DREAM_SKIN_REVISION__ || "1");
@@ -457,1464 +452,6 @@
   window.__codexThreadScrollSyncTimers = [];
   window.__codexThreadScrollRestoreRevision = (window.__codexThreadScrollRestoreRevision || 0) + 1;
 
-  function installCodexPlusImageOverlay() {
-    const config = window.__CODEX_PLUS_IMAGE_OVERLAY__ || {};
-    const source = typeof config.dataUrl === "string" ? config.dataUrl : "";
-    const cached = window.__codexPlusImageOverlayResource;
-    const configuredOpacity = Number(config.opacity);
-    const opacity = Number.isFinite(configuredOpacity)
-      ? Math.min(1, Math.max(0.01, configuredOpacity)) : 0.35;
-    const fitMode = ["fill", "fit", "stretch", "tile", "center"].includes(config.fitMode)
-      ? config.fitMode : "fit";
-    const reuse = !!(config.enabled && source && cached?.version === 30 && cached.ready && cached.source === source);
-    if (reuse && cached.opacity === opacity && cached.fitMode === fitMode &&
-      document.getElementById(codexPlusImageOverlayId)?.getAttribute("data-codex-plus-ext") === "image-overlay") return;
-    window.__codexPlusImageOverlayGeometryCleanup?.();
-    window.__codexPlusImageOverlayGeometryCleanup = null;
-    window.__codexPlusImageOverlayCleanup?.(reuse);
-    window.__codexPlusImageOverlayCleanup = null;
-    document.getElementById(codexPlusImageOverlayId)?.remove();
-    const root = document.documentElement;
-    window.__codexPlusImageOverlayReady = Promise.resolve(false);
-    if (!config.enabled || !source || !root) return;
-
-    const fitStyles = {
-      fill: { size: "cover", position: "center center", repeat: "no-repeat" },
-      fit: { size: "contain", position: "center center", repeat: "no-repeat" },
-      stretch: { size: "100% 100%", position: "center center", repeat: "no-repeat" },
-      tile: { size: "auto", position: "left top", repeat: "repeat" },
-      center: { size: "auto", position: "center center", repeat: "no-repeat" },
-    }[fitMode];
-    const viewerSelector = [
-      '[role="dialog"]:has([data-testid="image-preview-dismiss-area"])',
-      '[data-testid="image-preview-editor"]',
-      '[data-testid="image-preview-dismiss-area"]',
-      '.codex-dialog-overlay[class*="_imageOverlay_"]',
-      '.codex-dialog:has([data-image-preview-toolbar])',
-      '.codex-dialog:has([data-image-preview-composer])',
-      "[data-browser-sidebar-webview]",
-      "[data-browser-sidebar-toolbar]",
-    ].join(", ");
-    const toolbarSelector = "[data-browser-sidebar-toolbar]";
-    const browserSelector = `[data-browser-sidebar-webview], ${toolbarSelector}`;
-    const sidebarSelector = "aside.app-shell-left-panel, [data-app-action-sidebar-scroll], nav[data-app-navigation-rail]";
-    const sidebarRowSelector = "[data-app-action-sidebar-thread-row], [data-app-action-sidebar-project-row]";
-    const pageSelector = ".codex-plus-page-overlay";
-    const timelineSelector = "[data-app-action-timeline-scroll], .thread-scroll-container";
-    const reviewHeaderSelector = '[class~="group/turn-diff-header"]';
-    const rightPanelSelector = '[data-app-shell-focus-area="right-panel"]';
-    const inactivePanel = node => node.closest?.(
-      `${rightPanelSelector}[inert], ${rightPanelSelector}[aria-hidden="true"]`);
-    const mediaSelector = `img, video, canvas, ${viewerSelector}, ${reviewHeaderSelector}`;
-    const nativeRangeSelector = 'input[type="range"], [role="slider"]';
-    const composerSelector = '[class*="_ComposerLayoutRoot_"]';
-    const headerSelector = '[data-app-shell-header-layout], [data-sticky][class*="_shell_"], .sticky.z-30.bg-surface';
-    const editorSelector = '[contenteditable="true"], .ProseMirror';
-    const composerOverlaySelector = "[data-composer-overlay-floating-ui]";
-    const diffPreviewSelector = '[data-testid="diff-preview-scroll"]';
-    const controlSelector = 'button, [role="button"], input, textarea, select, a';
-    const mediaAttribute = "data-codex-plus-image-native";
-    const scopeAttribute = "data-codex-plus-image-scope";
-    const containmentAttribute = "data-codex-plus-image-contain";
-    const browserPortalAttribute = "data-codex-plus-image-browser-portal";
-    const popupMaterialAttribute = "data-codex-plus-image-popup-material";
-    const popupBoundaryAttribute = "data-codex-plus-image-popup-boundary";
-    const popupPortalAttribute = "data-codex-plus-image-popup-portal";
-    const popupPortalSelector = ".fixed.inset-0.pointer-events-none.zoom-adjusted-viewport.contain-layout";
-    const controlAttribute = "data-codex-plus-image-control";
-    const paintAttribute = "data-codex-plus-image-paint";
-    const topControlAttribute = "data-codex-plus-image-top-control";
-    const footerAttribute = "data-codex-plus-image-footer-gutter";
-    const footerSelector = "[data-thread-scroll-footer]";
-    const topControlSelector = [
-      '[role="menu"]', '[role="listbox"]', '[role="dialog"]', '[role="tooltip"]', '[class*="_Tooltip_"]',
-      "[data-radix-popper-content-wrapper]", '[data-slot="popover-content"]', "[popover]", composerOverlaySelector,
-    ].join(", ");
-    // Extensions keep their own layers; their full-page shell is the one wallpaper surface.
-    const owned = node => !!node?.closest?.('[data-codex-plus-ext]') && !node.matches(pageSelector);
-    const wallpaperLayer = 1000;
-    const overlay = document.createElement("div");
-    overlay.id = codexPlusImageOverlayId;
-    overlay.setAttribute("aria-hidden", "true");
-    overlay.setAttribute("data-codex-plus-ext", "image-overlay");
-    Object.assign(overlay.style, {
-      position: "fixed", inset: "0", width: "100vw", height: "100vh",
-      opacity: String(opacity), pointerEvents: "none", zIndex: String(wallpaperLayer),
-      userSelect: "none", backgroundSize: fitStyles.size,
-      backgroundPosition: fitStyles.position, backgroundRepeat: fitStyles.repeat,
-      transition: "none", animation: "none",
-    });
-    const style = document.createElement("style");
-    style.setAttribute("data-codex-plus-ext", "image-overlay");
-    const nativeRules = `
-      [${scopeAttribute}] { isolation:auto!important;z-index:auto!important;will-change:auto!important; }
-      [${browserPortalAttribute}] { z-index:${wallpaperLayer + 1}!important; }
-      [${scopeAttribute}^="identity"] { transform:none!important; }
-      [${scopeAttribute}="identity-flow"] { position:relative!important; }
-      [${containmentAttribute}] { contain:none!important; }
-      [${containmentAttribute}^="flow"] { position:relative!important; }
-      [${containmentAttribute}$="-clip"] { overflow:clip!important; }
-      [${mediaAttribute}]:where(:not([${mediaAttribute}="review"], [${mediaAttribute}="composer"], [${mediaAttribute}="page"])) { z-index:${wallpaperLayer}!important; }
-      [${mediaAttribute}="flow"], [${mediaAttribute}="island-flow"] { position:relative!important; }
-      [${mediaAttribute}="viewer"] { z-index:${wallpaperLayer + 3}!important; }
-      [${mediaAttribute}="footer"] { z-index:${wallpaperLayer + 1}!important; }
-      [${mediaAttribute}^="header"] { z-index:${wallpaperLayer + 1}!important; }
-      [${mediaAttribute}="header-flow"] { position:relative!important; }
-      [${mediaAttribute}^="header"][class~="after:bg-linear-to-b"][class~="after:from-surface"][class~="after:to-transparent"]::after { background-image:none!important; }
-      ${composerSelector} .top-full [data-composer-placement="home"].bg-background-composer-action-bar { background:none!important; }
-      [${mediaAttribute}="page"], [${mediaAttribute}="composer"] { isolation:isolate!important; }
-      [${mediaAttribute}="composer"]:not([${mediaAttribute}="footer"] *) { z-index:${wallpaperLayer + 1}!important; }
-      [${mediaAttribute}^="toolbar"] { background:none!important;box-shadow:none!important;filter:none!important;backdrop-filter:none!important; }
-      [${mediaAttribute}="toolbar-flow"] { position:relative!important; }
-      ${timelineSelector} { overscroll-behavior-y:none!important; }
-      [${popupMaterialAttribute}] { background-image:none!important;filter:none!important;backdrop-filter:none!important; }
-      [${paintAttribute}] { isolation:isolate!important; }
-      [${paintAttribute}]:not([${paintAttribute}^="before-"], [${paintAttribute}^="background-"])::after, [${paintAttribute}^="before-"]::before {
-        content:"";position:absolute;inset:0;pointer-events:none;border-radius:inherit;
-        corner-shape:inherit;z-index:-1;opacity:${opacity};
-        background-size:${fitStyles.size};background-position:${fitStyles.position};
-        background-repeat:${fitStyles.repeat};background-attachment:fixed;
-      }
-      [${controlAttribute}] { z-index:${wallpaperLayer}!important; }
-      [${topControlAttribute}] { z-index:${wallpaperLayer + 2}!important; }
-      [${popupPortalAttribute}] { z-index:${wallpaperLayer + 2}!important; }
-      [${topControlAttribute}="flow"] { position:relative!important; }
-    `;
-    const ns = "http://www.w3.org/2000/svg";
-    const svgNode = (tag, attributes = {}) => {
-      const node = document.createElementNS(ns, tag);
-      for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, String(value));
-      return node;
-    };
-    const svg = svgNode("svg", { width: 0, height: 0, "aria-hidden": "true", "data-codex-plus-ext": "image-overlay" });
-    Object.assign(svg.style, { position: "fixed", width: "0", height: "0", pointerEvents: "none" });
-    const defs = svgNode("defs");
-    svg.appendChild(defs);
-    let resource = reuse ? cached : null;
-    let disposed = false;
-    let raf = 0;
-    let nextControl = 0;
-    let nextSource = 0;
-    let previewVisible = false;
-    let sidebarScrollUntil = 0;
-    let finishReady;
-    const image = new Image();
-    const records = new Map();
-    const scopes = new Map();
-    const browserPortals = new Map();
-    const controls = new Map();
-    const popups = new Map();
-    const visibleMedia = new Set();
-    const visibleControls = new Set();
-    const activeControls = new Set();
-    const paintedNodes = new Set();
-    const viewers = new Set();
-    const scopeKeys = new Map();
-    const footers = new Map();
-    const themeInputs = new Map();
-    // 受变换影响的壁纸表面：待重算集合、当前按视口换算的集合、为其挂的 ResizeObserver（表面 -> 记录节点）。
-    const paintsDirty = new Set();
-    const geometryPaints = new Set();
-    const paintObservers = new Map();
-    let geometryDirty = true;
-    const originalAttributes = new Map();
-    const stats = { frames: 0, rectReads: 0, styleReads: 0, queries: 0, maskWrites: 0, layerWrites: 0 };
-    window.__codexPlusImageOverlayStats = stats;
-    window.__codexPlusImageOverlayReady = new Promise(resolve => { finishReady = resolve; });
-    const mark = (node, name, value) => {
-      let attributes = originalAttributes.get(node);
-      if (!attributes) originalAttributes.set(node, attributes = new Map());
-      if (!attributes.has(name)) attributes.set(name, node.getAttribute(name));
-      if (node.getAttribute(name) !== value) node.setAttribute(name, value);
-    };
-    const unmark = (node, name) => {
-      const attributes = originalAttributes.get(node);
-      if (!attributes?.has(name)) return;
-      const previous = attributes.get(name);
-      if (previous === null) node.removeAttribute(name);
-      else node.setAttribute(name, previous);
-      attributes.delete(name);
-      if (!attributes.size) originalAttributes.delete(node);
-    };
-    const computed = (node, pseudo) => { stats.styleReads++; return getComputedStyle(node, pseudo); };
-    const bounds = node => { stats.rectReads++; return node.getBoundingClientRect(); };
-    const queryAll = (node, selector) => { stats.queries++; return node.querySelectorAll(selector); };
-    // 按 CSS Transforms 规范，自身或祖先带变换时 background-attachment:fixed 退化为元素局部坐标；
-    // Chromium 里 translate:0、scale:1、will-change:transform 同样会触发（#2813：侧栏打开时 footer 带 translate）。
-    const transformedStyle = paint => [paint.transform, paint.translate, paint.scale, paint.rotate]
-      .some(value => value && value !== "none") || /transform|translate|scale|rotate/.test(paint.willChange || "");
-    // 全局壁纸层在视口里的绘制矩形，与 overlay 的 background-size / background-position 等价。
-    const wallpaperRect = (mode, width, height, imageWidth, imageHeight) => {
-      if (mode === "stretch") return [0, 0, width, height];
-      if (!imageWidth || !imageHeight) return null;
-      if (mode === "tile") return [0, 0, imageWidth, imageHeight];
-      const scale = mode === "fill" ? Math.max(width / imageWidth, height / imageHeight)
-        : mode === "fit" ? Math.min(width / imageWidth, height / imageHeight) : 1;
-      return [(width - imageWidth * scale) / 2, (height - imageHeight * scale) / 2, imageWidth * scale, imageHeight * scale];
-    };
-    // 把视口坐标的壁纸矩形换算到背景定位区域（视口原点 originX/originY，祖先缩放 sx/sy）的局部坐标。
-    const localWallpaper = (wall, originX, originY, sx, sy) => {
-      const px = value => `${Math.round(value * 1000) / 1000 || 0}px`;
-      return { size: `${px(wall[2] / sx)} ${px(wall[3] / sy)}`,
-        position: `${px((wall[0] - originX) / sx)} ${px((wall[1] - originY) / sy)}` };
-    };
-    const layoutScale = (size, layout) => !layout || Math.abs(size - layout) <= 1 ? 1 : size / layout;
-    const scopeKey = node => [node.getAttribute("class"), ...[
-      "position", "z-index", "isolation", "contain", "transform", "translate", "scale", "rotate",
-      "will-change", "overflow", "overflow-x", "overflow-y", "animation", "transition",
-    ].map(name => node.style.getPropertyValue(name))].join("|");
-    const themeKey = node => [
-      [...node.classList].filter(name => node !== root ||
-        !/^_(?:active|opening|closing)_[a-zA-Z0-9]+_\d+$/.test(name)).sort().join(" "),
-      [...node.style].filter(name => node !== root || name !== "--image-preview-thumbnail-radius")
-        .sort().map(name => `${name}:${node.style.getPropertyValue(name)}:${node.style.getPropertyPriority(name)}`).join(";"),
-    ].join("|");
-    const viewerKey = node => [node.hidden, node.getAttribute("class"), node.getAttribute("role"),
-      node.getAttribute("data-testid"),
-      node.style.display, node.style.visibility, node.style.contentVisibility].join("|");
-    const release = record => {
-      if (record.browserPortal) {
-        const count = browserPortals.get(record.browserPortal) - 1;
-        if (count) browserPortals.set(record.browserPortal, count);
-        else {
-          browserPortals.delete(record.browserPortal);
-          unmark(record.browserPortal, browserPortalAttribute);
-        }
-      }
-      for (const ancestor of record.ancestors) {
-        const count = scopes.get(ancestor) - 1;
-        if (count) scopes.set(ancestor, count);
-        else {
-          scopes.delete(ancestor);
-          scopeKeys.delete(ancestor);
-          unmark(ancestor, scopeAttribute);
-          unmark(ancestor, containmentAttribute);
-        }
-      }
-    };
-    const refreshScope = node => {
-      unmark(node, scopeAttribute);
-      unmark(node, containmentAttribute);
-      const originalStyle = computed(node);
-      if (originalStyle.contain.includes("paint")) {
-        const flow = originalStyle.position === "static" ? "flow" : "positioned";
-        const clip = originalStyle.overflowX === "visible" && originalStyle.overflowY === "visible" ? "-clip" : "";
-        mark(node, containmentAttribute, flow + clip);
-      }
-      const transform = originalStyle.transform;
-      const identity = transform !== "none" && new DOMMatrix(transform).isIdentity &&
-        !node.getAnimations().some(animation => animation.playState === "running");
-      mark(node, scopeAttribute, identity ? originalStyle.position === "static" ? "identity-flow" : "identity" : "stack");
-      scopeKeys.set(node, scopeKey(node));
-    };
-    const nativeKind = node => node.matches(reviewHeaderSelector) ? "review" :
-      node.matches(toolbarSelector) ? computed(node).position === "static" ? "toolbar-flow" : "toolbar" :
-      node.matches(pageSelector) ? "page" : node.matches(composerSelector) ? "composer" :
-      node.matches(headerSelector) ? computed(node).position === "static" ? "header-flow" : "header" :
-      node.matches(footerSelector) ? "footer" :
-      node.matches(viewerSelector) && !node.matches("[data-browser-sidebar-webview]") ? "viewer" :
-      records.get(node)?.mediaIsland ? computed(node).position === "static" ? "island-flow" : "island" :
-      computed(node).position === "static" ? "flow" : "positioned";
-    const add = node => {
-      if (owned(node) || inactivePanel(node) || node.closest(editorSelector)) return;
-      const previous = records.get(node);
-      if (!node.matches(viewerSelector) && node.closest(viewerSelector) ||
-        !node.matches(reviewHeaderSelector) && node.closest(reviewHeaderSelector)) {
-        if (previous) removeMedia(node, previous);
-        return;
-      }
-      const nativeBoundary = node.parentElement?.closest(`[${popupMaterialAttribute}], [${popupBoundaryAttribute}], [${mediaAttribute}^="island"], ${pageSelector}, ${composerSelector}, ${footerSelector}, ${headerSelector}`);
-      if (nativeBoundary && !node.matches(`${composerSelector}, ${headerSelector}`)) {
-        if (previous) removeMedia(node, previous);
-        return;
-      }
-      if (node.matches("img, video, canvas")) {
-        let host = node;
-        // Keep an icon's badges and overlapping logo stack in native DOM order.
-        for (let parent = node.parentElement; parent && parent !== document.body && !owned(parent) &&
-          !parent.matches(`${topControlSelector}, ${controlSelector}`) && !parent.textContent.trim(); parent = parent.parentElement) {
-          const children = [...parent.children];
-          const sameBox = parent.offsetWidth > 0 && parent.offsetWidth === host.offsetWidth && parent.offsetHeight === host.offsetHeight;
-          const stack = children.length > 1 && children.every(child => child.matches("img,svg") || child.querySelector("img,svg")) &&
-            ["flex", "inline-flex"].includes(computed(parent).display) &&
-            parent.offsetWidth <= children.reduce((sum, child) => sum + child.offsetWidth, 0) &&
-            parent.offsetHeight <= Math.max(...children.map(child => child.offsetHeight));
-          if (!sameBox && !stack) break;
-          host = parent;
-        }
-        if (host !== node) {
-          if (previous) removeMedia(node, previous);
-          removeWithin(records, host, removeMedia, false);
-          removeWithin(controls, host, removeControl);
-          add(host);
-          const record = records.get(host);
-          if (record) {
-            record.mediaIsland = true;
-            unmark(host, mediaAttribute);
-            mark(host, mediaAttribute, nativeKind(host));
-          }
-          return;
-        }
-      }
-      let browserPortal = node.matches(browserSelector) ? node.closest("[data-embedded-frame-host-root]") : null;
-      if (node.matches(browserSelector)) {
-        for (let parent = node.parentElement; !browserPortal && parent && parent !== root; parent = parent.parentElement) {
-          const paint = computed(parent);
-          if (paint.position === "fixed" && paint.pointerEvents === "none") { browserPortal = parent; break; }
-        }
-      }
-      const ancestors = [];
-      for (let parent = nativeBoundary || node.matches(reviewHeaderSelector) ||
-        node.matches(viewerSelector) && !node.matches(browserSelector)
-        ? null : browserPortal ? browserPortal.parentElement : node.parentElement; parent && parent !== root && !parent.matches(pageSelector) &&
-          parent !== nativeBoundary; parent = parent.parentElement) {
-        ancestors.push(parent);
-      }
-      if (previous?.parent === node.parentElement && previous.browserPortal === browserPortal && previous.nativeBoundary === nativeBoundary &&
-        previous.ancestors.length === ancestors.length &&
-        ancestors.every((parent, index) => previous.ancestors[index] === parent)) return;
-      if (previous) release(previous);
-      for (const parent of ancestors) {
-        const count = scopes.get(parent) || 0;
-        scopes.set(parent, count + 1);
-        if (!count) refreshScope(parent);
-      }
-      if (browserPortal) {
-        browserPortals.set(browserPortal, (browserPortals.get(browserPortal) || 0) + 1);
-        mark(browserPortal, browserPortalAttribute, "");
-      }
-      records.set(node, { ...previous, parent: node.parentElement, ancestors, browserPortal, nativeBoundary, box: null });
-      unmark(node, mediaAttribute);
-      mark(node, mediaAttribute, nativeKind(node));
-      if (node.getAttribute(mediaAttribute) === "viewer") {
-        viewers.add(node);
-        records.get(node).viewerKey = viewerKey(node);
-      } else viewers.delete(node);
-      if (nativeBoundary || node.matches(`${browserSelector}, ${reviewHeaderSelector}, ${composerSelector}, ${footerSelector}, ${pageSelector}, ${headerSelector}`)) {
-        intersectionObserver.unobserve(node);
-        visibleMedia.delete(node);
-      } else if (!previous || previous.nativeBoundary) intersectionObserver.observe(node);
-      stats.layerWrites++;
-    };
-    const addControl = (node, origin = null) => {
-      if (owned(node) || inactivePanel(node) || node.closest(reviewHeaderSelector) ||
-        node.matches(nativeRangeSelector) || node.closest(browserSelector) ||
-        node.closest(sidebarSelector) || node.closest(pageSelector) || node.closest(viewerSelector) ||
-        node.closest(topControlSelector) || node.closest(`[${popupBoundaryAttribute}]`) ||
-        node.closest(`${composerSelector}, ${footerSelector}, ${editorSelector}, [${mediaAttribute}^="island"], ${headerSelector}`)) {
-        const previous = controls.get(node);
-        if (previous) removeControl(node, previous);
-        return;
-      }
-      let record = controls.get(node);
-      if (!record) {
-        record = { id: ++nextControl, origin, box: null, paintDirty: false,
-          filter: null, backdrop: null, rule: "", key: "", backdropKey: "" };
-        controls.set(node, record);
-        intersectionObserver.observe(node);
-        resizeObserver.observe(node);
-      }
-      return record;
-    };
-    const controlSurface = node => {
-      let surface = node;
-      for (let parent = node.parentElement; parent && parent !== root && !scopes.has(parent); parent = parent.parentElement) {
-        if (parent.querySelector(mediaSelector)) break;
-        const paint = computed(parent);
-        if (paint.zIndex !== "auto" || paint.transform !== "none" ||
-          paint.filter !== "none" || paint.backdropFilter !== "none" ||
-          paint.isolation === "isolate" || Number(paint.opacity) < 1)
-          surface = parent;
-      }
-      return surface;
-    };
-    const nativeSurfacePaint = surface => ({ id: ++nextControl, surface,
-      pseudo: ["after", "before"].find(pseudo => ["none", "normal"].includes(computed(surface, `::${pseudo}`).content)) });
-    // 未受变换影响时沿用 fixed；受影响时 paint.geometry 记录每个绘制目标按视口换算出的尺寸与偏移。
-    const wallRule = paint => {
-      const image = JSON.stringify(resource.imageSource);
-      const selector = `[${paintAttribute}="${paint.ruleId}"]`;
-      if (paint.tints) return paint.tints.map(([pseudo, tint]) => {
-        const geometry = paint.geometry?.get(pseudo);
-        return `${selector}${pseudo}{background-image:linear-gradient(${tint},${tint}),url(${image})!important;background-size:auto,${geometry?.size || fitStyles.size}!important;background-position:0 0,${geometry?.position || fitStyles.position}!important;background-repeat:no-repeat,${fitStyles.repeat}!important;background-attachment:${geometry ? "scroll" : "fixed"}!important;}`;
-      }).join("\n");
-      const pseudo = `::${paint.pseudo}`;
-      const geometry = paint.geometry?.get(pseudo);
-      return `${selector}${pseudo}{background-image:url(${image});${geometry
-        ? `background-attachment:scroll!important;background-size:${geometry.size}!important;background-position:${geometry.position}!important;` : ""}}`;
-    };
-    const measurePaint = paint => {
-      const surface = paint.surface;
-      const geometry = new Map();
-      const wall = wallpaperRect(fitMode, innerWidth, innerHeight, resource.width, resource.height);
-      if (!wall || !surface.isConnected) return geometry;
-      const surfaceStyle = computed(surface);
-      // 绘制用的伪元素以表面为包含块时才能换算；否则保持 fixed，与改动前一致。
-      const containing = surfaceStyle.position !== "static" || transformedStyle(surfaceStyle);
-      const box = bounds(surface);
-      const sx = layoutScale(box.width, surface.offsetWidth), sy = layoutScale(box.height, surface.offsetHeight);
-      for (const pseudo of paint.tints ? paint.tints.map(([target]) => target) : [`::${paint.pseudo}`]) {
-        let x = surface.clientLeft, y = surface.clientTop;
-        if (pseudo) {
-          if (!containing) continue;
-          const own = computed(surface, pseudo);
-          const left = parseFloat(own.left), top = parseFloat(own.top);
-          if (own.position !== "absolute" || !Number.isFinite(left) || !Number.isFinite(top)) continue;
-          x += left + (parseFloat(own.borderLeftWidth) || 0);
-          y += top + (parseFloat(own.borderTopWidth) || 0);
-        }
-        geometry.set(pseudo, localWallpaper(wall, box.left + x * sx, box.top + y * sy, sx, sy));
-      }
-      return geometry;
-    };
-    const releasePaintGeometry = (node, paint) => {
-      geometryPaints.delete(node);
-      if (!paint) return;
-      paint.geometry = null;
-      const surface = paint.surface;
-      if (paintObservers.get(surface) !== node) return;
-      paintObservers.delete(surface);
-      if (!controls.has(surface) && ![...footers.values()].some(footer => footer.scroller === surface))
-        resizeObserver.unobserve(surface);
-    };
-    // 祖先样式变化（class/style 突变、过渡/动画结束）后，只标记待查，统一在 render 里读样式。
-    const invalidatePaintChains = target => {
-      let found = false;
-      for (const node of paintedNodes) {
-        const paint = records.get(node)?.paint;
-        if (!paint || target !== paint.surface && !target.contains(paint.surface)) continue;
-        paint.chainDirty = true;
-        paintsDirty.add(node);
-        found = true;
-      }
-      return found;
-    };
-    const refreshPaints = () => {
-      const nodes = geometryDirty ? new Set([...paintsDirty, ...geometryPaints]) : paintsDirty;
-      for (const node of nodes) {
-        const record = records.get(node);
-        const paint = record?.paint;
-        if (!paint || !paintedNodes.has(node) || !paint.surface.isConnected) continue;
-        if (paint.chainDirty) {
-          paint.chainDirty = false;
-          paint.transformed = false;
-          for (let parent = paint.surface; parent; parent = parent === root ? null : parent.parentElement)
-            if (transformedStyle(computed(parent))) { paint.transformed = true; break; }
-        }
-        const geometry = paint.transformed ? measurePaint(paint) : null;
-        if (geometry?.size) {
-          paint.geometry = geometry;
-          geometryPaints.add(node);
-          if (!paintObservers.has(paint.surface)) {
-            paintObservers.set(paint.surface, node);
-            resizeObserver.observe(paint.surface);
-          }
-        } else releasePaintGeometry(node, paint);
-        const rule = wallRule(paint);
-        if (record.wallRule !== rule) { record.wallRule = rule; writeRules(); }
-      }
-      paintsDirty.clear();
-    };
-    const registerPaint = (node, paint = records.get(node).paint || nativeSurfacePaint(node)) => {
-      const record = records.get(node);
-      const previous = record.paint;
-      if (previous && previous.surface !== paint.surface) {
-        unmark(previous.surface, paintAttribute);
-        releasePaintGeometry(node, previous);
-      }
-      record.paint = paint;
-      if (node.matches(headerSelector)) {
-        unmark(paint.surface, paintAttribute);
-        paint.ruleId = `background-${paint.id}`;
-        // Paint only existing opaque backing, including native top-edge extensions.
-        // Transparent headers already see the single global wallpaper underneath.
-        paint.tints = ["", "::before", "::after"].map(pseudo => {
-          const native = computed(paint.surface, pseudo || undefined);
-          const color = native.backgroundColor;
-          if (color === "transparent" || color.startsWith("rgba(") || color.includes("/") || native.backgroundImage !== "none") return null;
-          return [pseudo, `color-mix(in srgb, ${color} ${(1 - opacity) * 100}%, transparent)`];
-        }).filter(Boolean);
-        mark(paint.surface, paintAttribute, paint.ruleId);
-      } else if (!paint.pseudo) {
-        // Leave a surface's two native pseudo-elements intact when both are used.
-        unmark(paint.surface, paintAttribute);
-        paintedNodes.delete(node);
-        releasePaintGeometry(node, paint);
-        record.wallRule = "";
-        writeRules();
-        return;
-      } else {
-        paint.ruleId = (paint.pseudo === "before" ? "before-" : "") + paint.id;
-        paint.tints = null;
-        mark(paint.surface, paintAttribute, paint.ruleId);
-      }
-      paintedNodes.add(node);
-      record.wallRule = wallRule(paint);
-      paint.chainDirty = true;
-      paintsDirty.add(node);
-      schedule();
-      writeRules();
-    };
-    const removeWithin = (registry, tree, remove, includeRoot = true) => {
-      for (const [node, record] of registry)
-        if ((includeRoot || node !== tree) && tree.contains(node)) remove(node, record);
-    };
-    const popupBackgroundKey = node => Array.from(node.style)
-      .filter(name => name.startsWith("background") || name === "color")
-      .sort().map(name => `${name}:${node.style.getPropertyValue(name)}:${node.style.getPropertyPriority(name)}`).join(";");
-    const addComposer = node => {
-      if (owned(node) || inactivePanel(node) || node.closest(viewerSelector)) return;
-      // Paint below the native children. Never annotate editor-owned node views.
-      const surface = node.matches('[data-composer-utility-bar-variant="home"]')
-        ? node.querySelector('[class*="_ComposerLayoutBody_"]') || node : node;
-      let surfacePaint = records.get(node)?.paint;
-      if (!surfacePaint) {
-        unmark(node, mediaAttribute);
-        surfacePaint = nativeSurfacePaint(surface);
-      }
-      add(node);
-      registerPaint(node, surfacePaint);
-    };
-    const addPopupSurface = (boundary, surface) => {
-      if (owned(surface) || inactivePanel(surface) || surface.closest(reviewHeaderSelector) ||
-        surface.closest(viewerSelector) || surface.closest(pageSelector)) return;
-      const previous = popups.get(surface);
-      if (previous?.boundary === boundary) return;
-      if (previous) removePopup(surface, previous);
-      removeWithin(controls, boundary, removeControl);
-      const paint = computed(surface);
-      const record = { boundary, portal: boundary.closest(popupPortalSelector), owner: surface.closest(composerOverlaySelector) || boundary,
-        id: ++nextControl, backgroundKey: popupBackgroundKey(surface),
-        nativeBackground: paint.backgroundColor,
-        className: surface.getAttribute("class"), rule: "" };
-      // Only the background is translucent; native contents and positioning stay intact.
-      record.rule = `[${popupMaterialAttribute}="${record.id}"]{background-color:color-mix(in srgb, ${paint.backgroundColor} ${(1 - opacity) * 100}%, transparent)!important;}`;
-      popups.set(surface, record);
-      // Native tooltips share a fixed portal; lifting only its children cannot clear the composer.
-      if (record.portal) mark(record.portal, popupPortalAttribute, "");
-      mark(boundary, popupBoundaryAttribute, "");
-      mark(boundary, topControlAttribute, computed(boundary).position === "static" ? "flow" : "positioned");
-      mark(surface, popupMaterialAttribute, String(record.id));
-      queryAll(boundary, mediaSelector).forEach(add);
-      writeRules();
-    };
-    const refreshPopupTheme = () => {
-      for (const [surface, popup] of popups) {
-        unmark(surface, popupMaterialAttribute);
-        const background = computed(surface).backgroundColor;
-        mark(surface, popupMaterialAttribute, String(popup.id));
-        if (background === popup.nativeBackground) continue;
-        popup.nativeBackground = background;
-        popup.rule = `[${popupMaterialAttribute}="${popup.id}"]{background-color:color-mix(in srgb, ${background} ${(1 - opacity) * 100}%, transparent)!important;}`;
-      }
-      writeRules();
-    };
-    const addDiffPreview = scroll => {
-      const surface = scroll.parentElement;
-      const tooltip = scroll.closest('[class~="group/diff-preview"]');
-      if (!surface || !tooltip || owned(scroll)) return;
-      addPopupSurface(tooltip.closest("[data-radix-popper-content-wrapper]") || tooltip, surface);
-    };
-    const addNativePopup = node => {
-      if (owned(node) || node.closest(viewerSelector) || node.closest(pageSelector)) return;
-      const composerOverlay = node.matches(composerOverlaySelector);
-      const parent = node.parentElement;
-      // The roleless composer menu uses a translated positioning wrapper.
-      const boundary = composerOverlay && parent?.childElementCount === 1 &&
-        ["fixed", "absolute"].includes(computed(parent).position)
-        ? parent : node.closest("[data-radix-popper-content-wrapper]") || node;
-      if (popups.has(boundary)) return;
-      if (node === boundary && [...popups.values()].some(popup => popup.boundary === boundary)) return;
-      const surface = composerOverlay ? node.firstElementChild :
-        node.matches("[data-radix-popper-content-wrapper]") &&
-        computed(node).backgroundColor === "rgba(0, 0, 0, 0)"
-        ? node.querySelector(topControlSelector) : node;
-      if (!surface) return;
-      addPopupSurface(boundary, surface);
-    };
-    const isPopupSurface = surface => surface.matches(topControlSelector) ||
-      surface.closest(`[class~="group/diff-preview"], ${composerOverlaySelector}`);
-    const removePopup = (surface, record) => {
-      popups.delete(surface);
-      unmark(surface, popupMaterialAttribute);
-      if (record.portal && ![...popups.values()].some(other => other.portal === record.portal))
-        unmark(record.portal, popupPortalAttribute);
-      if (![...popups.values()].some(other => other.boundary === record.boundary)) {
-        unmark(record.boundary, popupBoundaryAttribute);
-        unmark(record.boundary, topControlAttribute);
-      }
-    };
-    const addPage = node => {
-      removeWithin(popups, node, removePopup);
-      removeWithin(controls, node, removeControl);
-      removeWithin(records, node, removeMedia, false);
-      add(node);
-      registerPaint(node);
-    };
-    const addHeader = node => {
-      if (owned(node) || inactivePanel(node) || node.closest(`${viewerSelector}, ${editorSelector}`)) return;
-      removeWithin(controls, node, removeControl);
-      removeWithin(records, node, removeMedia, false);
-      add(node);
-      registerPaint(node);
-    };
-    const updateFooter = (footer, record) => {
-      const scroller = record.scroller;
-      const parent = footer.offsetParent;
-      if (!parent) return false;
-      let left = 0, right = 0;
-      // The native footer is absolute in the outer frame, not in the scroller.
-      if (parent !== scroller) {
-        const scrollBox = bounds(scroller), parentBox = bounds(parent);
-        const scale = parentBox.width / (parent.offsetWidth || parentBox.width);
-        const scrollScale = scrollBox.width / (scroller.offsetWidth || scrollBox.width);
-        const origin = parentBox.left + parent.clientLeft * scale;
-        left = Math.max(0, (scrollBox.left + scroller.clientLeft * scrollScale - origin) / scale);
-        right = Math.max(0, parent.clientWidth - left - scroller.clientWidth * scrollScale / scale);
-      }
-      const rule = `[${footerAttribute}="${record.id}"]{left:${left}px!important;right:${right}px!important;}`;
-      if (record.rule === rule) return false;
-      record.rule = rule;
-      return true;
-    };
-    const removeFooter = (footer, record) => {
-      footers.delete(footer);
-      unmark(footer, footerAttribute);
-      if (![...footers.values()].some(other => other.scroller === record.scroller) &&
-        !records.has(record.scroller) && !controls.has(record.scroller) && !paintObservers.has(record.scroller))
-        resizeObserver.unobserve(record.scroller);
-    };
-    const addFooter = footer => {
-      if (owned(footer) || inactivePanel(footer) || footer.closest(reviewHeaderSelector)) return;
-      add(footer);
-      const surface = footer.querySelector(':scope > [aria-hidden="true"]');
-      if (surface && records.get(footer)?.paint?.surface !== surface) registerPaint(footer, nativeSurfacePaint(surface));
-      const scroller = footer.closest(timelineSelector);
-      if (!scroller) return;
-      const previous = footers.get(footer);
-      if (previous?.scroller === scroller) {
-        if (updateFooter(footer, previous)) writeRules();
-        return;
-      }
-      if (previous) removeFooter(footer, previous);
-      const paint = computed(footer);
-      // Only the full-width native footer can cover the scrollbar gutter.
-      if (!["absolute", "fixed"].includes(paint.position) ||
-        paint.left !== "0px" || paint.right !== "0px") return;
-      const record = { id: ++nextControl, scroller, rule: "" };
-      footers.set(footer, record);
-      mark(footer, footerAttribute, String(record.id));
-      updateFooter(footer, record);
-      resizeObserver.observe(scroller);
-      writeRules();
-    };
-    const addReviewHeader = node => {
-      removeWithin(popups, node, removePopup);
-      removeWithin(controls, node, removeControl);
-      removeWithin(records, node, removeMedia, false);
-      add(node);
-    };
-    const discoverySelector = [pageSelector, mediaSelector, controlSelector, composerSelector, footerSelector, headerSelector,
-      diffPreviewSelector, topControlSelector].join(", ");
-    const visit = node => {
-      if (node?.nodeType !== 1 || !node.isConnected || owned(node) || inactivePanel(node) ||
-        node.closest(editorSelector)) return;
-      if (node.matches(browserSelector)) { add(node); return; }
-      if (node.closest(browserSelector)) return;
-      const targets = [node, ...(node.childElementCount ? queryAll(node, discoverySelector) : [])]
-        .filter(target => !inactivePanel(target));
-      // Establish native boundaries before registering their media descendants.
-      for (const target of targets) if (target.matches(pageSelector)) addPage(target);
-      for (const target of targets) if (target.matches(footerSelector)) addFooter(target);
-      for (const target of targets) if (target.matches(composerSelector)) addComposer(target);
-      for (const target of targets) if (target.matches(headerSelector)) addHeader(target);
-      for (const target of targets) if (target.matches(reviewHeaderSelector)) addReviewHeader(target);
-      for (const target of targets) {
-        if (target.matches(diffPreviewSelector)) addDiffPreview(target);
-        if (target.matches(topControlSelector)) addNativePopup(target);
-      }
-      for (const target of targets) {
-        if (target.matches(mediaSelector)) add(target);
-        if (target.matches(controlSelector)) addControl(target);
-      }
-      const popup = node.closest(topControlSelector);
-      if (popup && popup !== node) {
-        if (popup.matches(viewerSelector)) add(popup);
-        else addNativePopup(popup);
-      }
-      if (node.parentElement?.matches(footerSelector)) addFooter(node.parentElement);
-    };
-    const intersectionObserver = new IntersectionObserver(entries => {
-      let changed = false;
-      const regions = new Set();
-      for (const entry of entries) {
-        if (inactivePanel(entry.target)) continue;
-        if (records.has(entry.target)) {
-          if (records.get(entry.target).nativeBoundary || entry.target.matches(browserSelector) || entry.target.matches(reviewHeaderSelector)) {
-            visibleMedia.delete(entry.target);
-            continue;
-          }
-          records.get(entry.target).box = null;
-          if (entry.isIntersecting) visibleMedia.add(entry.target);
-          else visibleMedia.delete(entry.target);
-          const region = entry.target.closest(`${timelineSelector}, ${composerSelector}, ${sidebarSelector}`);
-          if (region) regions.add(region);
-        }
-        if (controls.has(entry.target)) {
-          controls.get(entry.target).box = null;
-          if (entry.isIntersecting) visibleControls.add(entry.target);
-          else visibleControls.delete(entry.target);
-        }
-        changed ||= records.has(entry.target) || controls.has(entry.target);
-      }
-      for (const region of regions) invalidateRegion(region, false);
-      if (changed && !previewVisible) schedule();
-    });
-    const resizeObserver = new ResizeObserver(entries => {
-      let changed = false;
-      for (const { target } of entries) {
-        for (const [footer, record] of footers)
-          if (record.scroller === target && updateFooter(footer, record)) writeRules();
-        const control = controls.get(target);
-        if (control) control.box = null;
-        const record = records.get(target);
-        if (record) record.box = null;
-        const painted = paintObservers.get(target);
-        if (painted) paintsDirty.add(painted);
-        changed ||= !!(control || record || painted);
-      }
-      if (changed && !previewVisible) schedule();
-    });
-    const removeControl = (node, control) => {
-      control.filter?.remove();
-      control.backdrop?.remove();
-      unmark(node, controlAttribute);
-      unmark(node, topControlAttribute);
-      if (!records.has(node)) {
-        intersectionObserver.unobserve(node);
-        if (!paintObservers.has(node)) resizeObserver.unobserve(node);
-      }
-      visibleControls.delete(node);
-      activeControls.delete(node);
-      controls.delete(node);
-      stats.layerWrites++;
-    };
-    const removeMedia = (node, record) => {
-      release(record);
-      releasePaintGeometry(node, record.paint);
-      paintsDirty.delete(node);
-      record.paint?.filter?.remove();
-      unmark(node, mediaAttribute);
-      unmark(record.paint?.surface || node, paintAttribute);
-      if (!controls.has(node)) {
-        intersectionObserver.unobserve(node);
-        resizeObserver.unobserve(node);
-      }
-      visibleMedia.delete(node);
-      viewers.delete(node);
-      paintedNodes.delete(node);
-      records.delete(node);
-      stats.layerWrites++;
-    };
-    const prune = () => {
-      for (const [footer, record] of footers) {
-        if (footer.isConnected && !inactivePanel(footer) && !footer.closest(reviewHeaderSelector) &&
-          record.scroller.isConnected && record.scroller.contains(footer)) continue;
-        removeFooter(footer, record);
-      }
-      for (const [surface, popup] of popups) {
-        if (surface.isConnected && !inactivePanel(surface) && !surface.closest(reviewHeaderSelector) &&
-          popup.boundary.isConnected && popup.boundary.contains(surface) &&
-          !surface.closest(viewerSelector) && !surface.closest(pageSelector) &&
-          isPopupSurface(surface)) continue;
-        removePopup(surface, popup);
-      }
-      for (const [node, record] of records) {
-        if (node.isConnected && !inactivePanel(node) &&
-          (node.matches(viewerSelector) || !node.closest(viewerSelector)) &&
-          (node.matches(reviewHeaderSelector) || !node.closest(reviewHeaderSelector)) &&
-          (node.matches(mediaSelector) || node.matches(`${composerSelector}, ${footerSelector}, ${pageSelector}, ${headerSelector}`) ||
-            record.mediaIsland && node.querySelector("img, video, canvas"))) {
-          if (record.nativeBoundary &&
-            !record.nativeBoundary.matches(`[${popupMaterialAttribute}], [${popupBoundaryAttribute}], ${pageSelector}, ${footerSelector}, ${composerSelector}, ${headerSelector}`)) add(node);
-          continue;
-        }
-        removeMedia(node, record);
-        if (node.isConnected && !node.closest(viewerSelector)) visit(node);
-      }
-      for (const [node, control] of controls) {
-        if (node.isConnected && !inactivePanel(node) && !node.closest(reviewHeaderSelector) &&
-          !node.closest(viewerSelector) && (node.matches(controlSelector) ||
-          control.origin?.isConnected && node.contains(control.origin))) continue;
-        removeControl(node, control);
-      }
-    };
-    const retireTree = tree => {
-      removeWithin(popups, tree, removePopup);
-      removeWithin(controls, tree, removeControl);
-      removeWithin(records, tree, removeMedia);
-      removeWithin(footers, tree, removeFooter);
-    };
-    const mutationObserver = new MutationObserver(mutations => {
-      let changed = false;
-      let pruneNeeded = false;
-      const added = new Set();
-      const attributes = new Set();
-      const semanticAttributes = new Set();
-      const panels = new Set();
-      const movedInactive = new Set();
-      for (const mutation of mutations) {
-        if (owned(mutation.target) || mutation.target.closest?.(editorSelector)) continue;
-        if (mutation.type === "childList") {
-          for (const node of mutation.removedNodes)
-            if (node.nodeType === 1 && node.isConnected && inactivePanel(node)) movedInactive.add(node);
-        }
-        if (mutation.type === "attributes" && mutation.target.matches(rightPanelSelector) &&
-          ["inert", "aria-hidden", "data-app-shell-focus-area"].includes(mutation.attributeName)) {
-          panels.add(mutation.target);
-          continue;
-        }
-        if (inactivePanel(mutation.target)) continue;
-        if (mutation.type === "attributes" && mutation.attributeName === "data-composer-overlay-floating-ui") {
-          for (const [surface, popup] of popups)
-            if (popup.owner === mutation.target) removePopup(surface, popup);
-          added.add(mutation.target);
-          changed = true;
-          pruneNeeded = true;
-          continue;
-        }
-        if (mutation.type === "childList") {
-          if (mutation.target.closest?.(browserSelector)) continue;
-          const nodes = [...mutation.addedNodes, ...mutation.removedNodes];
-          if (!nodes.some(node => node.nodeType === 1 && !owned(node))) continue;
-          pruneNeeded = true;
-          for (const node of mutation.addedNodes)
-            if (node.nodeType === 1 && node.isConnected && !owned(node)) added.add(node);
-          if ([...mutation.removedNodes].some(node =>
-            node.nodeType === 1 && !owned(node) && (node.matches(`[${mediaAttribute}],[${controlAttribute}],[${footerAttribute}]`) ||
-              node.querySelector(`[${mediaAttribute}],[${controlAttribute}],[${popupMaterialAttribute}],[${footerAttribute}]`) ||
-              node.matches(`[${popupMaterialAttribute}]`)))) changed = true;
-        } else {
-          attributes.add(mutation.target);
-          if (mutation.attributeName !== "style") semanticAttributes.add(mutation.target);
-        }
-      }
-      const before = stats.layerWrites;
-      const count = records.size + controls.size + popups.size;
-      for (const tree of movedInactive) { retireTree(tree); changed = true; }
-      for (const panel of panels) {
-        if (inactivePanel(panel)) retireTree(panel);
-        else visit(panel);
-        changed = true;
-      }
-      for (const node of added) {
-        let parent = node.parentElement;
-        while (parent && !added.has(parent)) parent = parent.parentElement;
-        if (!parent) visit(node);
-      }
-      changed ||= stats.layerWrites !== before || records.size + controls.size + popups.size !== count;
-      for (const node of attributes) {
-        if (!node.isConnected || inactivePanel(node)) continue;
-        if (node.closest?.(browserSelector) && !node.matches(browserSelector)) continue;
-        // Native hosts and painted surfaces own their animated geometry.
-        if (node.matches(`${browserSelector}, ${headerSelector}`) && records.has(node) && !semanticAttributes.has(node)) continue;
-        if (node === root || node === document.body) {
-          const key = themeKey(node);
-          if (themeInputs.get(node) !== key) {
-            themeInputs.set(node, key);
-            refreshPopupTheme();
-            for (const surface of paintedNodes) if (surface.matches(headerSelector)) registerPaint(surface);
-          }
-        }
-        if (viewers.has(node)) {
-          const record = records.get(node);
-          if (!node.matches(viewerSelector)) {
-            removeMedia(node, record);
-            visit(node);
-            changed = true;
-            pruneNeeded = true;
-            continue;
-          }
-          const key = viewerKey(node);
-          if (record.viewerKey === key) continue;
-          record.viewerKey = key;
-          changed ||= isPreviewOpen() !== previewVisible;
-          continue;
-        } else if (node.closest(viewerSelector) && !node.matches(browserSelector)) continue;
-        if ([...viewers].some(viewer => node.contains(viewer)))
-          changed ||= isPreviewOpen() !== previewVisible;
-        pruneNeeded ||= semanticAttributes.has(node);
-        if (node.matches(pageSelector) && !records.get(node)?.paint) visit(node);
-        if (node.matches(headerSelector) && (!records.get(node)?.paint || semanticAttributes.has(node))) { addHeader(node); changed = true; }
-        if (node.matches(reviewHeaderSelector)) { addReviewHeader(node); continue; }
-        const popup = popups.get(node);
-        if (popup && !node.closest(viewerSelector) && !node.closest(pageSelector) &&
-          isPopupSurface(node)) {
-          const key = popupBackgroundKey(node);
-          const className = node.getAttribute("class");
-          if (key !== popup.backgroundKey || className !== popup.className) {
-            const boundary = popup.boundary;
-            removePopup(node, popup);
-            addPopupSurface(boundary, node);
-            changed = true;
-          }
-          continue;
-        }
-        if (popup) { removePopup(node, popup); visit(node); changed = true; }
-        if (node.matches(topControlSelector)) {
-          const count = popups.size;
-          addNativePopup(node);
-          changed ||= popups.size !== count;
-        }
-        if (node.closest(`[${popupBoundaryAttribute}]`) && !records.has(node) && !scopes.has(node)) continue;
-        if (previewVisible) {
-          continue;
-        }
-        // 祖先 class/style 变化可能加上或撤掉 translate（如侧栏开合），重新判断其下壁纸表面。
-        if (invalidatePaintChains(node)) changed = true;
-        if (footers.has(node) || node.matches(footerSelector)) {
-          const footer = footers.get(node);
-          if (footer) removeFooter(node, footer);
-          if (node.matches(footerSelector)) addFooter(node);
-          if (footer) writeRules();
-        }
-        if (records.has(node)) {
-          records.get(node).box = null;
-          unmark(node, mediaAttribute);
-          add(node);
-          if (!records.has(node)) { changed = true; continue; }
-          mark(node, mediaAttribute, nativeKind(node));
-          if (records.get(node).nativeBoundary) continue;
-        } else {
-          if (node.matches(mediaSelector)) add(node);
-          if (node.matches(controlSelector)) addControl(node);
-          if (!scopes.has(node) && !controls.has(node) && !records.has(node)) continue;
-        }
-        if (scopes.has(node)) {
-          if (scopeKeys.get(node) !== scopeKey(node)) {
-            refreshScope(node);
-            geometryDirty = true;
-            pruneNeeded = true;
-            changed = true;
-          } else changed = invalidateRegion(node.closest(sidebarSelector) ? document.body : node, false) || changed;
-          if (!records.has(node) && !controls.has(node)) continue;
-        }
-        const control = controls.get(node);
-        if (control) { control.box = null; control.surface = null; control.candidate = undefined; }
-        if (control) control.paintDirty = true;
-        changed = true;
-      }
-      changed ||= stats.layerWrites !== before;
-      if (pruneNeeded && [...viewers].some(node => !node.isConnected || !node.matches(viewerSelector)))
-        changed = true;
-      if (changed) {
-        if (pruneNeeded) prune();
-        if (isPreviewOpen() !== previewVisible) {
-          if (raf) cancelAnimationFrame(raf);
-          render();
-        } else schedule();
-      }
-    });
-    const isPreviewOpen = () => [...viewers].some(node =>
-      node.isConnected && node.matches(viewerSelector) && node.checkVisibility({ checkVisibilityCSS: true }));
-    const inViewport = box => box.width > 0 && box.height > 0 && box.right > 0 &&
-      box.bottom > 0 && box.left < innerWidth && box.top < innerHeight;
-    const overlap = (a, b) => a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
-    const wallpaperInput = (box, sx, sy) => {
-      const width = innerWidth / sx, height = innerHeight / sy;
-      if (fitMode === "tile") {
-        const key = `${innerWidth}|${innerHeight}`;
-        if (resource.tileInputKey !== key) {
-          if (resource.tileInputUrl) URL.revokeObjectURL(resource.tileInputUrl);
-          const tiled = svgNode("svg", { width: innerWidth, height: innerHeight });
-          const pattern = svgNode("pattern", { id: "wall", patternUnits: "userSpaceOnUse",
-            width: resource.width, height: resource.height });
-          pattern.appendChild(svgNode("image", { href: source, width: resource.width, height: resource.height }));
-          const patterns = svgNode("defs");
-          patterns.appendChild(pattern);
-          tiled.append(patterns, svgNode("rect", { width: innerWidth, height: innerHeight, fill: "url(#wall)" }));
-          resource.tileInputUrl = URL.createObjectURL(new Blob(
-            [new XMLSerializer().serializeToString(tiled)], { type: "image/svg+xml" }));
-          resource.tileInputKey = key;
-        }
-        return { href: resource.tileInputUrl, x: -box.x / sx, y: -box.y / sy,
-          width, height, preserveAspectRatio: "none", result: "wall" };
-      }
-      let x = -box.x / sx, y = -box.y / sy, w = width, h = height;
-      let aspect = fitMode === "fill" ? "xMidYMid slice" : fitMode === "fit" ? "xMidYMid meet" : "none";
-      if (fitMode === "center") {
-        w = resource.width / sx;
-        h = resource.height / sy;
-        x += (width - w) / 2;
-        y += (height - h) / 2;
-      }
-      return { href: resource.imageSource, x, y, width: w, height: h, preserveAspectRatio: aspect, result: "wall" };
-    };
-    const backdropInput = (item, box, sx, sy, index) => {
-      const target = item.node, paint = computed(target), mediaBox = item.box;
-      const x = (mediaBox.x - box.x) / sx, y = (mediaBox.y - box.y) / sy;
-      const width = mediaBox.width / sx, height = mediaBox.height / sy;
-      const input = `media-${index}`, shape = `shape-${index}`;
-      const clipped = `clipped-${index}`, painted = `painted-${index}`;
-      const primitives = [];
-      if (target instanceof HTMLImageElement && target.complete && target.naturalWidth) {
-        const sourceUrl = target.currentSrc || target.src;
-        const mediaRecord = records.get(target);
-        if (mediaRecord.sourceUrl !== sourceUrl || mediaRecord.sourceWidth !== target.naturalWidth ||
-          mediaRecord.sourceHeight !== target.naturalHeight) {
-          mediaRecord.sourceUrl = sourceUrl;
-          mediaRecord.sourceWidth = target.naturalWidth;
-          mediaRecord.sourceHeight = target.naturalHeight;
-          mediaRecord.inputRevision = ++nextSource;
-          mediaRecord.inputSource = sourceUrl;
-          if (sourceUrl.startsWith("data:image/")) {
-            const sourceSvg = svgNode("svg", { width: target.naturalWidth, height: target.naturalHeight });
-            sourceSvg.appendChild(svgNode("image", { href: sourceUrl,
-              width: target.naturalWidth, height: target.naturalHeight, preserveAspectRatio: "none" }));
-            mediaRecord.inputSource = "data:" + "image/svg+xml;charset=utf-8," +
-              encodeURIComponent(new XMLSerializer().serializeToString(sourceSvg));
-          }
-        }
-        let w = width, h = height, left = x, top = y;
-        const mediaScaleX = mediaBox.width / (target.offsetWidth || mediaBox.width);
-        const mediaScaleY = mediaBox.height / (target.offsetHeight || mediaBox.height);
-        const naturalWidth = target.naturalWidth * mediaScaleX / sx;
-        const naturalHeight = target.naturalHeight * mediaScaleY / sy;
-        const fit = paint.objectFit;
-        if (fit !== "fill") {
-          let scale = fit === "cover" ? Math.max(width / naturalWidth, height / naturalHeight)
-            : fit === "none" ? 1 : Math.min(width / naturalWidth, height / naturalHeight);
-          if (fit === "scale-down") scale = Math.min(1, scale);
-          w = naturalWidth * scale;
-          h = naturalHeight * scale;
-          const positions = paint.objectPosition.split(/\s+/);
-          const offset = (value, available) => value?.endsWith("%")
-            ? available * parseFloat(value) / 100 : parseFloat(value) || 0;
-          left += offset(positions[0], width - w);
-          top += offset(positions[1] || positions[0], height - h);
-        }
-        primitives.push(["feImage", { href: mediaRecord.inputSource,
-          x: left, y: top, width: w, height: h, preserveAspectRatio: "none", result: input }]);
-      } else {
-        // Opaque live surfaces use the existing backdrop pixels, never a capture.
-        primitives.push(["feComposite", { in: "SourceGraphic", in2: "SourceGraphic",
-          operator: "in", result: input }]);
-      }
-      const radius = paint.borderTopLeftRadius.split(/\s+/);
-      const length = (value, size, scale) => value?.endsWith("%")
-        ? size * parseFloat(value) / 100 : (parseFloat(value) || 0) / scale;
-      const rx = Math.min(width / 2, length(radius[0], width, sx));
-      const ry = Math.min(height / 2, length(radius[1] || radius[0], height, sy));
-      const clip = `<svg xmlns="${ns}" width="${width}" height="${height}"><rect width="${width}" height="${height}" rx="${rx}" ry="${ry}" fill="white"/></svg>`;
-      primitives.push(
-        ["feImage", { href: `data:image/svg+xml,${encodeURIComponent(clip)}`,
-          x, y, width, height, preserveAspectRatio: "none", result: shape }],
-        ["feComposite", { in: input, in2: shape, operator: "in", result: clipped }],
-      );
-      if (Number(paint.opacity) !== 1) primitives.push(["feColorMatrix", {
-        in: clipped, type: "matrix", values: `1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 ${paint.opacity} 0`, result: painted,
-      }]);
-      return { primitives, input: Number(paint.opacity) === 1 ? clipped : painted, key: [x, y, width, height,
-        records.get(target).inputRevision || 0, paint.objectFit,
-        paint.objectPosition, paint.borderTopLeftRadius, paint.opacity].join("|") };
-    };
-    const restoreBackdrop = (record, box, sx, sy, mediaBoxes) => {
-      if (record.nativeBackdrop === "none" || opacity === 1) return "";
-      const padding = (record.nativeBackdrop.match(/[\d.]+px/g) || [])
-        .reduce((sum, value) => sum + parseFloat(value) * 3, 0);
-      const area = { left: box.left - padding * sx, right: box.right + padding * sx,
-        top: box.top - padding * sy, bottom: box.bottom + padding * sy };
-      const inputs = mediaBoxes.filter(item => overlap(area, item.box))
-        .map((item, index) => backdropInput(item, box, sx, sy, index));
-      const key = [box.x, box.y, box.width, box.height, sx, sy, innerWidth, innerHeight,
-        record.nativeBackdrop, ...inputs.map(input => input.key)].join("|");
-      const id = `${codexPlusImageOverlayId}-backdrop-${record.id}`;
-      if (!record.backdrop) {
-        record.backdrop = svgNode("filter", { id, filterUnits: "userSpaceOnUse", "color-interpolation-filters": "sRGB" });
-        defs.appendChild(record.backdrop);
-      }
-      if (key !== record.backdropKey) {
-        record.backdropKey = key;
-        const primitives = [svgNode("feImage", wallpaperInput(box, sx, sy))];
-        let compensation = "wall";
-        for (const [index, { primitives: sourcePrimitives, input }] of inputs.entries()) {
-          const next = `compensation-${index}`;
-          primitives.push(...sourcePrimitives.map(([tag, attributes]) => svgNode(tag, attributes)),
-            svgNode("feComposite", { in: compensation, in2: input, operator: "out", result: "wallOutside" }),
-            svgNode("feComposite", { in: input, in2: "wall", operator: "in", result: "mediaInside" }),
-            svgNode("feComposite", { in: "wallOutside", in2: "mediaInside", operator: "arithmetic",
-              k2: 1, k3: 1, result: next }),
-          );
-          compensation = next;
-        }
-        // Premultiplied subtraction also restores alpha. Unpremultiplication
-        // recovers the original backdrop without a divide or a backing layer.
-        primitives.push(
-          svgNode("feComposite", { in: "SourceGraphic", in2: compensation, operator: "arithmetic",
-            k2: 1, k3: -opacity, result: "restored" }),
-          svgNode("feColorMatrix", { in: "restored", type: "matrix",
-            values: "1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 0 1" }),
-        );
-        record.backdrop.setAttribute("x", String(-padding));
-        record.backdrop.setAttribute("y", String(-padding));
-        record.backdrop.setAttribute("width", String(box.width / sx + padding * 2));
-        record.backdrop.setAttribute("height", String(box.height / sy + padding * 2));
-        record.backdrop.replaceChildren(...primitives);
-      }
-      return `backdrop-filter:url("#${id}") ${record.nativeBackdrop}!important;`;
-    };
-    const activateTint = (record, node) => {
-      mark(node, controlAttribute, String(record.id));
-      if (node.matches(topControlSelector) || node.closest(topControlSelector) || node.querySelector(topControlSelector))
-        mark(node, topControlAttribute, "");
-      else unmark(node, topControlAttribute);
-    };
-    const createTint = (record, node, box, nativeFilter, mediaBoxes) => {
-      const sx = box.width / (node.offsetWidth || box.width);
-      const sy = box.height / (node.offsetHeight || box.height);
-      const backdropRule = restoreBackdrop(record, box, sx, sy, mediaBoxes);
-      const key = [box.x, box.y, box.width, box.height, innerWidth, innerHeight, sx, sy,
-        nativeFilter, record.nativePosition, record.nativeShadow, record.nativeBackdrop, record.backdropKey].join("|");
-      if (record.key === key) {
-        if (!record.rule && record.cachedRule) {
-          record.rule = record.cachedRule;
-          activateTint(record, node);
-          stats.layerWrites++;
-        }
-        return;
-      }
-      record.key = key;
-      const id = `${codexPlusImageOverlayId}-control-${record.id}`;
-      if (!record.filter) {
-        record.filter = svgNode("filter", { id, filterUnits: "userSpaceOnUse", "color-interpolation-filters": "sRGB" });
-        defs.appendChild(record.filter);
-        record.filter.append(
-          svgNode("feImage", wallpaperInput(box, sx, sy)),
-          svgNode("feColorMatrix", { in: "wall", type: "matrix",
-            values: `1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 ${opacity} 0`, result: "tint" }),
-          svgNode("feComposite", { in: "SourceGraphic", in2: "tint", operator: "out", result: "ordinary" }),
-          svgNode("feComposite", { in: "tint", in2: "SourceAlpha", operator: "in", result: "wallInk" }),
-          svgNode("feComposite", { in: "ordinary", in2: "wallInk", operator: "arithmetic", k2: 1, k3: 1 }),
-        );
-      } else {
-        const input = record.filter.firstElementChild;
-        for (const [name, value] of Object.entries(wallpaperInput(box, sx, sy)))
-          if (input.getAttribute(name) !== String(value)) input.setAttribute(name, String(value));
-      }
-      let padding = 0;
-      for (const shadow of record.nativeShadow.replace(/\([^)]*\)/g, "").split(",")) {
-        if (shadow.includes("inset")) continue;
-        const [dx = 0, dy = 0, blur = 0, spread = 0] = (shadow.match(/-?[\d.]+px/g) || []).map(parseFloat);
-        padding = Math.max(padding, Math.max(Math.abs(dx), Math.abs(dy)) + blur * 2 + Math.abs(spread));
-      }
-      padding += (nativeFilter.match(/-?[\d.]+px/g) || []).reduce((sum, value) => sum + Math.abs(parseFloat(value)) * 3, 0);
-      for (const [name, value] of Object.entries({ x: -padding, y: -padding,
-        width: box.width / sx + padding * 2, height: box.height / sy + padding * 2 }))
-        if (record.filter.getAttribute(name) !== String(value)) record.filter.setAttribute(name, String(value));
-      // Tint the control's own ink, preserving alpha. This composes once over
-      // an already-tinted backdrop; it does not create a media backing region.
-      record.rule = `[${controlAttribute}="${record.id}"]{${record.nativePosition === "static" ? "position:relative!important;" : ""}${backdropRule}filter:${nativeFilter === "none" ? "" : `${nativeFilter} `}url("#${id}")!important;}`;
-      record.cachedRule = record.rule;
-      activateTint(record, node);
-      stats.layerWrites++;
-    };
-    let lastRules = null;
-    let rulesQueued = false;
-    const writeRules = () => {
-      if (rulesQueued || disposed) return;
-      rulesQueued = true;
-      // Commit once per mutation batch, before the browser paints.
-      queueMicrotask(() => { rulesQueued = false; if (!disposed) flushRules(); });
-    };
-    const flushRules = () => {
-      const rules = nativeRules + [...footers.values()].map(record => record.rule).join("\n") +
-        [...paintedNodes].map(node => records.get(node))
-        .map(record => record.wallRule).join("\n") +
-        [...activeControls].map(node => controls.get(node).rule).concat([...popups.values()].map(record => record.rule))
-          .filter(Boolean).join("\n");
-      if (rules !== lastRules) { style.textContent = rules; lastRules = rules; }
-    };
-    const render = () => {
-      raf = 0;
-      if (disposed || document.hidden) return;
-      stats.frames++;
-      const previewWasVisible = previewVisible;
-      previewVisible = isPreviewOpen();
-      if (previewVisible) return;
-      // 预览期间跳过的祖先变化，在预览关闭后补查一次。
-      if (previewWasVisible) for (const node of paintedNodes) {
-        const paint = records.get(node)?.paint;
-        if (paint) { paint.chainDirty = true; paintsDirty.add(node); }
-      }
-      if (paintsDirty.size || geometryDirty && geometryPaints.size) refreshPaints();
-      const media = [...visibleMedia].filter(node => node.isConnected && !records.get(node)?.nativeBoundary &&
-        !inactivePanel(node) &&
-        !node.matches(composerSelector) && !node.matches(browserSelector) && !node.matches(reviewHeaderSelector) &&
-        node.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }));
-      const mediaBoxes = new Map();
-      const mediaGroups = new Map();
-      const measureMedia = composer => {
-        if (mediaGroups.has(composer)) return mediaGroups.get(composer);
-        const group = media.filter(target => !composer || composer.contains(target)).map(target => {
-        if (!mediaBoxes.has(target)) {
-          const item = records.get(target);
-          mediaBoxes.set(target, { node: target, box: !geometryDirty && item.box ? item.box : (item.box = bounds(target)) });
-        }
-        return mediaBoxes.get(target);
-        }).filter(item => inViewport(item.box));
-        mediaGroups.set(composer, group);
-        return group;
-      };
-      const candidates = new Set([...visibleControls, ...activeControls]);
-      for (const node of candidates) {
-        const record = controls.get(node);
-        if (!record) continue;
-        const composer = node.closest(composerSelector);
-        let active = !inactivePanel(node) && visibleControls.has(node) && !node.closest(viewerSelector) &&
-          !node.parentElement?.closest(`[${controlAttribute}]`) &&
-          !records.has(node) && !node.querySelector(mediaSelector) &&
-          node.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) &&
-          (composer
-            ? media.some(target => composer.contains(target) && !node.contains(target))
-            : media.length);
-        const current = record.rule;
-        if (active) {
-          if (record.candidate === undefined) {
-            const surface = controlSurface(node);
-            record.surface = surface;
-            const paint = computed(surface);
-            record.candidate = paint.position === "absolute" || paint.position === "fixed" ||
-              paint.zIndex !== "auto";
-          }
-          active = record.candidate;
-        }
-        if (active) {
-          const box = !geometryDirty && record.box ? record.box : (record.box = bounds(node));
-          active = inViewport(box);
-          if (active) {
-            active = measureMedia(composer).some(item =>
-              !node.contains(item.node) && overlap(box, item.box));
-            if (active) {
-              if (record.surface && !record.surface.contains(node)) record.surface = null;
-              const surface = record.surface ||= controlSurface(node);
-              if (surface !== node) {
-                if (addControl(surface, node)) {
-                  visibleControls.add(surface);
-                  candidates.add(surface);
-                }
-                active = false;
-              }
-            }
-            if (active) {
-              let originalStyle = null;
-              if (!current || record.paintDirty) {
-                if (current) unmark(node, controlAttribute);
-                originalStyle = computed(node);
-                if (current) mark(node, controlAttribute, String(record.id));
-                record.paintDirty = false;
-              }
-              const baseFilter = originalStyle?.filter || record.nativeFilter;
-              if (originalStyle) {
-                record.nativePosition = originalStyle.position;
-                record.nativeShadow = originalStyle.boxShadow;
-                record.nativeBackdrop = originalStyle.backdropFilter;
-              }
-              record.nativeFilter = baseFilter;
-              createTint(record, node, box, baseFilter,
-                record.nativeBackdrop === "none" ? [] : measureMedia(composer));
-            }
-          }
-        }
-        if (!active && current) {
-          record.rule = "";
-          unmark(node, controlAttribute);
-          unmark(node, topControlAttribute);
-          stats.layerWrites++;
-        }
-        if (record.rule) activeControls.add(node);
-        else activeControls.delete(node);
-      }
-      writeRules();
-      geometryDirty = false;
-    };
-    function schedule(geometry = false) {
-      geometryDirty ||= geometry === true;
-      if (!disposed && !document.hidden && !raf) raf = requestAnimationFrame(render);
-    }
-    const onControlMotionEnd = event => {
-      const node = event.target?.closest?.(`[${controlAttribute}]`);
-      const control = controls.get(node);
-      if (!control?.rule) return;
-      control.paintDirty = true;
-      control.box = null;
-      schedule();
-    };
-    // 侧栏开合等带过渡的 translate 在结束时才落定；不逐帧跟随，只在结束后重算一次。
-    const onPaintMotionEnd = event => {
-      const target = event.target;
-      if (target?.nodeType !== 1 || previewVisible || owned(target)) return;
-      if (invalidatePaintChains(target)) schedule();
-    };
-    const onScroll = event => {
-      if (event.target?.closest?.(sidebarSelector)) sidebarScrollUntil = performance.now() + 180;
-      if (previewVisible) return;
-      const target = event.target;
-      // 只有按视口换算的表面需要跟随滚动重算；沿用 fixed 的表面不受影响，无额外开销。
-      if (geometryPaints.size) {
-        let moved = false;
-        for (const node of geometryPaints) {
-          const surface = records.get(node)?.paint?.surface;
-          if (!surface || !(target === document || target?.contains?.(surface))) continue;
-          paintsDirty.add(node);
-          moved = true;
-        }
-        if (moved) schedule();
-      }
-      if (!target || target === document || target === document.documentElement ||
-        target === document.body || target === document.scrollingElement) {
-        if (activeControls.size) schedule(true);
-        else invalidateRegion(document.body, false);
-        return;
-      }
-      if (target.closest?.(browserSelector)) return;
-      invalidateRegion(target, activeControls.size > 0);
-    };
-    const invalidateRegion = (target, redraw = true) => {
-      let changed = false;
-      for (const node of new Set([...visibleMedia, ...visibleControls, ...activeControls])) {
-        if (!target.contains?.(node)) continue;
-        const record = records.get(node);
-        const control = controls.get(node);
-        if (record) record.box = null;
-        if (control) control.box = null;
-        changed = true;
-      }
-      if (changed && redraw) schedule();
-      return changed;
-    };
-    const onSidebarWheel = event => {
-      if (event.target?.closest?.(sidebarSelector)) sidebarScrollUntil = performance.now() + 180;
-    };
-    const onSidebarHover = event => {
-      if (performance.now() >= sidebarScrollUntil || event.buttons || event.pointerType === "touch") return;
-      if (event.target?.closest?.(sidebarRowSelector)?.closest(sidebarSelector))
-        event.stopImmediatePropagation();
-    };
-    const events = [
-      [document, "visibilitychange", () => {
-        if (document.hidden) {
-          if (raf) cancelAnimationFrame(raf);
-          raf = 0;
-        } else schedule(true);
-      }, false],
-      [document, "scroll", onScroll, true],
-      [document, "wheel", onSidebarWheel, true],
-      [document, "pointerover", onSidebarHover, true],
-      [document, "pointermove", onSidebarHover, true],
-      [document, "mouseover", onSidebarHover, true],
-      [document, "mousemove", onSidebarHover, true],
-      [document, "pointerdown", () => { sidebarScrollUntil = 0; }, true],
-      [window, "resize", () => schedule(true), false],
-      [document, "load", event => {
-        const record = records.get(event.target);
-        if (!record || record.nativeBoundary || event.target.matches(browserSelector)) return;
-        const region = event.target.closest(`${timelineSelector}, ${composerSelector}, ${sidebarSelector}`);
-        if (region) invalidateRegion(region);
-        else schedule(true);
-      }, true],
-      [document, "toggle", schedule, true],
-      [document, "transitionend", onControlMotionEnd, true],
-      [document, "animationend", onControlMotionEnd, true],
-      [document, "transitionend", onPaintMotionEnd, true],
-      [document, "transitioncancel", onPaintMotionEnd, true],
-      [document, "animationend", onPaintMotionEnd, true],
-    ];
-    window.__codexPlusImageOverlayCleanup = (keepResource = false) => {
-      if (disposed) return;
-      disposed = true;
-      if (raf) cancelAnimationFrame(raf);
-      mutationObserver.disconnect();
-      resizeObserver.disconnect();
-      intersectionObserver.disconnect();
-      for (const [target, event, handler, capture] of events) target.removeEventListener(event, handler, capture);
-      for (const [node, attributes] of [...originalAttributes])
-        for (const name of [...attributes.keys()]) unmark(node, name);
-      overlay.remove();
-      style.remove();
-      svg.remove();
-      image.onload = null;
-      image.onerror = null;
-      for (const collection of [records, scopes, browserPortals, controls, popups, visibleMedia,
-        visibleControls, activeControls, paintedNodes, viewers, scopeKeys, footers, themeInputs,
-        paintsDirty, geometryPaints, paintObservers]) collection.clear();
-      finishReady(false);
-      if (!keepResource && resource) {
-        if (resource.blobUrl) URL.revokeObjectURL(resource.blobUrl);
-        if (resource.tileInputUrl) URL.revokeObjectURL(resource.tileInputUrl);
-        if (window.__codexPlusImageOverlayResource === resource) window.__codexPlusImageOverlayResource = null;
-        if (window.__codexPlusImageOverlayBlobUrl === resource.blobUrl) window.__codexPlusImageOverlayBlobUrl = "";
-      }
-    };
-    const install = () => {
-      if (disposed) return;
-      resource.ready = true;
-      resource.opacity = opacity;
-      resource.fitMode = fitMode;
-      resource.width ||= image.naturalWidth;
-      resource.height ||= image.naturalHeight;
-      overlay.style.backgroundImage = `url(${JSON.stringify(resource.imageSource)})`;
-      style.textContent = nativeRules;
-      root.append(style, svg);
-      root.insertBefore(overlay, document.body || root.firstChild);
-      visit(root);
-      themeInputs.set(root, themeKey(root));
-      if (document.body) themeInputs.set(document.body, themeKey(document.body));
-      mutationObserver.observe(root, { childList: true, subtree: true, attributes: true,
-        attributeFilter: ["class", "style", "hidden", "open", "inert", "aria-hidden", "src", "srcset", "sizes", "role", "data-testid", "data-browser-sidebar-webview", "data-browser-sidebar-toolbar", "data-thread-scroll-footer", "data-app-shell-focus-area", "data-composer-overlay-floating-ui", "data-app-shell-header-layout", "data-sticky", "data-composer-placement"] });
-      for (const [target, event, handler, capture] of events)
-        target.addEventListener(event, handler, { capture, passive: true });
-      // 首次扫描登记的壁纸表面已排了一帧；这里同步渲染，撤掉重复的那一帧。
-      if (raf) cancelAnimationFrame(raf);
-      render();
-      finishReady(true);
-      sendCodexPlusDiagnostic("image_overlay_installed", { opacity, fitMode, sourceKind: source.startsWith("data:") ? "data-uri" : "unknown" });
-    };
-    if (resource) install();
-    else {
-      let blobUrl = "";
-      const data = source.match(/^data:([^;,]+);base64,([\s\S]*)$/);
-      if (data) {
-        const decoded = atob(data[2]);
-        const bytes = new Uint8Array(decoded.length);
-        for (let index = 0; index < decoded.length; index++) bytes[index] = decoded.charCodeAt(index);
-        blobUrl = URL.createObjectURL(new Blob([bytes], { type: data[1] }));
-      }
-      resource = { version: 30, source, blobUrl, imageSource: blobUrl || source };
-      window.__codexPlusImageOverlayResource = resource;
-      window.__codexPlusImageOverlayBlobUrl = blobUrl;
-      image.onload = install;
-      image.onerror = () => { if (!disposed) window.__codexPlusImageOverlayCleanup?.(); };
-      image.src = resource.imageSource;
-    }
-  }
-
-  function scheduleCodexPlusImageOverlay() {
-    window.__codexPlusImageOverlayReadyCleanup?.();
-    window.__codexPlusImageOverlayReadyCleanup = null;
-    if (document.readyState === "loading") {
-      const onReady = () => {
-        window.__codexPlusImageOverlayReadyCleanup = null;
-        installCodexPlusImageOverlay();
-      };
-      document.addEventListener("DOMContentLoaded", onReady, { once: true });
-      window.__codexPlusImageOverlayReadyCleanup = () =>
-        document.removeEventListener("DOMContentLoaded", onReady);
-      return;
-    }
-    installCodexPlusImageOverlay();
-  }
-
-  scheduleCodexPlusImageOverlay();
   window.__codexThreadScrollSyncRevision = (window.__codexThreadScrollSyncRevision || 0) + 1;
   ["__codexPlusHtmlCenteredThreadWidth", "__codexPlusViewportCenteredThreadWidth", "__codexPlusBoundedThreadCenter"].forEach((key) => {
     try {
@@ -1939,7 +476,6 @@
     conversationViewContentAnchor: "[data-thread-user-message-navigation-content]",
     conversationViewFooter: "[data-thread-scroll-footer]",
   };
-  const headerContextButtonClass = "border-token-border user-select-none no-drag cursor-interaction flex items-center gap-1 border whitespace-nowrap focus:outline-none disabled:cursor-not-allowed disabled:opacity-40 rounded-lg border-token-border text-token-button-tertiary-foreground bg-token-bg-fog enabled:hover:bg-token-list-hover-background data-[state=open]:bg-token-list-hover-background border h-token-button-composer px-2 py-0 text-base leading-[18px]";
   /**
    * 拓展注册中心。
    *
@@ -1972,6 +508,7 @@
     shortcuts: new Map(),
     themes: new Map(),
     floatingTabs: new Map(),
+    settingsPanels: new Map(),
   };
 
   /** 每个脚本最多注册多少项、全局最多多少项，防止劣质拓展把扫描拖慢。 */
@@ -2293,31 +830,6 @@
         border-color: var(--color-token-border-light, var(--color-token-border-default, rgba(0,0,0,.12)));
         background: var(--color-token-bg-secondary, transparent);
         color: var(--color-token-text-primary, inherit);
-      }
-      .${sessionShareButtonClass} {
-        position: static;
-        flex: 0 0 auto;
-        pointer-events: auto;
-        -webkit-app-region: no-drag;
-        margin-left: 2px;
-        z-index: 2147483001;
-        min-height: var(--height-button-composer, 32px);
-        border-radius: var(--border-radius-lg, 8px);
-        font: inherit;
-        font-size: 13px;
-        line-height: 18px;
-        cursor: pointer;
-        box-shadow: none;
-      }
-      .${sessionShareButtonClass}:hover,
-      .${sessionShareButtonClass}:focus-visible {
-        background: var(--color-token-list-hover-background, var(--codex-plus-bg-hover));
-        color: var(--color-token-text-primary, var(--codex-plus-text));
-        outline: none;
-      }
-      .${sessionShareButtonClass}[aria-busy="true"] {
-        cursor: wait;
-        opacity: .65;
       }
       [data-codex-delete-row="true"]:hover .${actionGroupClass} {
         opacity: 1;
@@ -3028,6 +1540,9 @@
       }
       .codex-plus-extensions-detail-link { margin-top: 16px; font-size: 13px; }
       .codex-plus-extensions-detail-link a { color: var(--codex-plus-success); word-break: break-all; }
+      .codex-plus-extensions-detail-settings { margin-top: 22px; }
+      .codex-plus-extensions-detail-settings-host { margin-top: 8px; }
+      .codex-plus-extensions-detail-settings-hint { color: var(--codex-plus-text-secondary); font-size: 13px; }
       .codex-plus-extensions-detail-error {
         margin-top: 14px;
         padding: 8px 10px;
@@ -3160,15 +1675,6 @@
         padding: 0 8px;
       }
       .codex-plus-width-input:disabled { opacity: .55; cursor: not-allowed; }
-      .codex-plus-typing-effect-select {
-        flex-shrink: 0;
-        align-self: center;
-        min-width: 112px;
-        height: 32px;
-        padding: 0 8px;
-        font-size: 13px;
-      }
-      .codex-plus-typing-effect-select:disabled { opacity: .55; cursor: not-allowed; }
       .codex-plus-about { color: #a1a1aa; line-height: 1.5; }
       .codex-plus-panel[hidden] { display: none; }
       .codex-plus-action-button,
@@ -3325,11 +1831,6 @@
       .codex-session-more-menu-item { border-radius: var(--border-radius-sm, 6px); font-family: inherit; }
       .codex-session-more-menu-item:hover,
       .codex-session-more-menu-item:focus-visible { background: var(--codex-plus-bg-hover); }
-      .${sessionShareButtonClass}:hover,
-      .${sessionShareButtonClass}:focus-visible {
-        background: var(--codex-plus-bg-hover);
-        color: var(--codex-plus-text);
-      }
       .${actionTooltipClass} {
         border-color: var(--codex-plus-border);
         border-radius: var(--border-radius-md, 6px);
@@ -3399,7 +1900,6 @@
       .codex-plus-toggle span { background: var(--color-token-bg-primary, #fff); box-shadow: var(--switch-thumb-shadow, 0 1px 2px rgba(0,0,0,.16)); }
       .codex-plus-toggle[data-enabled="true"] { background: var(--color-background-primary-solid, var(--color-background-success-solid, #10a37f)); }
       .codex-plus-width-input,
-      .codex-plus-typing-effect-select,
       .codex-plus-form-field input {
         border: 1px solid var(--codex-plus-border);
         border-radius: var(--border-radius-lg, 8px);
@@ -3408,7 +1908,6 @@
         font-family: inherit;
       }
       .codex-plus-width-input:focus,
-      .codex-plus-typing-effect-select:focus,
       .codex-plus-form-field input:focus { border-color: var(--codex-plus-focus); outline: 2px solid color-mix(in srgb, var(--codex-plus-focus) 25%, transparent); outline-offset: 0; }
       #${codexPlusSidebarNavId} .codex-plus-sidebar-nav-status,
       .codex-plus-backend-indicator { box-shadow: none; }
@@ -3573,8 +2072,7 @@
       .codex-plus-settings .codex-plus-backend-status { overflow-wrap: anywhere; text-align: right; }
       .codex-plus-settings .codex-plus-action-button,
       .codex-plus-settings .codex-plus-issue-button,
-      .codex-plus-settings .codex-plus-width-input,
-      .codex-plus-settings .codex-plus-typing-effect-select {
+      .codex-plus-settings .codex-plus-width-input {
         box-sizing: border-box;
         min-height: 32px;
         border: 1px solid var(--codex-plus-border);
@@ -3585,89 +2083,7 @@
         font-size: 13px;
         line-height: 18px;
       }
-      .codex-plus-settings .codex-plus-width-input,
-      .codex-plus-settings .codex-plus-typing-effect-select { height: 32px; }
-      .codex-plus-settings .codex-plus-width-input { width: 72px; min-width: 48px; }
-      .codex-plus-settings .codex-plus-typing-effect-select { min-width: 0; }
-      .codex-plus-settings .codex-plus-typing-effect-select[hidden] { display: none; }
-      .codex-plus-settings .codex-plus-dropdown-trigger {
-        display: inline-flex;
-        flex: 0 0 auto;
-        align-items: center;
-        align-self: center;
-        justify-content: space-between;
-        gap: 8px;
-        height: 28px;
-        min-width: 112px;
-        box-sizing: border-box;
-        border: 1px solid var(--codex-plus-border);
-        border-radius: 8px;
-        padding: 3px 10px;
-        background: var(--codex-plus-bg-secondary);
-        color: var(--codex-plus-text);
-        font: inherit;
-        font-size: 13px;
-        line-height: 20px;
-        cursor: pointer;
-      }
-      .codex-plus-settings .codex-plus-dropdown-trigger > svg {
-        flex: 0 0 16px;
-        width: 16px;
-        height: 16px;
-        color: var(--codex-plus-text-secondary);
-      }
-      .codex-plus-settings .codex-plus-dropdown-trigger:hover:not(:disabled),
-      .codex-plus-settings .codex-plus-dropdown-trigger[aria-expanded="true"] { background: var(--codex-plus-bg-hover); }
-      .codex-plus-settings .codex-plus-dropdown-trigger:disabled { cursor: not-allowed; opacity: .55; }
-      /* 菜单挂在 overlay 上，避免设置卡片或滚动容器裁切。 */
-      .codex-plus-dropdown-menu {
-        position: absolute;
-        z-index: 2;
-        overflow-y: auto;
-        overscroll-behavior: contain;
-        width: 220px;
-        max-width: calc(100% - 16px);
-        box-sizing: border-box;
-        padding: 6px;
-        border: 1px solid var(--codex-plus-border);
-        border-radius: 14px;
-        background: var(--codex-plus-bg-elevated);
-        color: var(--codex-plus-text);
-        font-family: inherit;
-        box-shadow: var(--ui-menu-shadow, var(--shadow-300, 0 8px 24px rgba(0,0,0,.16)));
-      }
-      .codex-plus-dropdown-menu[hidden] { display: none; }
-      .codex-plus-dropdown-option {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 16px;
-        width: 100%;
-        min-height: 28px;
-        box-sizing: border-box;
-        border: 0;
-        border-radius: 8px;
-        padding: 4px 12px;
-        background: transparent;
-        color: inherit;
-        font: inherit;
-        font-size: 14px;
-        line-height: 20px;
-        text-align: left;
-        cursor: pointer;
-      }
-      .codex-plus-dropdown-option > svg {
-        flex: 0 0 16px;
-        width: 16px;
-        height: 16px;
-        visibility: hidden;
-      }
-      .codex-plus-dropdown-option[aria-selected="true"] > svg { visibility: visible; }
-      .codex-plus-dropdown-option:hover,
-      .codex-plus-dropdown-option:focus-visible {
-        background: var(--codex-plus-bg-hover);
-        outline: none;
-      }
+      .codex-plus-settings .codex-plus-width-input { height: 32px; width: 72px; min-width: 48px; }
       .codex-plus-settings .codex-plus-action-button,
       .codex-plus-settings .codex-plus-issue-button { white-space: normal; overflow-wrap: anywhere; }
       .codex-plus-settings .codex-plus-action-button:hover,
@@ -3927,6 +2343,86 @@
         color: var(--codex-plus-settings-page-bg, var(--codex-plus-bg-primary));
       }
       .codex-plus-discovery .codex-plus-extensions-detail-link a { color: var(--color-text-link, var(--color-token-text-link, var(--codex-plus-switch-on, #3485ff))); }
+      /* 详情页签与两栏（对齐 VS Code 扩展详情）：左边细节 / 设置 / 功能，右边安装与市场信息。 */
+      .codex-plus-discovery .codex-plus-extensions-detail { max-width: 1120px; }
+      .codex-plus-discovery .codex-plus-extensions-detail-heading .codex-plus-extensions-detail-description { margin-top: 6px; }
+      .codex-plus-extensions-detail-gear { display: inline-flex; align-items: center; justify-content: center; width: 32px; padding: 0; }
+      .codex-plus-extensions-detail-gear svg { width: 16px; height: 16px; }
+      .codex-plus-extensions-detail-tabs { display: flex; gap: 20px; border-bottom: 1px solid var(--codex-plus-border-subtle); }
+      .codex-plus-extensions-detail-tabs button {
+        margin-bottom: -1px; padding: 8px 2px; border: 0; border-bottom: 2px solid transparent; background: transparent;
+        color: var(--codex-plus-text-secondary); font: inherit; font-size: 13px; line-height: 20px; cursor: pointer;
+      }
+      .codex-plus-extensions-detail-tabs button:hover { color: var(--codex-plus-text); }
+      .codex-plus-extensions-detail-tabs button[aria-selected="true"] { border-bottom-color: var(--codex-plus-switch-on, #3485ff); color: var(--codex-plus-text); }
+      .codex-plus-extensions-detail-columns { display: grid; grid-template-columns: minmax(0, 1fr) 240px; gap: 32px; padding-top: 20px; }
+      .codex-plus-extensions-detail-main { min-width: 0; }
+      .codex-plus-extensions-detail-tabpanel[hidden] { display: none !important; }
+      .codex-plus-extensions-readme-hint { color: var(--codex-plus-text-tertiary); font-size: 13px; line-height: 20px; }
+      .codex-plus-extensions-detail-aside { min-width: 0; font-size: 12px; line-height: 18px; color: var(--codex-plus-text-secondary); }
+      .codex-plus-extensions-detail-aside section { padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid var(--codex-plus-border-subtle); }
+      .codex-plus-extensions-detail-aside section:last-child { border-bottom: 0; }
+      .codex-plus-extensions-detail-aside h3 { margin: 0 0 8px; color: var(--codex-plus-text); font-size: 13px; font-weight: 600; }
+      .codex-plus-extensions-detail-aside dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 12px; margin: 0; }
+      .codex-plus-extensions-detail-aside dt { color: var(--codex-plus-text-tertiary); }
+      .codex-plus-extensions-detail-aside dd { margin: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+      .codex-plus-extensions-aside-links { margin: 0; padding: 0; list-style: none; display: grid; gap: 4px; }
+      .codex-plus-extensions-detail-aside a { color: var(--color-text-link, var(--color-token-text-link, var(--codex-plus-switch-on, #3485ff))); text-decoration: none; }
+      .codex-plus-extensions-detail-aside a:hover { text-decoration: underline; }
+      .codex-plus-extensions-detail-aside .codex-plus-extensions-detail-tags { margin-top: 0; }
+      .codex-plus-extensions-features { width: 100%; border-collapse: collapse; font-size: 13px; line-height: 20px; }
+      .codex-plus-extensions-features th, .codex-plus-extensions-features td { padding: 8px 0; border-bottom: 1px solid var(--codex-plus-border-subtle); text-align: left; vertical-align: top; }
+      .codex-plus-extensions-features th { width: 160px; padding-right: 16px; color: var(--codex-plus-text-secondary); font-weight: 500; }
+      .codex-plus-extensions-features td { color: var(--codex-plus-text); overflow-wrap: anywhere; }
+      /* 通用设置表单（按清单 config 生成）。 */
+      .codex-plus-ext-config { display: grid; gap: 2px; }
+      .codex-plus-extensions-detail-settings-hint + .codex-plus-ext-config { margin-top: 12px; }
+      .codex-plus-ext-config-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(160px, 260px); align-items: center; gap: 8px 24px; padding: 10px 0; border-bottom: 1px solid var(--codex-plus-border-subtle); }
+      .codex-plus-ext-config-row[data-wide="true"] { grid-template-columns: minmax(0, 1fr); }
+      .codex-plus-ext-config-label label { color: var(--codex-plus-text); font-size: 13px; font-weight: 500; line-height: 20px; }
+      .codex-plus-ext-config-description { color: var(--codex-plus-text-tertiary); font-size: 12px; line-height: 18px; }
+      .codex-plus-ext-config-control { display: flex; justify-content: flex-end; min-width: 0; }
+      .codex-plus-ext-config-row[data-wide="true"] .codex-plus-ext-config-control { justify-content: stretch; }
+      .codex-plus-ext-config-input {
+        width: 100%; box-sizing: border-box; min-height: 30px; padding: 5px 8px; border: 1px solid var(--codex-plus-border); border-radius: 6px;
+        background: var(--codex-plus-bg-secondary, transparent); color: var(--codex-plus-text); font: inherit; font-size: 13px; line-height: 18px;
+      }
+      textarea.codex-plus-ext-config-input { resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+      .codex-plus-ext-config-input:focus { outline: 2px solid var(--codex-plus-switch-on, #3485ff); outline-offset: -1px; }
+      .codex-plus-ext-config-status { min-height: 18px; padding-top: 8px; color: var(--codex-plus-text-tertiary); font-size: 12px; }
+      .codex-plus-ext-config-status[data-kind="ok"] { color: var(--codex-plus-success); }
+      .codex-plus-ext-config-status[data-kind="error"] { color: var(--codex-plus-danger); }
+      /* README 的 Markdown 正文。 */
+      .codex-plus-markdown { color: var(--codex-plus-text); font-size: 14px; line-height: 1.65; overflow-wrap: anywhere; }
+      .codex-plus-markdown > :first-child { margin-top: 0; }
+      .codex-plus-markdown h1, .codex-plus-markdown h2, .codex-plus-markdown h3, .codex-plus-markdown h4, .codex-plus-markdown h5, .codex-plus-markdown h6 { margin: 1.4em 0 .6em; font-weight: 600; line-height: 1.3; }
+      .codex-plus-markdown h1 { font-size: 24px; padding-bottom: .3em; border-bottom: 1px solid var(--codex-plus-border-subtle); }
+      .codex-plus-markdown h2 { font-size: 19px; padding-bottom: .3em; border-bottom: 1px solid var(--codex-plus-border-subtle); }
+      .codex-plus-markdown h3 { font-size: 16px; }
+      .codex-plus-markdown h4, .codex-plus-markdown h5, .codex-plus-markdown h6 { font-size: 14px; }
+      .codex-plus-markdown p, .codex-plus-markdown ul, .codex-plus-markdown ol, .codex-plus-markdown blockquote, .codex-plus-markdown pre, .codex-plus-markdown .codex-plus-markdown-table { margin: 0 0 12px; }
+      /* Codex 自己的样式把列表符号清掉了，这里补回。 */
+      .codex-plus-markdown ul, .codex-plus-markdown ol { padding-left: 22px; }
+      .codex-plus-markdown ul { list-style: disc; }
+      .codex-plus-markdown ul ul { list-style: circle; }
+      .codex-plus-markdown ol { list-style: decimal; }
+      .codex-plus-markdown li { display: list-item; }
+      .codex-plus-markdown li + li { margin-top: 2px; }
+      .codex-plus-markdown li > ul, .codex-plus-markdown li > ol { margin: 2px 0 0; }
+      .codex-plus-markdown li.codex-plus-markdown-task { list-style: none; margin-left: -20px; }
+      .codex-plus-markdown li.codex-plus-markdown-task input { margin: 0 6px 0 0; vertical-align: -1px; }
+      .codex-plus-markdown a { color: var(--color-text-link, var(--color-token-text-link, var(--codex-plus-switch-on, #3485ff))); text-decoration: none; }
+      .codex-plus-markdown a:hover { text-decoration: underline; }
+      .codex-plus-markdown code { padding: 1px 5px; border-radius: 4px; background: var(--codex-plus-bg-hover); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .88em; }
+      .codex-plus-markdown pre { overflow: auto; padding: 12px 14px; border-radius: 8px; background: var(--codex-plus-bg-hover); line-height: 1.5; }
+      .codex-plus-markdown pre code { padding: 0; background: transparent; font-size: 12px; white-space: pre; }
+      .codex-plus-markdown blockquote { padding: 0 0 0 12px; border-left: 3px solid var(--codex-plus-border); color: var(--codex-plus-text-secondary); }
+      .codex-plus-markdown hr { height: 1px; margin: 20px 0; border: 0; background: var(--codex-plus-border-subtle); }
+      .codex-plus-markdown img { max-width: 100%; vertical-align: middle; }
+      .codex-plus-markdown .codex-plus-markdown-table { overflow-x: auto; }
+      .codex-plus-markdown table { border-collapse: collapse; font-size: 13px; }
+      .codex-plus-markdown th, .codex-plus-markdown td { padding: 6px 12px; border: 1px solid var(--codex-plus-border-subtle); }
+      .codex-plus-markdown th { background: var(--codex-plus-bg-hover); font-weight: 600; }
       .codex-plus-discovery .codex-plus-toggle { flex: 0 0 32px; width: 32px; height: 20px; min-height: 20px; box-sizing: border-box; padding: 2px; background: var(--codex-plus-switch-off, #3a3a3a); cursor: pointer; }
       .codex-plus-discovery .codex-plus-toggle span { width: 16px; height: 16px; background: var(--codex-plus-switch-thumb, #fff); }
       .codex-plus-discovery .codex-plus-toggle[data-enabled="true"] { background: var(--codex-plus-switch-on, #3485ff); }
@@ -3980,6 +2476,7 @@
         .codex-plus-discovery-toolbar { flex-basis: 100%; }
         .codex-plus-discovery .codex-plus-extensions-detail-head { flex-wrap: wrap; }
         .codex-plus-discovery .codex-plus-extensions-detail-actions { flex-basis: 100%; }
+        .codex-plus-extensions-detail-columns { grid-template-columns: minmax(0, 1fr); }
       }
       @container codex-plus-discovery (max-width: 600px) {
         .codex-plus-extensions-grid,
@@ -4008,12 +2505,12 @@
   }
 
   function defaultCodexPlusSettings() {
-    // capacityAutoRetry* 必须写成字面量：多个测试（typing-effects-settings、agent-pet、
-    // session-share-runtime…）把 defaultCodexPlusSettings 切片到不带 prelude 的沙箱里执行，
+    // capacityAutoRetry* 必须写成字面量：多个测试（agent-pet、
+    // backend-settings-sync…）把 defaultCodexPlusSettings 切片到不带 prelude 的沙箱里执行，
     // 引用 prelude 常量会直接 ReferenceError。与 00-prelude.js 里
     // capacityAutoRetryDefaultMaxAttempts / capacityAutoRetryDefaultIntervalSeconds 的一致性
     // 由 capacity-auto-retry.test.ts 的防漂移用例守住。
-    return { sideChatSave: false, pluginMarketplaceUnlock: true, modelWhitelistUnlock: true, sessionDelete: true, sessionDeleteSkipConfirm: false, markdownExport: true, sessionShare: true, pasteFix: false, typingEffect: "off", threadIdBadge: false, conversationView: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, historyTurnRecovery: false, nativeMenuPlacement: true, nativeFastUnlock: false, petRealMouseLook: false, activityOverlayRight: false, stepwise: false, answerOutline: false, usageStatusLine: true, proxyRequestStatus: true, turnRewind: false, capacityAutoRetry: false, capacityAutoRetryMaxAttempts: 15, capacityAutoRetryIntervalSeconds: 0, dreamSkinEnabled: false, dreamSkinPaused: false, dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {}, dreamSkinImagePath: "" };
+    return { sideChatSave: false, pluginMarketplaceUnlock: true, modelWhitelistUnlock: true, sessionDelete: true, sessionDeleteSkipConfirm: false, markdownExport: true, pasteFix: false, threadIdBadge: false, conversationView: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, historyTurnRecovery: false, nativeMenuPlacement: true, nativeFastUnlock: false, petRealMouseLook: false, activityOverlayRight: false, stepwise: false, answerOutline: false, usageStatusLine: true, proxyRequestStatus: true, turnRewind: false, capacityAutoRetry: false, capacityAutoRetryMaxAttempts: 15, capacityAutoRetryIntervalSeconds: 0, dreamSkinEnabled: false, dreamSkinPaused: false, dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {}, dreamSkinImagePath: "" };
   }
 
   const codexPlusBackendSettingMap = {
@@ -4023,7 +2520,6 @@
     sessionDeleteSkipConfirm: "codexAppSessionDeleteSkipConfirm",
     sideChatSave: "codexAppSideChatSave",
     markdownExport: "codexAppMarkdownExport",
-    sessionShare: "codexAppSessionShare",
     threadIdBadge: "codexAppThreadIdBadge",
     conversationView: "codexAppConversationView",
     threadScrollRestore: "codexAppThreadScrollRestore",
@@ -4039,7 +2535,6 @@
     capacityAutoRetry: "codexAppCapacityAutoRetry",
     turnRewind: "codexAppTurnRewind",
     pasteFix: "codexAppPasteFix",
-    typingEffect: "codexAppTypingEffect",
     dreamSkinEnabled: "codexAppDreamSkinEnabled",
     dreamSkinPaused: "codexAppDreamSkinPaused",
     dreamSkinThemeConfig: "codexAppDreamSkinThemeConfig",
@@ -4091,10 +2586,8 @@
         sessionDelete: false,
         sessionDeleteSkipConfirm: false,
         markdownExport: false,
-        sessionShare: false,
         sideChatSave: false,
         pasteFix: false,
-        typingEffect: "off",
         threadIdBadge: false,
         conversationView: false,
         conversationViewMaxWidth: conversationViewDefaultWidth,
@@ -4988,11 +3481,6 @@
     });
     refreshConversationViewControls();
     if (typeof syncCodexAmbientSuggestionsToggles === "function") syncCodexAmbientSuggestionsToggles();
-    document.querySelectorAll("[data-codex-plus-typing-effect]").forEach((select) => {
-      select.value = ["rainbow", "fireworks", "stars"].includes(settings.typingEffect) ? settings.typingEffect : "off";
-      select.disabled = !codexPlusBackendSettingsLoaded || codexPlusBackendSettings.enhancementsEnabled === false;
-      if (typeof syncCodexPlusTypingEffectDropdown === "function") syncCodexPlusTypingEffectDropdown(select);
-    });
   }
 
   let codexPlusBackendSettings = { providerSyncEnabled: false, enhancementsEnabled: true, codexAppVersion: "" };
@@ -6898,12 +5386,13 @@
     return { loaded: "已加载", failed: "失败", disabled: "已禁用", not_loaded: "未加载", loading: "加载中" }[status] || status || "未知";
   }
 
-  // 使用已安装 Lucide Search / RotateCw / Plus / ArrowLeft 的 ISC 图标路径。
+  // 使用已安装 Lucide Search / RotateCw / Plus / ArrowLeft / Settings 的 ISC 图标路径。
   const codexPlusDiscoveryIcons = {
     search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>',
     refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>',
     plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M12 5v14"/></svg>',
     back: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 19-7-7 7-7M19 12H5"/></svg>',
+    settings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>',
   };
 
   /** 原生风格侧栏：浏览入口和已安装拓展的单行名称。 */
@@ -6915,7 +5404,7 @@
       const marketItem = codexPlusExtensionMarketItem(entry);
       return `
         <button type="button" class="codex-plus-page-nav-item codex-plus-extensions-nav-entry" data-codex-extensions-select="installed:${escapeHtml(entry.key)}" data-active="${String(selected)}" title="${escapeHtml(entry.name)}" aria-label="${escapeHtml(entry.name)}">
-          <span class="codex-plus-page-nav-item-icon" aria-hidden="true">${extensionIconMarkup(marketItem?.icon)}</span>
+          <span class="codex-plus-page-nav-item-icon" aria-hidden="true">${extensionIconMarkup(marketItem?.icon || entry.script?.package?.icon)}</span>
           <span class="codex-plus-page-nav-item-text"><span class="codex-plus-page-nav-item-name">${escapeHtml(entry.name)}</span></span>
           <span class="codex-plus-page-nav-item-state" data-state="${entry.enabled ? "on" : "off"}" title="${entry.enabled ? "已启用" : "已禁用"}"></span>
         </button>
@@ -6949,7 +5438,7 @@
       return `
         <article class="codex-plus-extension-card">
           <button type="button" class="codex-plus-extension-card-select" data-codex-extensions-select="${select}" aria-label="查看 ${escapeHtml(entry.name)}">
-            <span class="codex-plus-extension-card-icon" aria-hidden="true">${extensionIconMarkup(item?.icon)}</span>
+            <span class="codex-plus-extension-card-icon" aria-hidden="true">${extensionIconMarkup(item?.icon || entry.script?.package?.icon)}</span>
             <span class="codex-plus-extension-card-copy">
               <span class="codex-plus-extension-card-title">${escapeHtml(entry.name)}</span>
               <span class="codex-plus-extension-card-description">${escapeHtml(description)}</span>
@@ -6986,7 +5475,11 @@
     const body = document.querySelector("[data-codex-plus-page-nav-body]");
     if (body) body.innerHTML = renderCodexPlusExtensionsNav();
     const detail = document.querySelector("[data-codex-plus-extensions-detail]");
-    if (detail) detail.innerHTML = renderCodexPlusExtensionsDetail();
+    if (detail) {
+      detail.innerHTML = renderCodexPlusExtensionsDetail();
+      // typeof 守卫：测试会把这段单独切出来执行，那时设置面板的宿主不在作用域里。
+      if (typeof mountCodexPlusSettingsPanel === "function") mountCodexPlusSettingsPanel(detail);
+    }
     if (focused) {
       Array.from(detail?.querySelectorAll("[data-codex-user-script-key]") || [])
         .find((button) => button.getAttribute("data-codex-user-script-key") === focused)?.focus({ preventScroll: true });
@@ -7021,7 +5514,8 @@
   }
 
   /**
-   * 条目图标：市场清单给了 `icon` 就用它，否则回退 VSCode 的默认扩展字形。
+   * 条目图标：市场清单的 `icon`，或拓展包清单 codexpp.json 的 `icon`（后台已换成 data URL / https 地址）；
+   * 都没有就回退 VSCode 的默认扩展字形。
    *
    * 回退是必须的——清单里的老条目没有这个字段，而且 icon 指的是外链，
    * 加载失败时若不兜底就会留一块空白。失败替换交给委托监听（见 handleExtensionIconError），
@@ -7059,7 +5553,7 @@
     const name = marketItem?.name || local?.name || sel.key;
     const version = marketItem?.version || local?.version || "";
     const author = marketItem?.author || "";
-    const description = marketItem?.description || local?.description || "";
+    const description = marketItem?.description || local?.description || local?.package?.description || "";
     const tags = marketItem?.tags || [];
     const requirements = marketItem?.requirements || [];
     const limitations = marketItem?.limitations || [];
@@ -7068,10 +5562,11 @@
     const updateAvailable = isInstalled && marketItem && version && local?.version && local.version !== version;
 
     // 详情沿用列表的内容宽度，管理操作保持独立。
+    const sourceLabel = local ? (typeof codexPlusScriptSourceLabel === "function" ? codexPlusScriptSourceLabel(local) : local.source === "builtin" ? "内置" : "用户") : "";
     const publisherLine = [
       author ? escapeHtml(author) : "",
       version ? `v${escapeHtml(version)}` : "",
-      local ? `${local.source === "builtin" ? "内置" : "用户"} · ${escapeHtml(userScriptStatusLabel(local.status))}` : "",
+      local ? `${escapeHtml(sourceLabel)} · ${escapeHtml(userScriptStatusLabel(local.status))}` : "",
     ].filter(Boolean).join('<span class="codex-plus-extensions-detail-sep">·</span>');
 
     const actions = [];
@@ -7083,35 +5578,100 @@
       if (local?.source === "user") {
         actions.push(`<button type="button" class="codex-plus-extensions-detail-button" data-codex-extensions-uninstall="${escapeHtml(local.key)}">卸载</button>`);
       }
+      // 和 VS Code 一样，头部的齿轮直达「设置」页签。
+      if (typeof codexPlusExtensionHasSettings === "function" && codexPlusExtensionHasSettings(local)) {
+        actions.push(`<button type="button" class="codex-plus-extensions-detail-button codex-plus-extensions-detail-gear" data-codex-extensions-tab="settings" title="设置" aria-label="${escapeHtml(name)} 的设置">${codexPlusDiscoveryIcons.settings}</button>`);
+      }
     } else if (marketItem) {
       actions.push(`<button type="button" class="codex-plus-extensions-detail-button codex-plus-extensions-detail-primary" data-codex-market-install="${escapeHtml(marketItem.id)}">安装</button>`);
     }
 
-    // 使用要求与限制保留为独立正文分区。
+    // 页签（细节 / 设置 / 功能）与右侧栏见 41-extension-detail.js；测试单独切出这段执行时退回到简单正文。
     const list = (title, items) => items.length
       ? `<div class="codex-plus-extensions-detail-section"><div class="codex-plus-extensions-detail-section-title">${escapeHtml(title)}</div><ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></div>`
       : "";
-
-    return `
-      <button type="button" class="codex-plus-extensions-back" data-codex-extensions-browse="${codexPlusExtensionsFilter}" aria-label="返回拓展列表">${codexPlusDiscoveryIcons.back}<span>返回拓展列表</span></button>
-      <div class="codex-plus-extensions-detail-head">
-        <div class="codex-plus-extensions-detail-icon" aria-hidden="true">${extensionIconMarkup(marketItem?.icon)}</div>
-        <div class="codex-plus-extensions-detail-heading">
-          <div class="codex-plus-extensions-detail-title">${escapeHtml(name)}</div>
-          ${publisherLine ? `<div class="codex-plus-extensions-detail-meta">${publisherLine}</div>` : ""}
-          ${updateAvailable ? `<div class="codex-plus-extensions-detail-update">有新版本 v${escapeHtml(version)} 可更新</div>` : ""}
-        </div>
-        <div class="codex-plus-extensions-detail-actions">${actions.join("")}</div>
-      </div>
-      <div class="codex-plus-extensions-detail-body">
-        ${description ? `<div class="codex-plus-extensions-detail-description">${escapeHtml(description)}</div>` : ""}
+    const body = typeof renderCodexPlusExtensionDetailTabs === "function"
+      ? renderCodexPlusExtensionDetailTabs({ local, marketItem, sourceLabel })
+      : `<div class="codex-plus-extensions-detail-body">
         ${tags.length ? `<div class="codex-plus-extensions-detail-tags">${tags.map((tag) => `<span>${escapeHtml(tag)}</span>`).join("")}</div>` : ""}
         ${list("使用要求", requirements)}
         ${list("已知限制", limitations)}
         ${homepage ? `<div class="codex-plus-extensions-detail-link"><a href="${escapeHtml(homepage)}" target="_blank" rel="noreferrer">${escapeHtml(homepage)}</a></div>` : ""}
         ${local?.error ? `<div class="codex-plus-extensions-detail-error">${escapeHtml(local.error)}</div>` : ""}
+      </div>`;
+
+    return `
+      <button type="button" class="codex-plus-extensions-back" data-codex-extensions-browse="${codexPlusExtensionsFilter}" aria-label="返回拓展列表">${codexPlusDiscoveryIcons.back}<span>返回拓展列表</span></button>
+      <div class="codex-plus-extensions-detail-head">
+        <div class="codex-plus-extensions-detail-icon" aria-hidden="true">${extensionIconMarkup(marketItem?.icon || local?.package?.icon)}</div>
+        <div class="codex-plus-extensions-detail-heading">
+          <div class="codex-plus-extensions-detail-title">${escapeHtml(name)}</div>
+          ${publisherLine ? `<div class="codex-plus-extensions-detail-meta">${publisherLine}</div>` : ""}
+          ${description ? `<div class="codex-plus-extensions-detail-description">${escapeHtml(description)}</div>` : ""}
+          ${updateAvailable ? `<div class="codex-plus-extensions-detail-update">有新版本 v${escapeHtml(version)} 可更新</div>` : ""}
+        </div>
+        <div class="codex-plus-extensions-detail-actions">${actions.join("")}</div>
       </div>
+      ${body}
     `;
+  }
+
+  /** 来源标签：内置 / 官方（随 Codex++ 发布的拓展包）/ 市场 / 用户。 */
+  function codexPlusScriptSourceLabel(script) {
+    if (script?.source === "builtin") return "内置";
+    if (script?.source === "bundled") return "官方";
+    return script?.market_id ? "市场" : "用户";
+  }
+
+  /**
+   * 正挂着的拓展设置面板 { key, node, cleanup }。详情区重画（innerHTML）时把同一个节点搬回新的挂载点，
+   * 面板里的状态（滚动、正在输入的内容、加载好的预览）不丢；换了拓展或没有挂载点时才清理。
+   */
+  let codexPlusMountedSettingsPanel = null;
+
+  function unmountCodexPlusSettingsPanel() {
+    const mounted = codexPlusMountedSettingsPanel;
+    codexPlusMountedSettingsPanel = null;
+    if (!mounted) return;
+    if (typeof mounted.cleanup === "function") runCodexPlusExtensionCallback(mounted.key, "settingsPanel.cleanup", mounted.cleanup);
+    mounted.node.remove();
+  }
+
+  function mountCodexPlusSettingsPanel(root) {
+    const slot = root?.querySelector?.("[data-codex-plus-settings-panel]");
+    const key = slot?.getAttribute("data-codex-plus-settings-panel") || "";
+    const mounted = codexPlusMountedSettingsPanel;
+    if (mounted && slot && mounted.key === key && mounted.panel === codexPlusSettingsPanelFor(key)) {
+      slot.replaceWith(mounted.node);
+      return;
+    }
+    unmountCodexPlusSettingsPanel();
+    const panel = slot && typeof codexPlusSettingsPanelFor === "function" ? codexPlusSettingsPanelFor(key) : null;
+    if (!panel) return;
+    const local = (codexPlusUserScripts.scripts || []).find((script) => script.key === key);
+    const config = local?.package?.config || window.__codexPlusUserScripts?.scripts?.[key]?.manifest?.config || {};
+    const saveConfig = (values) => saveCodexPlusExtensionConfig(key, values);
+    const result = runCodexPlusExtensionCallback(key, "settingsPanel.render", () => panel.render({ container: slot, config: { ...config }, saveConfig }));
+    codexPlusMountedSettingsPanel = { key, node: slot, panel, cleanup: result.ok ? result.value : null };
+  }
+
+  /** 拓展设置面板保存配置：后台只收清单里声明过的项；拓展用 onConfigUpdate 接住时原地生效，否则整体热重载。 */
+  async function saveCodexPlusExtensionConfig(key, values) {
+    const result = await postJson("/user-scripts/set-config", { key, values: values && typeof values === "object" ? values : {} });
+    if (!result || result.status !== "ok") throw new Error(result?.message || "拓展配置没有保存");
+    const config = result.config && typeof result.config === "object" ? result.config : {};
+    const local = (codexPlusUserScripts.scripts || []).find((script) => script.key === key);
+    if (local?.package) local.package.config = config;
+    const applied = window.__codexPlusUserScripts?.updateConfig?.(key, config);
+    if (applied !== "applied") await reloadUserScriptsAfterChange();
+    return config;
+  }
+
+  /** 注册表里某个拓展的设置面板变了（热重载、启停）：正显示着它就重画详情。 */
+  function codexPlusSettingsPanelChanged(key) {
+    if (codexPlusMountedSettingsPanel?.key !== key && !(codexPlusExtensionsSelected?.kind === "installed" && codexPlusExtensionsSelected.key === key)) return;
+    if (codexPlusMountedSettingsPanel?.key === key) unmountCodexPlusSettingsPanel();
+    if (typeof refreshCodexPlusExtensionsView === "function") refreshCodexPlusExtensionsView();
   }
 
   /** 卸载用户脚本：删文件 + 清记录，然后刷新两侧。 */
@@ -7309,7 +5869,7 @@
       kind: "installed",
       key: script.key,
       name: marketById.get(script.market_id)?.name || script.name || script.key,
-      meta: `${script.source === "builtin" ? "内置" : script.market_id ? "市场" : "用户"} · ${userScriptStatusLabel(script.status)}`,
+      meta: `${typeof codexPlusScriptSourceLabel === "function" ? codexPlusScriptSourceLabel(script) : script.source === "builtin" ? "内置" : script.market_id ? "市场" : "用户"} · ${userScriptStatusLabel(script.status)}`,
       enabled: !!script.enabled,
       script,
     }));
@@ -7476,7 +6036,6 @@
   }
 
   function selectCodexPlusTab(tab) {
-    closeCodexPlusTypingEffectDropdown();
     // 归一化后再比对：panel 用的是 extensions，而旧调用点仍传 userScripts，
     // 不统一就会两边都对不上、所有 panel 全被隐藏。
     const normalized = codexPlusModalTab(tab);
@@ -7817,79 +6376,6 @@
     return "home";
   }
 
-  let codexPlusTypingEffectDropdownCleanup = null;
-
-  /** 保留 select 的值与 change 契约，只替换原生系统菜单的呈现。 */
-  function syncCodexPlusTypingEffectDropdown(select) {
-    const overlay = select.closest(".codex-plus-modal-overlay, .codex-plus-page-overlay");
-    const trigger = overlay?.querySelector("[data-codex-plus-typing-effect-trigger]");
-    if (!trigger) return;
-    trigger.disabled = select.disabled;
-    const label = trigger.querySelector("[data-codex-plus-dropdown-label]");
-    if (label) label.textContent = select.selectedOptions[0]?.textContent || "关闭";
-    overlay.querySelectorAll("[data-codex-plus-typing-effect-option]").forEach((option) => {
-      const selected = option.dataset.codexPlusTypingEffectOption === select.value;
-      option.setAttribute("aria-selected", String(selected));
-      option.tabIndex = selected ? 0 : -1;
-    });
-    if (select.disabled) closeCodexPlusTypingEffectDropdown();
-  }
-
-  function closeCodexPlusTypingEffectDropdown(restoreFocus = false) {
-    const menu = document.querySelector("[data-codex-plus-typing-effect-menu]");
-    const trigger = menu?.parentElement?.querySelector("[data-codex-plus-typing-effect-trigger]");
-    if (menu) menu.hidden = true;
-    trigger?.setAttribute("aria-expanded", "false");
-    codexPlusTypingEffectDropdownCleanup?.();
-    codexPlusTypingEffectDropdownCleanup = null;
-    if (restoreFocus && trigger?.isConnected && !trigger.disabled) trigger.focus();
-  }
-
-  function openCodexPlusTypingEffectDropdown(overlay, last = false) {
-    const select = overlay.querySelector("[data-codex-plus-typing-effect]");
-    const trigger = overlay.querySelector("[data-codex-plus-typing-effect-trigger]");
-    const menu = overlay.querySelector("[data-codex-plus-typing-effect-menu]");
-    if (!select || select.disabled || !trigger || !menu) return;
-    closeCodexPlusTypingEffectDropdown();
-    syncCodexPlusTypingEffectDropdown(select);
-    menu.hidden = false;
-    trigger.setAttribute("aria-expanded", "true");
-    // 菜单直接挂 overlay，避开滚动内容的裁剪；坐标换算与页面缩放保持同源。
-    const frame = overlay.getBoundingClientRect();
-    const anchor = trigger.getBoundingClientRect();
-    const zoom = codexPlusWindowZoom();
-    const width = frame.width / zoom;
-    const height = frame.height / zoom;
-    menu.style.maxHeight = `${Math.max(0, height - 16)}px`;
-    const left = (anchor.right - frame.left) / zoom - menu.offsetWidth;
-    const below = (anchor.bottom - frame.top) / zoom + 4;
-    const above = (anchor.top - frame.top) / zoom - menu.offsetHeight - 4;
-    const top = below + menu.offsetHeight > height - 8 && above >= 8 ? above : below;
-    menu.style.left = `${Math.max(8, Math.min(left, width - menu.offsetWidth - 8))}px`;
-    menu.style.top = `${Math.max(8, Math.min(top, height - menu.offsetHeight - 8))}px`;
-    const options = Array.from(menu.querySelectorAll("[role=option]"));
-    const focused = last ? options[options.length - 1] : options.find((option) => option.getAttribute("aria-selected") === "true") || options[0];
-    focused?.focus({ preventScroll: true });
-    const controller = new AbortController();
-    const close = () => closeCodexPlusTypingEffectDropdown();
-    document.addEventListener("pointerdown", (event) => {
-      if (!menu.contains(event.target) && !trigger.contains(event.target)) close();
-    }, { capture: true, signal: controller.signal });
-    overlay.addEventListener("scroll", (event) => {
-      if (!menu.contains(event.target)) close();
-    }, { capture: true, signal: controller.signal });
-    window.addEventListener("resize", close, { signal: controller.signal });
-    window.addEventListener("blur", close, { signal: controller.signal });
-    const observer = new MutationObserver(() => {
-      if (!overlay.isConnected) close();
-    });
-    observer.observe(document.body, { childList: true });
-    codexPlusTypingEffectDropdownCleanup = () => {
-      controller.abort();
-      observer.disconnect();
-    };
-  }
-
   // ── 设置项清单 ──────────────────────────────────────────────────────────────
   // 设置页里每个开关的标题、说明、分组都来自后端 /settings/catalog，
   // 与管理器「Codex → 内置拓展」页 import 的是同一份 JSON（crates/codex-plus-core/assets/enhancement-settings.json）。
@@ -7985,34 +6471,6 @@
     return `<input class="codex-plus-width-input" ${attribute}="true" min="${min}" max="${max}" step="${step}" type="number" value="${value}" title="${escapeHtml(input.hint || input.label || "")}" aria-label="${label}">`;
   }
 
-  /** 打字特效沿用自绘下拉：隐藏的 select 保留 change 契约，选项文案来自清单。 */
-  function renderCodexPlusTypingEffectControl(item) {
-    const title = escapeHtml(item.title);
-    const options = Array.isArray(item.options) ? item.options : [];
-    return `
-                  <select class="codex-plus-typing-effect-select" data-codex-plus-typing-effect="true" aria-label="${title}" hidden aria-hidden="true" tabindex="-1">
-                    ${options.map((option) => `<option value="${escapeHtml(option.value)}">${escapeHtml(option.label)}</option>`).join("")}
-                  </select>
-                  <button type="button" class="codex-plus-dropdown-trigger" data-codex-plus-typing-effect-trigger="true" aria-label="${title}" aria-haspopup="listbox" aria-expanded="false" aria-controls="codex-plus-typing-effect-menu">
-                    <span data-codex-plus-dropdown-label="true">${escapeHtml(options[0]?.label || "")}</span>
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
-                  </button>`;
-  }
-
-  /** 下拉菜单挂在 overlay 根部（避开滚动裁剪），选项同样按清单生成。 */
-  function syncCodexPlusTypingEffectMenu(overlay) {
-    const menu = overlay?.querySelector("[data-codex-plus-typing-effect-menu]");
-    if (!menu) return;
-    const item = codexPlusSettingsCatalog?.items.find((candidate) => candidate.key === "codexAppTypingEffect");
-    const options = Array.isArray(item?.options) ? item.options : [];
-    menu.setAttribute("aria-label", item?.title || "");
-    menu.innerHTML = options.map((option) => `
-          <button type="button" class="codex-plus-dropdown-option" data-codex-plus-typing-effect-option="${escapeHtml(option.value)}" role="option" aria-selected="false" tabindex="-1">
-            <span>${escapeHtml(option.label)}</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
-          </button>
-        `).join("");
-  }
-
   /** 清单 key 是 BackendSettings 字段；能映射到本页设置 key 的走 setCodexPlusSetting（带即时副作用）。 */
   function codexPlusLocalSettingKey(backendKey) {
     return Object.keys(codexPlusBackendSettingMap).find((key) => codexPlusBackendSettingMap[key] === backendKey) || "";
@@ -8074,9 +6532,7 @@
   function renderCodexPlusSettingsCatalogRow(item, options = {}) {
     const title = escapeHtml(item.title);
     let control = "";
-    if (item.key === "codexAppTypingEffect" && item.control === "select") {
-      control = renderCodexPlusTypingEffectControl(item);
-    } else if (item.control === "bool") {
+    if (item.control === "bool") {
       const localKey = codexPlusLocalSettingKey(item.key);
       const binding = localKey ? `data-codex-plus-setting="${escapeHtml(localKey)}"` : `data-codex-backend-setting="${escapeHtml(item.key)}"`;
       const toggle = `<button type="button" class="codex-plus-toggle" ${binding} role="switch" aria-checked="false" aria-label="${title}"><span></span></button>`;
@@ -8211,7 +6667,6 @@
       const retryFocused = !!document.activeElement?.closest?.("[data-codex-plus-settings-catalog-retry]");
       panel.querySelectorAll("[data-codex-plus-settings-catalog]").forEach((node) => node.remove());
       anchor.insertAdjacentHTML("beforebegin", renderCodexPlusSettingsCatalogSections());
-      syncCodexPlusTypingEffectMenu(panel.closest(".codex-plus-modal-overlay, .codex-plus-page-overlay"));
       if (retryFocused) {
         panel.querySelector("[data-codex-plus-settings-catalog-retry], [data-codex-plus-settings-catalog] .codex-plus-toggle")?.focus({ preventScroll: true });
       }
@@ -8304,9 +6759,8 @@
           </div>
         </div>
       </div>
-      <div id="codex-plus-typing-effect-menu" class="codex-plus-dropdown-menu" data-codex-plus-typing-effect-menu="true" role="listbox" hidden></div>
     `;
-    syncCodexPlusTypingEffectMenu(overlay);
+    if (typeof mountCodexPlusSettingsPanel === "function") mountCodexPlusSettingsPanel(overlay.querySelector("[data-codex-plus-extensions-detail]"));
     overlay.querySelectorAll(".codex-plus-toggle[data-codex-plus-setting], .codex-plus-toggle[data-codex-backend-setting]").forEach((button) => {
       button.setAttribute("role", "switch");
       button.setAttribute("aria-checked", "false");
@@ -8333,13 +6787,7 @@
     }, true);
     overlay.addEventListener("change", (event) => {
       const target = event.target instanceof Element ? event.target : event.target?.parentElement;
-      const typingEffectSelect = target?.closest("[data-codex-plus-typing-effect]");
-      if (typingEffectSelect) {
-        if (!typingEffectSelect.disabled && ["off", "rainbow", "fireworks", "stars"].includes(typingEffectSelect.value)) {
-          setCodexPlusSetting("typingEffect", typingEffectSelect.value);
-        }
-        return;
-      }
+      if (typeof handleCodexPlusExtensionConfigChange === "function" && handleCodexPlusExtensionConfigChange(target)) return;
       const widthInput = target?.closest("[data-codex-plus-conversation-view-width]");
       if (widthInput) {
         const width = normalizeConversationViewWidth(widthInput.value);
@@ -8362,26 +6810,8 @@
       // 拓展注册的菜单项。放在最前面是因为它的判定完全基于自己的 data 属性，
       // 与下面那些内置分支不会重叠；万一将来重叠，也应当由拓展优先拿到。
       if (handleCodexPlusExtensionMenuClick(target)) return;
-      const typingEffectTrigger = target?.closest("[data-codex-plus-typing-effect-trigger]");
-      if (typingEffectTrigger) {
-        const menu = overlay.querySelector("[data-codex-plus-typing-effect-menu]");
-        if (menu?.hidden) openCodexPlusTypingEffectDropdown(overlay);
-        else closeCodexPlusTypingEffectDropdown();
-        return;
-      }
-      const typingEffectOption = target?.closest("[data-codex-plus-typing-effect-option]");
-      if (typingEffectOption) {
-        const select = overlay.querySelector("[data-codex-plus-typing-effect]");
-        if (select && !select.disabled) {
-          const value = typingEffectOption.dataset.codexPlusTypingEffectOption;
-          if (select.value !== value) {
-            select.value = value;
-            select.dispatchEvent(new Event("change", { bubbles: true }));
-          }
-        }
-        closeCodexPlusTypingEffectDropdown(true);
-        return;
-      }
+      // 拓展详情的页签、设置表单开关、README 页内锚点。
+      if (typeof handleCodexPlusExtensionDetailClick === "function" && handleCodexPlusExtensionDetailClick(target, event)) return;
       const extensionsBrowse = target?.closest("[data-codex-extensions-browse]");
       if (extensionsBrowse) {
         codexPlusExtensionsFilter = extensionsBrowse.dataset.codexExtensionsBrowse === "installed" ? "installed" : "market";
@@ -8489,6 +6919,8 @@
       }
       const extensionsRefresh = target?.closest("[data-codex-market-refresh]");
       if (extensionsRefresh) {
+        // 顺带丢掉 README 缓存：改过的 README 重新打开详情就能看到。
+        if (typeof clearCodexPlusExtensionReadmes === "function") clearCodexPlusExtensionReadmes();
         void loadScriptMarket(true);
         return;
       }
@@ -8503,6 +6935,7 @@
       if (extensionsSelect) {
         const [kind, ...rest] = extensionsSelect.getAttribute("data-codex-extensions-select").split(":");
         codexPlusExtensionsSelected = { kind, key: rest.join(":") };
+        if (typeof resetCodexPlusExtensionsDetailTab === "function") resetCodexPlusExtensionsDetailTab();
         refreshCodexPlusExtensionsView();
         overlay.querySelector(".codex-plus-extensions-back")?.focus({ preventScroll: true });
         return;
@@ -8525,32 +6958,6 @@
         const key = backendToggle.getAttribute("data-codex-backend-setting");
         setBackendSetting(key, !codexPlusBackendSettings[key]);
         return;
-      }
-    }, true);
-    overlay.addEventListener("keydown", (event) => {
-      const target = event.target instanceof Element ? event.target : event.target?.parentElement;
-      if (target?.closest("[data-codex-plus-typing-effect-trigger]") && ["ArrowDown", "ArrowUp"].includes(event.key)) {
-        event.preventDefault();
-        openCodexPlusTypingEffectDropdown(overlay, event.key === "ArrowUp");
-        return;
-      }
-      const menu = target?.closest("[data-codex-plus-typing-effect-menu]");
-      if (!menu || menu.hidden) return;
-      if (event.key === "Escape") {
-        event.preventDefault();
-        event.stopPropagation();
-        closeCodexPlusTypingEffectDropdown(true);
-      } else if (event.key === "Tab") {
-        // 回到触发器后让浏览器处理 Tab，焦点会自然进入下一项而不会停在隐藏菜单里。
-        closeCodexPlusTypingEffectDropdown(true);
-      } else if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
-        event.preventDefault();
-        const options = Array.from(menu.querySelectorAll("[role=option]"));
-        const current = options.indexOf(document.activeElement);
-        const next = event.key === "Home" ? 0 : event.key === "End" ? options.length - 1
-          : (current + (event.key === "ArrowDown" ? 1 : -1) + options.length) % options.length;
-        options.forEach((option, index) => { option.tabIndex = index === next ? 0 : -1; });
-        options[next]?.focus({ preventScroll: true });
       }
     }, true);
     // 图标加载失败的回退：error 不冒泡，只能捕获阶段委托。
@@ -8594,13 +7001,13 @@
   function closeCodexPlusPage() {
     clearTimeout(window.__codexPlusPageNavigationCloseTimer);
     window.__codexPlusPageNavigationCloseTimer = null;
-    closeCodexPlusTypingEffectDropdown();
     window.removeEventListener("resize", window.__codexPlusPageResizeHandler);
     window.__codexPlusPageResizeHandler = null;
     window.__codexPlusPageLayoutObserver?.disconnect();
     window.__codexPlusPageLayoutObserver = null;
     window.__codexPlusPageLayoutTargets = null;
     document.querySelectorAll(`.${codexPlusPageClass}`).forEach((node) => node.remove());
+    if (typeof unmountCodexPlusSettingsPanel === "function") unmountCodexPlusSettingsPanel();
     setCodexPlusSidebarNavActive(false);
     restoreCodexPlusPageBackButton();
   }
@@ -9044,6 +7451,561 @@
   }
 
   /** 图标栏存在时走它，否则回退到旧版宽面板侧边栏入口。两条路径互斥，不会重复出现。 */
+  // 拓展详情页的主体（形态对齐 VS Code 的扩展详情）：「细节」显示拓展自己的 README，「设置」显示拓展登记的设置面板
+  // 或按清单 config 生成的表单，「功能」列出拓展接管了哪些能力；右侧栏是安装与市场信息。
+  // 头部（图标、名称、开关、卸载）仍在 renderCodexPlusExtensionsDetail 里，这里只管头部下面的部分。
+
+  /** 详情当前页签：readme / settings / features。换选中项时回到「细节」。 */
+  let codexPlusExtensionsDetailTab = "readme";
+  /** README 缓存：`<key>@<版本>` → { state: loading | ok | failed, markdown, assets, truncated, message }。 */
+  const codexPlusExtensionReadmes = new Map();
+
+  function resetCodexPlusExtensionsDetailTab() {
+    codexPlusExtensionsDetailTab = "readme";
+  }
+
+  /** 「刷新」时清掉 README 缓存，改过的 README 下次打开重新读。 */
+  function clearCodexPlusExtensionReadmes() {
+    codexPlusExtensionReadmes.clear();
+  }
+
+  function codexPlusExtensionReadmeCacheKey(local) {
+    return `${local.key}@${local.package?.version || ""}`;
+  }
+
+  async function loadCodexPlusExtensionReadme(local) {
+    const cacheKey = codexPlusExtensionReadmeCacheKey(local);
+    if (codexPlusExtensionReadmes.has(cacheKey)) return;
+    codexPlusExtensionReadmes.set(cacheKey, { state: "loading" });
+    let entry;
+    try {
+      const result = await postJson("/user-scripts/readme", { key: local.key });
+      entry = result?.status === "ok"
+        ? { state: "ok", markdown: String(result.markdown || ""), assets: result.assets && typeof result.assets === "object" ? result.assets : {}, truncated: !!result.truncated }
+        : { state: "failed", message: result?.message || "README 读取失败" };
+    } catch (error) {
+      entry = { state: "failed", message: String(error?.message || error || "README 读取失败") };
+    }
+    codexPlusExtensionReadmes.set(cacheKey, entry);
+    // 只换 README 那一块，不重画整个详情：设置面板、滚动位置都不动。
+    document.querySelectorAll("[data-codex-extensions-readme]").forEach((node) => {
+      if (node.getAttribute("data-codex-extensions-readme") === local.key) node.innerHTML = renderCodexPlusExtensionReadmeBody(local, entry);
+    });
+  }
+
+  /** 「细节」页签：有 README 显示 README；没有就显示市场清单里的使用要求、已知限制。 */
+  function renderCodexPlusExtensionReadmeBody(local, entry) {
+    if (!entry || entry.state === "loading") return '<div class="codex-plus-extensions-readme-hint" role="status">正在读取 README…</div>';
+    if (entry.state === "failed") return `<div class="codex-plus-extensions-detail-error">${escapeHtml(entry.message)}</div>`;
+    if (!entry.markdown.trim()) return "";
+    const truncated = entry.truncated ? '<div class="codex-plus-extensions-readme-hint">README 太长，只显示了前 512 KB。</div>' : "";
+    return `<div class="codex-plus-markdown">${renderCodexPlusMarkdown(entry.markdown, { assets: entry.assets })}</div>${truncated}`;
+  }
+
+  function renderCodexPlusExtensionDetailsTab(local, marketItem) {
+    const list = (title, items) => items?.length
+      ? `<div class="codex-plus-extensions-detail-section"><div class="codex-plus-extensions-detail-section-title">${escapeHtml(title)}</div><ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></div>`
+      : "";
+    const facts = `${list("使用要求", marketItem?.requirements)}${list("已知限制", marketItem?.limitations)}`;
+    if (local?.package?.readme) {
+      const entry = codexPlusExtensionReadmes.get(codexPlusExtensionReadmeCacheKey(local));
+      if (!entry) void loadCodexPlusExtensionReadme(local);
+      return `<div data-codex-extensions-readme="${escapeHtml(local.key)}">${renderCodexPlusExtensionReadmeBody(local, entry)}</div>${facts}`;
+    }
+    const empty = local
+      ? local.kind === "package" ? "这个拓展没有提供 README。在拓展包目录里放一个 README.md，就会显示在这里。" : "单文件脚本没有 README，说明见上方简介。"
+      : "";
+    return facts || `<div class="codex-plus-extensions-readme-hint">${escapeHtml(empty || "这个拓展没有更多说明。")}</div>`;
+  }
+
+  /** 多语言文本（字符串或 `{ "zh-CN", zh, en }`）取中文优先。 */
+  function codexPlusExtensionText(value) {
+    if (value && typeof value === "object") {
+      return value["zh-CN"] || value.zh || value.en || Object.values(value).find((item) => typeof item === "string") || "";
+    }
+    return value == null ? "" : String(value);
+  }
+
+  /** 拓展有没有可设置的内容：登记了设置面板、声明了设置页或 config。 */
+  function codexPlusExtensionHasSettings(local) {
+    if (!local || local.kind !== "package") return false;
+    const panel = typeof codexPlusSettingsPanelFor === "function" ? codexPlusSettingsPanelFor(local.key) : null;
+    return !!(panel || local.package?.settingsPage || local.package?.configSchema?.length);
+  }
+
+  /**
+   * 「设置」页签：拓展在运行且登记了设置面板（ctx.registerSettingsPanel）就留挂载点给它画；
+   * 否则按清单 config 生成表单（停用的拓展也能改），声明了自己的设置界面的再提示一句启用后能看到。
+   */
+  function renderCodexPlusExtensionSettingsTab(local) {
+    const panel = typeof codexPlusSettingsPanelFor === "function" ? codexPlusSettingsPanelFor(local.key) : null;
+    if (panel && local.enabled) {
+      return `<div class="codex-plus-extensions-detail-settings-host" data-codex-plus-settings-panel="${escapeHtml(local.key)}" ${codexPlusExtensionConstants.extensionAttribute}="${escapeHtml(local.key)}"></div>`;
+    }
+    const ownUi = panel || local.package?.settingsPage;
+    const hint = ownUi
+      ? `<div class="codex-plus-extensions-detail-settings-hint">${local.enabled ? "这个拓展加载后，这里会显示它自己的设置界面。" : "启用这个拓展后，这里会显示它自己的设置界面。"}${local.package?.configSchema?.length ? "下面是按清单生成的通用设置。" : ""}</div>`
+      : "";
+    return `${hint}${local.package?.configSchema?.length ? renderCodexPlusExtensionConfigForm(local) : ""}`;
+  }
+
+  /** 按清单 config 生成的设置表单。改一项就把整份配置存回去（后台按整份覆盖）。 */
+  function renderCodexPlusExtensionConfigForm(local) {
+    const config = local.package?.config && typeof local.package.config === "object" ? local.package.config : {};
+    const rows = (local.package?.configSchema || []).map((field, index) => {
+      const id = `codex-plus-ext-config-${index}`;
+      const value = config[field.key] !== undefined ? config[field.key] : field.default;
+      const attrs = `id="${id}" data-codex-ext-config-field="${escapeHtml(field.key)}" data-codex-ext-config-type="${escapeHtml(field.type)}"`;
+      let control;
+      if (field.type === "boolean") {
+        control = `<button type="button" class="codex-plus-toggle" ${attrs} data-enabled="${String(value === true)}" role="switch" aria-checked="${String(value === true)}"><span></span></button>`;
+      } else if (field.type === "select") {
+        const options = (field.options || []).map((option) => {
+          const raw = JSON.stringify(option?.value ?? null);
+          const selected = raw === JSON.stringify(value ?? null) ? " selected" : "";
+          return `<option value="${escapeHtml(raw)}"${selected}>${escapeHtml(codexPlusExtensionText(option?.label) || String(option?.value ?? ""))}</option>`;
+        }).join("");
+        control = `<select class="codex-plus-ext-config-input" ${attrs}>${options}</select>`;
+      } else if (field.type === "number") {
+        const min = field.min == null ? "" : ` min="${escapeHtml(field.min)}"`;
+        const max = field.max == null ? "" : ` max="${escapeHtml(field.max)}"`;
+        control = `<input type="number" step="any" class="codex-plus-ext-config-input codex-plus-ext-config-number" ${attrs}${min}${max} value="${escapeHtml(value ?? "")}" />`;
+      } else if (field.type === "text") {
+        control = `<textarea class="codex-plus-ext-config-input" rows="4" spellcheck="false" ${attrs}>${escapeHtml(value ?? "")}</textarea>`;
+      } else if (field.type === "array" || field.type === "object") {
+        control = `<textarea class="codex-plus-ext-config-input codex-plus-ext-config-json" rows="6" spellcheck="false" ${attrs}>${escapeHtml(JSON.stringify(value ?? (field.type === "array" ? [] : {}), null, 2))}</textarea>`;
+      } else {
+        control = `<input type="${field.secret ? "password" : "text"}" autocomplete="off" spellcheck="false" class="codex-plus-ext-config-input" ${attrs} value="${escapeHtml(value ?? "")}" />`;
+      }
+      const description = codexPlusExtensionText(field.description);
+      const wide = ["text", "array", "object"].includes(field.type);
+      return `
+        <div class="codex-plus-ext-config-row" data-wide="${String(wide)}">
+          <div class="codex-plus-ext-config-label">
+            <label for="${id}">${escapeHtml(codexPlusExtensionText(field.title) || field.key)}</label>
+            ${description ? `<div class="codex-plus-ext-config-description">${escapeHtml(description)}</div>` : ""}
+            ${field.type === "array" || field.type === "object" ? '<div class="codex-plus-ext-config-description">JSON 格式，失焦后保存。</div>' : ""}
+          </div>
+          <div class="codex-plus-ext-config-control">${control}</div>
+        </div>
+      `;
+    }).join("");
+    return `<div class="codex-plus-ext-config" data-codex-ext-config="${escapeHtml(local.key)}">${rows}<div class="codex-plus-ext-config-status" role="status" data-codex-ext-config-status="true"></div></div>`;
+  }
+
+  /** 从控件读出新值；读不出（数字不合法、JSON 写错）时抛错给状态行显示。 */
+  function codexPlusExtensionConfigValue(control) {
+    const type = control.getAttribute("data-codex-ext-config-type");
+    if (type === "boolean") return control.getAttribute("data-enabled") !== "true";
+    if (type === "select") return JSON.parse(control.value);
+    if (type === "number") {
+      if (control.value.trim() === "" || !Number.isFinite(Number(control.value))) throw new Error("请填一个数字");
+      return Number(control.value);
+    }
+    if (type === "array" || type === "object") {
+      let value;
+      try {
+        value = JSON.parse(control.value || (type === "array" ? "[]" : "{}"));
+      } catch {
+        throw new Error("JSON 格式不对");
+      }
+      if (type === "array" ? !Array.isArray(value) : !value || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error(type === "array" ? "要填一个 JSON 数组" : "要填一个 JSON 对象");
+      }
+      return value;
+    }
+    return control.value;
+  }
+
+  async function saveCodexPlusExtensionConfigField(control) {
+    const form = control.closest("[data-codex-ext-config]");
+    const key = form?.getAttribute("data-codex-ext-config") || "";
+    const local = (codexPlusUserScripts.scripts || []).find((script) => script.key === key);
+    const status = form?.querySelector("[data-codex-ext-config-status]");
+    if (!local || !status) return;
+    const setStatus = (text, kind) => {
+      status.textContent = text;
+      status.dataset.kind = kind;
+    };
+    let value;
+    try {
+      value = codexPlusExtensionConfigValue(control);
+    } catch (error) {
+      setStatus(error.message, "error");
+      return;
+    }
+    const field = control.getAttribute("data-codex-ext-config-field");
+    const next = { ...(local.package?.config || {}), [field]: value };
+    if (control.getAttribute("data-codex-ext-config-type") === "boolean") {
+      control.setAttribute("data-enabled", String(value));
+      control.setAttribute("aria-checked", String(value));
+    }
+    setStatus("正在保存…", "pending");
+    try {
+      await saveCodexPlusExtensionConfig(key, next);
+      setStatus("已保存", "ok");
+    } catch (error) {
+      setStatus(String(error?.message || error), "error");
+    }
+  }
+
+  /** 「功能」页签：拓展清单里声明接管的能力（对应 VS Code 的 Feature Contributions）。 */
+  function codexPlusExtensionFeatures(local) {
+    const pkg = local?.package;
+    if (!pkg) return [];
+    const names = (items) => (Array.isArray(items) ? items : []).map((item) => (typeof item === "string" ? item : item?.name || item?.id || "")).filter(Boolean);
+    const rows = [];
+    const add = (label, value) => {
+      if (Array.isArray(value) ? value.length : value) rows.push([label, Array.isArray(value) ? value.join("、") : String(value)]);
+    };
+    add("页面脚本", pkg.renderer ? `${pkg.renderer} 个文件` : "");
+    add("模型工具", names(pkg.tools));
+    add("Codex 钩子", names(pkg.hookEvents));
+    const pipeline = pkg.toolPipeline || {};
+    add("工具调用管线", [
+      pipeline.preExecute ? `执行前 ${pipeline.preExecute} 个` : "",
+      pipeline.execute ? `接管执行 ${pipeline.execute} 个` : "",
+      pipeline.postExecute ? `结果改写 ${pipeline.postExecute} 个` : "",
+    ].filter(Boolean));
+    add("网关中间件", [
+      pkg.gatewayRequest ? `请求 ${pkg.gatewayRequest} 个` : "",
+      pkg.gatewayResponse ? `响应流 ${pkg.gatewayResponse} 个` : "",
+      pkg.gatewayError ? `失败重试 ${pkg.gatewayError} 个` : "",
+    ].filter(Boolean));
+    add("关掉的内置网关环节", names(pkg.gatewayReplaces));
+    add("模型供应商", (pkg.providers || []).map((provider) => provider?.name || provider?.id).filter(Boolean));
+    add("常驻后台", pkg.backend ? [pkg.http ? "后台脚本（处理 HTTP 请求）" : "后台脚本"] : []);
+    add("提供的服务", names(pkg.services));
+    add("定时任务", (pkg.schedules || []).length ? `${pkg.schedules.length} 个` : "");
+    const codex = pkg.codex || {};
+    add("Skills", names(codex.skills));
+    add("子 Agent", names(codex.agents));
+    add("MCP 服务器", names(codex.mcpServers));
+    add("提示词", names(codex.prompts));
+    add("全局指令", codex.instructions ? "有" : "");
+    add("顶替的内置拓展", names(pkg.replaces));
+    add("管理器面板", pkg.managerPage ? [pkg.managerPage.title || "面板"] : []);
+    add("页面最早期脚本", pkg.preload?.scripts ? `${pkg.preload.scripts} 个` : "");
+    add("启动前后", [
+      pkg.launch?.before ? "启动前脚本" : "",
+      pkg.launch?.after ? "退出后脚本" : "",
+      pkg.launch?.args?.length ? `启动参数 ${pkg.launch.args.join(" ")}` : "",
+    ].filter(Boolean));
+    add("dsh 插件", pkg.dsh ? "有" : "");
+    add("设置项", (pkg.configSchema || []).map((field) => codexPlusExtensionText(field.title) || field.key));
+    add("可调用的数据路由", names(pkg.routes));
+    return rows;
+  }
+
+  function renderCodexPlusExtensionFeaturesTab(rows) {
+    return `<table class="codex-plus-extensions-features"><tbody>${rows.map(([label, value]) => `<tr><th scope="row">${escapeHtml(label)}</th><td>${escapeHtml(value)}</td></tr>`).join("")}</tbody></table>`;
+  }
+
+  /** 右侧栏：安装信息、市场信息、链接、标签。 */
+  function renderCodexPlusExtensionAside(local, marketItem, sourceLabel) {
+    const table = (title, rows) => {
+      const shown = rows.filter(([, value]) => value);
+      return shown.length
+        ? `<section><h3>${escapeHtml(title)}</h3><dl>${shown.map(([label, value]) => `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd>`).join("")}</dl></section>`
+        : "";
+    };
+    const install = local ? table("安装", [
+      ["标识符", local.key],
+      ["版本", local.package?.version || local.version || ""],
+      ["来源", sourceLabel],
+      ["状态", userScriptStatusLabel(local.status)],
+    ]) : "";
+    const market = marketItem ? table("市场", [
+      ["作者", marketItem.author || ""],
+      ["最新版本", marketItem.version ? `v${marketItem.version}` : ""],
+      ["更新时间", marketItem.updated_at || ""],
+    ]) : "";
+    const links = [
+      [marketItem?.homepage || local?.homepage, "主页"],
+      [local?.source_url || marketItem?.script_url, "源文件"],
+    ].filter(([url]) => /^https?:\/\//i.test(String(url || "")));
+    const resources = links.length
+      ? `<section><h3>资源</h3><ul class="codex-plus-extensions-aside-links">${links.map(([url, label]) => `<li><a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(label)}</a></li>`).join("")}</ul></section>`
+      : "";
+    const tags = marketItem?.tags?.length
+      ? `<section><h3>标签</h3><div class="codex-plus-extensions-detail-tags">${marketItem.tags.map((tag) => `<span>${escapeHtml(tag)}</span>`).join("")}</div></section>`
+      : "";
+    return `${install}${market}${resources}${tags}`;
+  }
+
+  /** 头部下面的部分：页签 + 内容 + 右侧栏。 */
+  function renderCodexPlusExtensionDetailTabs({ local, marketItem, sourceLabel }) {
+    const tabs = [{ id: "readme", label: "细节" }];
+    if (codexPlusExtensionHasSettings(local)) tabs.push({ id: "settings", label: "设置" });
+    const features = codexPlusExtensionFeatures(local);
+    if (features.length) tabs.push({ id: "features", label: "功能" });
+    const active = tabs.some((tab) => tab.id === codexPlusExtensionsDetailTab) ? codexPlusExtensionsDetailTab : "readme";
+    const body = (id) => {
+      if (id === "settings") return renderCodexPlusExtensionSettingsTab(local);
+      if (id === "features") return renderCodexPlusExtensionFeaturesTab(features);
+      return renderCodexPlusExtensionDetailsTab(local, marketItem);
+    };
+    const aside = renderCodexPlusExtensionAside(local, marketItem, sourceLabel);
+    return `
+      <div class="codex-plus-extensions-detail-tabs" role="tablist" aria-label="拓展详情">
+        ${tabs.map((tab) => `<button type="button" role="tab" id="codex-plus-extensions-tab-${tab.id}" aria-controls="codex-plus-extensions-tabpanel-${tab.id}" aria-selected="${String(tab.id === active)}" data-codex-extensions-tab="${tab.id}">${tab.label}</button>`).join("")}
+      </div>
+      <div class="codex-plus-extensions-detail-columns">
+        <div class="codex-plus-extensions-detail-main">
+          ${tabs.map((tab) => `<div class="codex-plus-extensions-detail-tabpanel" role="tabpanel" id="codex-plus-extensions-tabpanel-${tab.id}" aria-labelledby="codex-plus-extensions-tab-${tab.id}" data-codex-extensions-tabpanel="${tab.id}"${tab.id === active ? "" : " hidden"}>${body(tab.id)}</div>`).join("")}
+          ${local?.error ? `<div class="codex-plus-extensions-detail-error">${escapeHtml(local.error)}</div>` : ""}
+        </div>
+        ${aside ? `<aside class="codex-plus-extensions-detail-aside">${aside}</aside>` : ""}
+      </div>
+    `;
+  }
+
+  /** 切页签只改显隐，不重画：设置面板与 README 都留在原地。 */
+  function selectCodexPlusExtensionsDetailTab(root, tab) {
+    const tabs = Array.from(root?.querySelectorAll?.("[data-codex-extensions-tab]") || []).filter((button) => button.getAttribute("role") === "tab");
+    if (!tabs.some((button) => button.getAttribute("data-codex-extensions-tab") === tab)) return false;
+    codexPlusExtensionsDetailTab = tab;
+    tabs.forEach((button) => button.setAttribute("aria-selected", String(button.getAttribute("data-codex-extensions-tab") === tab)));
+    root.querySelectorAll("[data-codex-extensions-tabpanel]").forEach((panel) => {
+      panel.hidden = panel.getAttribute("data-codex-extensions-tabpanel") !== tab;
+    });
+    return true;
+  }
+
+  /** 详情里的点击：页签、头部的「设置」、配置开关、README 里的页内锚点。处理了返回 true。 */
+  function handleCodexPlusExtensionDetailClick(target, event) {
+    const tabButton = target?.closest?.("[data-codex-extensions-tab]");
+    if (tabButton) {
+      const root = tabButton.closest("[data-codex-plus-extensions-detail]");
+      selectCodexPlusExtensionsDetailTab(root, tabButton.getAttribute("data-codex-extensions-tab"));
+      if (tabButton.getAttribute("role") !== "tab") root?.querySelector(".codex-plus-extensions-detail-tabs")?.scrollIntoView?.({ block: "nearest" });
+      return true;
+    }
+    const toggle = target?.closest?.('[data-codex-ext-config-type="boolean"]');
+    if (toggle) {
+      void saveCodexPlusExtensionConfigField(toggle);
+      return true;
+    }
+    const anchor = target?.closest?.("[data-codex-plus-md-anchor]");
+    if (anchor) {
+      // 不能让页内锚点改 Codex 页面的地址，自己滚到 README 里对应的标题。
+      event?.preventDefault?.();
+      const id = `codex-plus-md-${anchor.getAttribute("data-codex-plus-md-anchor")}`;
+      const heading = Array.from(anchor.closest(".codex-plus-markdown")?.querySelectorAll("[id]") || []).find((node) => node.id === id);
+      heading?.scrollIntoView?.({ block: "start", behavior: "smooth" });
+      return true;
+    }
+    return false;
+  }
+
+  /** 配置表单里输入框 / 下拉 / 文本框的 change（失焦或回车）就保存。 */
+  function handleCodexPlusExtensionConfigChange(target) {
+    const control = target?.closest?.("[data-codex-ext-config-field]");
+    if (!control || control.getAttribute("data-codex-ext-config-type") === "boolean") return false;
+    void saveCodexPlusExtensionConfigField(control);
+    return true;
+  }
+
+  /**
+   * 拓展 README 的 Markdown 渲染。原样先转义，原始 HTML 一律当文字显示（HTML 注释直接去掉）；
+   * 链接只放行 http(s)、mailto 和页内锚点，图片只放行 https、常见图片 data URL 和包内 `assets/` 资源
+   * （`options.assets`：后台随 README 给的 路径 → data URL）。覆盖 README 常用语法：标题（含 Setext）、段落、
+   * 无序/有序/任务列表（可嵌套）、引用、围栏/缩进代码块、表格、分隔线，行内代码、粗体、斜体、删除线、链接、图片、自动链接、换行。
+   */
+  function renderCodexPlusMarkdown(source, options = {}) {
+    const assets = options.assets && typeof options.assets === "object" ? options.assets : {};
+    const text = String(source || "").replace(/\r\n?/g, "\n").replace(/<!--[\s\S]*?-->/g, "").replace(/\t/g, "    ");
+    const slugs = new Map();
+    const slug = (value) => {
+      const base = String(value).toLowerCase().replace(/<[^>]*>/g, "").replace(/&[a-z#0-9]+;/g, "").trim()
+        .replace(/[^\p{L}\p{N}\s-]/gu, "").replace(/\s+/g, "-") || "section";
+      const count = slugs.get(base) || 0;
+      slugs.set(base, count + 1);
+      return count ? `${base}-${count}` : base;
+    };
+    const safeHref = (url) => {
+      const value = String(url || "").trim();
+      if (/^(https?:|mailto:)/i.test(value)) return { href: value, external: true };
+      if (/^#[^\s]*$/.test(value)) return { anchor: value.slice(1) };
+      return null;
+    };
+    const safeSrc = (url) => {
+      const value = String(url || "").trim();
+      if (/^https:\/\//i.test(value) || /^data:image\/(png|jpe?g|gif|webp);base64,[a-z0-9+/=]+$/i.test(value)) return value;
+      const relative = value.replace(/^\.?\//, "");
+      return typeof assets[relative] === "string" ? assets[relative] : "";
+    };
+
+    const inline = (raw) => {
+      const stash = [];
+      const keep = (html) => `\u0000${stash.push(html) - 1}\u0000`;
+      let value = String(raw);
+      value = value.replace(/(`+)([\s\S]*?[^`])\1(?!`)/g, (_, _ticks, code) => keep(`<code>${escapeHtml(code.trim())}</code>`));
+      value = value.replace(/\\([\\`*_{}\[\]()#+\-.!|~<>])/g, (_, char) => keep(escapeHtml(char)));
+      value = value.replace(/!\[([^\]]*)\]\(\s*<?((?:[^()\s<>]|\([^()\s]*\))+)>?(?:\s+"([^"]*)")?\s*\)/g, (_, alt, url, title) => {
+        const src = safeSrc(url);
+        if (!src) return keep(escapeHtml(alt));
+        return keep(`<img src="${escapeHtml(src)}" alt="${escapeHtml(alt)}"${title ? ` title="${escapeHtml(title)}"` : ""} loading="lazy" />`);
+      });
+      value = value.replace(/<(https?:\/\/[^\s>]+)>/g, (_, url) => keep(`<a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(url)}</a>`));
+      value = value.replace(/\[((?:[^\[\]]|\[[^\]]*\])+)\]\(\s*<?((?:[^()\s<>]|\([^()\s]*\))+)>?(?:\s+"([^"]*)")?\s*\)/g, (_, label, url) => {
+        const link = safeHref(url);
+        const body = inline(label);
+        if (!link) return keep(body);
+        if (link.anchor !== undefined) return keep(`<a href="#" data-codex-plus-md-anchor="${escapeHtml(link.anchor)}">${body}</a>`);
+        return keep(`<a href="${escapeHtml(link.href)}" target="_blank" rel="noreferrer">${body}</a>`);
+      });
+      value = value.replace(/https?:\/\/[^\s<>()\u0000]+[^\s<>()\u0000.,;:!?'"]/g, (url) => keep(`<a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(url)}</a>`));
+      value = escapeHtml(value)
+        .replace(/(\*\*|__)(?=\S)([\s\S]*?\S)\1/g, "<strong>$2</strong>")
+        .replace(/~~(?=\S)([\s\S]*?\S)~~/g, "<del>$1</del>")
+        .replace(/\*(?=[^\s*])([\s\S]*?[^\s*])\*/g, "<em>$1</em>")
+        .replace(/(^|[^\p{L}\p{N}_])_(?=\S)([\s\S]*?\S)_(?![\p{L}\p{N}_])/gu, "$1<em>$2</em>")
+        .replace(/(?: {2,}|\\)\n/g, "<br />")
+        .replace(/\n/g, " ");
+      let guard = 0;
+      while (value.includes("\u0000") && guard++ < 50) value = value.replace(/\u0000(\d+)\u0000/g, (_, index) => stash[Number(index)] ?? "");
+      return value;
+    };
+
+    const fenceRe = /^ {0,3}(`{3,}|~{3,})\s*([^`\s]*)/;
+    const headingRe = /^ {0,3}(#{1,6})(?:\s+(.*?))?\s*#*\s*$/;
+    const hrRe = /^ {0,3}([-*_])(?:\s*\1){2,}\s*$/;
+    const listRe = /^( *)([-*+]|\d{1,9}[.)])(?:\s+(.*)|$)/;
+    const quoteRe = /^ {0,3}>/;
+    const tableSepRe = /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)*\|?\s*$/;
+    const leading = (line) => line.match(/^ */)[0].length;
+    const isBlockStart = (line) => fenceRe.test(line) || headingRe.test(line) || hrRe.test(line) || listRe.test(line) || quoteRe.test(line);
+    const splitRow = (line) => line.trim().replace(/^\|/, "").replace(/(?<!\\)\|$/, "").split(/(?<!\\)\|/).map((cell) => cell.trim());
+
+    const blocks = (lines) => {
+      const out = [];
+      let i = 0;
+      while (i < lines.length) {
+        const line = lines[i];
+        if (!line.trim()) { i++; continue; }
+        const fence = line.match(fenceRe);
+        if (fence) {
+          const marker = fence[1];
+          const body = [];
+          i++;
+          while (i < lines.length && !new RegExp(`^ {0,3}${marker[0] === "`" ? "`" : "~"}{${marker.length},}\\s*$`).test(lines[i])) body.push(lines[i++]);
+          i++;
+          const lang = fence[2] ? ` data-lang="${escapeHtml(fence[2])}"` : "";
+          out.push(`<pre><code${lang}>${escapeHtml(body.join("\n"))}</code></pre>`);
+          continue;
+        }
+        if (leading(line) >= 4) {
+          const body = [];
+          while (i < lines.length && (leading(lines[i]) >= 4 || !lines[i].trim())) body.push(lines[i++].slice(4));
+          while (body.length && !body[body.length - 1].trim()) body.pop();
+          out.push(`<pre><code>${escapeHtml(body.join("\n"))}</code></pre>`);
+          continue;
+        }
+        const heading = line.match(headingRe);
+        if (heading) {
+          const level = heading[1].length;
+          const html = inline(heading[2] || "");
+          out.push(`<h${level} id="codex-plus-md-${escapeHtml(slug(html))}">${html}</h${level}>`);
+          i++;
+          continue;
+        }
+        if (hrRe.test(line)) { out.push("<hr />"); i++; continue; }
+        if (quoteRe.test(line)) {
+          const body = [];
+          while (i < lines.length && lines[i].trim() && (quoteRe.test(lines[i]) || !isBlockStart(lines[i]))) {
+            body.push(lines[i].replace(/^ {0,3}> ?/, ""));
+            i++;
+          }
+          out.push(`<blockquote>${blocks(body)}</blockquote>`);
+          continue;
+        }
+        const list = line.match(listRe);
+        if (list) {
+          const indent = list[1].length;
+          const ordered = /\d/.test(list[2]);
+          const start = ordered ? parseInt(list[2], 10) : 1;
+          const items = [];
+          let loose = false;
+          while (i < lines.length) {
+            if (!lines[i].trim()) {
+              let next = i;
+              while (next < lines.length && !lines[next].trim()) next++;
+              const sibling = lines[next]?.match(listRe);
+              if (!sibling || sibling[1].length !== indent || /\d/.test(sibling[2]) !== ordered) break;
+              loose = true;
+              i = next;
+            }
+            const item = lines[i].match(listRe);
+            if (!item || item[1].length !== indent || /\d/.test(item[2]) !== ordered) break;
+            const contentIndent = item[1].length + item[2].length + 1;
+            const body = [item[3] || ""];
+            i++;
+            while (i < lines.length) {
+              const current = lines[i];
+              if (!current.trim()) {
+                let next = i;
+                while (next < lines.length && !lines[next].trim()) next++;
+                if (next < lines.length && leading(lines[next]) > indent && !(listRe.test(lines[next]) && leading(lines[next]) === indent)) {
+                  body.push("");
+                  loose = true;
+                  i++;
+                  continue;
+                }
+                break;
+              }
+              if (leading(current) > indent) { body.push(current.slice(Math.min(leading(current), contentIndent))); i++; continue; }
+              if (!isBlockStart(current) && !(i + 1 < lines.length && tableSepRe.test(lines[i + 1]) && current.includes("|"))) { body.push(current.trim()); i++; continue; }
+              break;
+            }
+            items.push(body);
+          }
+          const html = items.map((body) => {
+            let first = body[0];
+            let check = "";
+            const task = first.match(/^\[([ xX])\]\s+/);
+            if (task) {
+              check = `<input type="checkbox" disabled${task[1] === " " ? "" : " checked"} /> `;
+              first = first.slice(task[0].length);
+            }
+            let content = blocks([first, ...body.slice(1)]);
+            if (!loose) content = content.replace(/<p>([\s\S]*?)<\/p>/g, "$1");
+            return `<li${task ? ' class="codex-plus-markdown-task"' : ""}>${check}${content}</li>`;
+          }).join("");
+          out.push(ordered ? `<ol${start !== 1 ? ` start="${start}"` : ""}>${html}</ol>` : `<ul>${html}</ul>`);
+          continue;
+        }
+        if (line.includes("|") && i + 1 < lines.length && tableSepRe.test(lines[i + 1]) && lines[i + 1].includes("-")) {
+          const head = splitRow(line);
+          const aligns = splitRow(lines[i + 1]).map((cell) => (cell.startsWith(":") && cell.endsWith(":") ? "center" : cell.endsWith(":") ? "right" : cell.startsWith(":") ? "left" : ""));
+          i += 2;
+          const rows = [];
+          while (i < lines.length && lines[i].trim() && lines[i].includes("|")) rows.push(splitRow(lines[i++]));
+          const cell = (tag, value, index) => `<${tag}${aligns[index] ? ` style="text-align:${aligns[index]}"` : ""}>${inline(value || "")}</${tag}>`;
+          out.push(`<div class="codex-plus-markdown-table"><table><thead><tr>${head.map((value, index) => cell("th", value, index)).join("")}</tr></thead><tbody>${rows.map((row) => `<tr>${head.map((_, index) => cell("td", row[index], index)).join("")}</tr>`).join("")}</tbody></table></div>`);
+          continue;
+        }
+        const paragraph = [];
+        while (i < lines.length && lines[i].trim()) {
+          if (paragraph.length && /^ {0,3}(=+|-+)\s*$/.test(lines[i])) break;
+          if (paragraph.length && (isBlockStart(lines[i]) || (lines[i].includes("|") && i + 1 < lines.length && tableSepRe.test(lines[i + 1]) && lines[i + 1].includes("-")))) break;
+          paragraph.push(paragraph.length ? lines[i].replace(/^ +/, "") : lines[i].trim());
+          i++;
+        }
+        const setext = i < lines.length ? lines[i].match(/^ {0,3}(=+|-+)\s*$/) : null;
+        if (setext && paragraph.length) {
+          const level = setext[1][0] === "=" ? 1 : 2;
+          const html = inline(paragraph.join("\n"));
+          out.push(`<h${level} id="codex-plus-md-${escapeHtml(slug(html))}">${html}</h${level}>`);
+          i++;
+          continue;
+        }
+        out.push(`<p>${inline(paragraph.join("\n"))}</p>`);
+      }
+      return out.join("");
+    };
+    return blocks(text.split("\n"));
+  }
   function installCodexPlusNavigationEntries() {
     // 插件入口沿用原生按钮，清理旧注入留下的重复商店入口。
     document.getElementById(codexPlusRailPluginMarketId)?.remove();
@@ -11989,7 +10951,8 @@
   }
 
   function codexPlusModelUnlockEnabled() {
-    return !!codexPlusSettings().modelWhitelistUnlock;
+    // 被拓展顶替时让位（停用集合由 96-builtin-extensions.js 按下发的顶替状态维护）。
+    return !!codexPlusSettings().modelWhitelistUnlock && !globalThis.__codexPlusBuiltinInactive?.has("model-whitelist-unlock");
   }
 
   function codexPlusModelNames() {
@@ -14414,295 +13377,6 @@
     layoutCodexPlusToasts();
     setTimeout(() => dismissCodexPlusToast(toast), codexPlusToastLifetimeMs);
     return () => dismissCodexPlusToast(toast);
-  }
-
-  function shareBase64Url(bytes) {
-    let binary = "";
-    for (const byte of bytes) binary += String.fromCharCode(byte);
-    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  }
-
-  function shareTextFromElement(element) {
-    const clone = element.cloneNode(true);
-    clone.querySelectorAll?.("button, textarea, input, select, [contenteditable='true'], .codex-delete-toast, .codex-plus-modal-overlay, .codex-plus-page-overlay, .codex-session-share-button").forEach((node) => node.remove());
-    return String(clone.innerText || clone.textContent || "").replace(/\u00a0/g, " ").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
-  }
-
-  function sessionShareMarkdown() {
-    const ref = currentSessionRef();
-    if (!ref.session_id) return { ref, markdown: "" };
-    const root = conversationRoot();
-    if (!root) return { ref, markdown: "" };
-    const authored = Array.from(root.querySelectorAll("[data-message-author-role]"));
-    const knownTurns = Array.from(root.querySelectorAll([
-      '[data-testid="conversation-turn"]',
-      '[data-testid*="message"]',
-      '[data-message-content]',
-      'main .prose',
-      '[class*="message-bubble"]',
-      '[class*="MessageBubble"]',
-      '[class*="user-message"]',
-      '[class*="UserMessage"]',
-    ].join(",")));
-    const turns = authored.length ? authored : knownTurns;
-    const seen = new Set();
-    const messages = turns.map((node) => {
-      if (!(node instanceof HTMLElement) || seen.has(node)) return "";
-      if (node.parentElement?.closest?.('[data-message-author-role], [data-testid="conversation-turn"]')) return "";
-      seen.add(node);
-      const text = shareTextFromElement(node);
-      if (!text) return "";
-      const role = String(node.getAttribute("data-message-author-role") || "").toLowerCase();
-      const label = role === "user" ? "用户" : role === "assistant" ? "助手" : "消息";
-      return { role: role === "user" || role === "assistant" ? role : "message", label, text };
-    }).filter(Boolean);
-    const title = String(ref.title || document.querySelector(selectors.threadTitle)?.textContent || "未命名会话").replace(/\s+/g, " ").trim();
-    let content = messages.map((message) => `### ${message.label}\n\n${message.text}`).join("\n\n");
-    if (!content) {
-      const fallback = root.cloneNode(true);
-      fallback.querySelectorAll?.([
-        ".composer-footer", ".composer-surface-chrome", "form", "header", "nav", "aside",
-        "button", "textarea", "input", "select", "[contenteditable='true']",
-        ".codex-delete-toast", ".codex-plus-modal-overlay", ".codex-plus-page-overlay",
-        ".codex-session-share-button",
-      ].join(",")).forEach((node) => node.remove());
-      content = String(fallback.innerText || fallback.textContent || "")
-        .replace(/\u00a0/g, " ")
-        .replace(/[ \t]+\n/g, "\n")
-        .replace(/\n{3,}/g, "\n\n")
-        .trim();
-      if (content) messages.push({ role: "message", label: "会话", text: content });
-    }
-    const markdown = `# ${title || "未命名会话"}\n\n- 会话 ID：\`${ref.session_id}\`\n\n${content}`.slice(0, codexPlusShareMaxCharacters);
-    return {
-      ref,
-      markdown: content ? markdown : "",
-      session: content ? {
-        version: 1,
-        kind: "codex-session",
-        session_id: ref.session_id,
-        title: title || "未命名会话",
-        messages: messages.map(({ role, text }) => ({ role, text })),
-      } : null,
-    };
-  }
-
-  async function encryptSessionShare(value) {
-    const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt"]);
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(value));
-    const exportedKey = await crypto.subtle.exportKey("raw", key);
-    return {
-      key: shareBase64Url(new Uint8Array(exportedKey)),
-      encrypted: {
-        v: 1,
-        iv: shareBase64Url(iv),
-        ciphertext: shareBase64Url(new Uint8Array(ciphertext)),
-      },
-    };
-  }
-
-  async function createSessionShare() {
-    const { ref, markdown, session } = sessionShareMarkdown();
-    if (!ref.session_id) {
-      showToast("当前页面还没有可分享的会话", null);
-      return;
-    }
-    if (!markdown || !session) {
-      showToast("当前会话还没有可分享的消息", null);
-      return;
-    }
-    const shareWindow = window.open("about:blank", "_blank");
-    const button = document.querySelector(`.${sessionShareButtonClass}`);
-    if (button) {
-      button.disabled = true;
-      button.setAttribute("aria-busy", "true");
-      button.textContent = "正在创建…";
-    }
-    try {
-      let shareDocument = session;
-      const nativeSession = await postJson("/session/export", {
-        session_id: ref.session_id,
-        title: session.title,
-      });
-      if (nativeSession?.status !== "ok" || nativeSession.kind !== "codex-rollout" || typeof nativeSession.content !== "string") {
-        throw new Error(nativeSession?.message || "无法读取完整 Codex 会话文件");
-      }
-      shareDocument = { ...nativeSession, title: session.title };
-      const encrypted = await encryptSessionShare(JSON.stringify(shareDocument));
-      const payload = { ttl: 604800, encrypted: encrypted.encrypted };
-      let result;
-      let baseUrl = codexPlusShareBaseUrl;
-      try {
-        result = await postJson("/share/create", payload);
-        if (result?.id) {
-          baseUrl = codexPlusShareBaseUrl;
-        } else if (result?.status !== "failed") {
-          throw new Error(result?.message || "创建分享失败");
-        }
-      } catch (_) {
-        result = null;
-      }
-      if (!result?.id) {
-        let response;
-        try {
-          response = await fetch(`${baseUrl}/api/shares`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-        } catch (_) {
-          baseUrl = codexPlusShareFallbackBaseUrl;
-          response = await fetch(`${baseUrl}/api/shares`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-        }
-        result = await response.json().catch(() => ({}));
-        if (!response.ok || !result.id) throw new Error(result.error || `创建分享失败（HTTP ${response.status}）`);
-      }
-      const shareUrl = `${baseUrl}/?s=${encodeURIComponent(result.id)}#k=${encrypted.key}`;
-      try {
-        await navigator.clipboard.writeText(shareUrl);
-      } catch (_) {
-        const input = document.createElement("input");
-        input.value = shareUrl;
-        input.style.position = "fixed";
-        input.style.opacity = "0";
-        document.body.appendChild(input);
-        input.select();
-        document.execCommand("copy");
-        input.remove();
-      }
-      showToast("会话分享链接已复制", null);
-      if (shareWindow && !shareWindow.closed) shareWindow.location.href = shareUrl;
-    } catch (error) {
-      if (shareWindow && !shareWindow.closed) shareWindow.close();
-      showToast(error?.message || "创建分享失败，请稍后重试", null);
-    } finally {
-      if (button) {
-        button.disabled = false;
-        button.removeAttribute("aria-busy");
-        button.textContent = "分享会话";
-      }
-    }
-  }
-
-  function sessionSharePlacement() {
-    // 会话操作锚点唯一时才挂载，不能把右侧审查/浏览器的 header 当作会话栏。
-    const headerSelector = 'header, [data-app-shell-header-edge-scroll], [class*="_Header_"]';
-    const anchors = Array.from(document.querySelectorAll('[data-testid="app-shell-header-context-menu-surface"]'))
-      .filter((node) => visibleElement(node) && !node.closest('[data-codex-plus-ext]'));
-    if (anchors.length !== 1) return null;
-    const header = anchors[0].closest(headerSelector);
-    if (!(header instanceof HTMLElement) || !visibleElement(header)) return null;
-    const nativeShare = Array.from(header.querySelectorAll('button[aria-label="Share"], button[aria-label="分享"], button[aria-label*="Share"], button[aria-label*="分享"]'))
-      .find((node) => visibleElement(node) && !node.closest('[data-codex-plus-ext]') && !node.classList.contains(sessionShareButtonClass) && node.closest(headerSelector) === header);
-    const nativeGroup = nativeShare?.closest?.(".ms-auto");
-    if (nativeGroup && header.contains(nativeGroup)) return nativeGroup;
-    const groups = Array.from(header.querySelectorAll(".ms-auto"))
-      .filter((node) => visibleElement(node) && !node.closest('[data-codex-plus-ext]') && node.closest(headerSelector) === header);
-    return groups.length === 1 ? groups[0] : null;
-  }
-
-  function installSessionShareButton() {
-    const existing = document.querySelectorAll(`.${sessionShareButtonClass}`);
-    const ref = currentSessionRef();
-    const actionGroup = codexPlusSettings().sessionShare && ref.session_id && !globalThis.__codexPlusBuiltinInactive?.has("session-share")
-      ? sessionSharePlacement()
-      : null;
-    if (!(actionGroup instanceof HTMLElement)) {
-      existing.forEach((button) => button.remove());
-      return;
-    }
-    let button = existing[0];
-    existing.forEach((node) => { if (node !== button) node.remove(); });
-    if (!button) {
-      button = document.createElement("button");
-      button.type = "button";
-      button.className = `${sessionShareButtonClass} ${headerContextButtonClass}`;
-      button.textContent = "分享会话";
-      button.setAttribute("aria-label", "分享当前会话");
-      button.setAttribute("data-codex-plus-ext", "session-share");
-      button.dataset.codexSessionShareVersion = sessionShareButtonVersion;
-      button.addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        void createSessionShare();
-      }, true);
-    }
-    button.setAttribute("data-codex-plus-ext", "session-share");
-    button.style.position = "static";
-    button.style.pointerEvents = "auto";
-    button.style.webkitAppRegion = "no-drag";
-    button.style.marginLeft = "";
-    // 宿主重建时才搬动，避免每轮扫描再次触发 DOM mutation（issue #1960）。
-    if (button.parentElement !== actionGroup) actionGroup.appendChild(button);
-  }
-
-  function sessionImportMarkdown(session) {
-    const title = String(session?.title || "未命名会话").trim() || "未命名会话";
-    const messages = Array.isArray(session?.messages) ? session.messages : [];
-    const body = messages.map((message) => {
-      const role = message?.role === "user" ? "用户" : message?.role === "assistant" ? "助手" : "消息";
-      const text = String(message?.text || "").trim();
-      return text ? `### ${role}\n\n${text}` : "";
-    }).filter(Boolean).join("\n\n");
-    return `# ${title}\n\n${body}`.trim();
-  }
-
-  function importSharedSessionIntoNewChat(session) {
-    if (session?.kind === "codex-rollout" && typeof session.content === "string") {
-      void postJson("/session/import", session).then((result) => {
-        if (result?.status !== "ok") {
-          showToast(result?.message || "原生会话导入失败", null);
-          return;
-        }
-        void refreshRecentConversationsForHost();
-        showToast("已导入完整 Codex 会话", null);
-      }).catch((error) => showToast(error?.message || "原生会话导入失败", null));
-      return;
-    }
-    const markdown = sessionImportMarkdown(session);
-    if (!markdown) {
-      showToast("分享内容为空，无法导入", null);
-      return;
-    }
-    const newChat = Array.from(document.querySelectorAll("button")).find((button) => {
-      if (!visibleElement(button) || isExtensionUiNode(button)) return false;
-      const text = String(button.textContent || "").replace(/\s+/g, " ").trim();
-      const label = button.getAttribute("aria-label") || "";
-      return /^(新对话|New chat)$/i.test(text) || /^(新对话|New chat)$/i.test(label);
-    });
-    if (newChat instanceof HTMLElement) newChat.click();
-    const deadline = Date.now() + 5000;
-    const fill = () => {
-      const editor = Array.from(document.querySelectorAll("textarea, [contenteditable='true']"))
-        .filter((node) => visibleElement(node))
-        .at(-1);
-      if (!(editor instanceof HTMLElement)) {
-        if (Date.now() < deadline) window.setTimeout(fill, 100);
-        else showToast("无法找到 Codex 输入框，请手动打开新对话后重试", null);
-        return;
-      }
-      editor.focus();
-      if (editor instanceof HTMLTextAreaElement) {
-        const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
-        setter?.call(editor, markdown);
-        editor.dispatchEvent(new Event("input", { bubbles: true }));
-      } else {
-        document.execCommand("insertText", false, markdown);
-        editor.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: markdown }));
-      }
-      showToast("已导入完整会话内容，请发送以继续", null);
-    };
-    window.setTimeout(fill, newChat ? 350 : 0);
-  }
-
-  function installSessionShareImportListener() {
-    window.removeEventListener("message", window.__codexSessionShareImportHandler);
-    window.__codexSessionShareImportHandler = (event) => {
-      if (!/^(https:\/\/share\.codexpp\.cc|https:\/\/codexpp-share\.pages\.dev)$/.test(event.origin || "") || event.data?.type !== "codexpp-import-session") return;
-      const session = event.data?.session;
-      if (!session || !["codex-session", "codex-rollout"].includes(session.kind)) return;
-      if (session.kind === "codex-session" && !Array.isArray(session.messages)) return;
-      if (session.kind === "codex-rollout" && typeof session.content !== "string") return;
-      importSharedSessionIntoNewChat(session);
-    };
-    window.addEventListener("message", window.__codexSessionShareImportHandler);
   }
 
   function visibleElement(node) {
@@ -19174,7 +17848,6 @@
    */
   const codexPlusExtensionRoutes = new Set([
     "/diagnostics/log",
-    "/session/export",
     "/thread-usage-history",
     "/archived-thread",
     "/export-markdown",
@@ -19182,6 +17855,22 @@
     // 显式开放：给拓展注入 overlay 等独立 Codex 页面，不暴露任意 CDP 方法。
     "/cdp/targets",
     "/cdp/evaluate",
+    // 只读：系统鼠标位置，写「桌宠跟随鼠标」这类功能用。
+    "/system/cursor-position",
+    // 只读：最近已完成的模型请求（模型、耗时、供应商、token、成败），写「请求提示」这类功能用。
+    "/request-log/recent",
+    // Agent 桌宠（官方拓展包）的数据服务：图片 / 音效下载、大肥鱼的素材、挂件数据、本机用量。
+    // 只有启用中的拓展在清单里声明了才干活；供应商 Key 只在 Codex++ 里用。
+    "/agent-pet/catalog",
+    "/agent-pet/image",
+    "/agent-pet/sound",
+    "/agent-pet/import-sound",
+    "/whale/media",
+    "/whale/full",
+    "/whale/history",
+    "/whale/session",
+    // 背景图（官方拓展包）的读图路由：只读这个拓展配置里的那张本机图片。
+    "/image-overlay/image",
   ]);
 
   /** 单次调用的默认超时，略短于桥接自身的 26s，让拓展先拿到可读的错误。 */
@@ -19401,6 +18090,15 @@
       currentSessionId() {
         return codexPlusCurrentSessionId();
       },
+      /**
+       * 当前打开的 Codex 会话：{ id, title, hostId, remote }。hostId 是会话所在的主机（本机为 "local"），
+       * remote 表示远程 / SSH 会话（本机会话日志里没有它的用量）。没有会话时 id 为空串。
+       */
+      currentSession() {
+        const ref = typeof currentSessionRef === "function" ? currentSessionRef() || {} : {};
+        const hostId = String(ref.host_id || "local");
+        return Object.freeze({ id: String(ref.session_id || ""), title: String(ref.title || ""), hostId, remote: hostId !== "local" });
+      },
 
       /** 内置拓展的现状：[{ id, name, active, disabled, replacedBy }]。见 96-builtin-extensions.js。 */
       builtins() {
@@ -19492,6 +18190,14 @@
       /** Codex 设置页左侧导航末尾加一项，点开是 render({ container, close }) 画的页面。 */
       registerSettingsSection(definition, options = {}) {
         return codexPlusRegisterSettingsSection(definition, options);
+      },
+
+      /**
+       * 「拓展」页面里本拓展详情下方的设置面板（每个拓展一个）：render({ container, config, saveConfig }) 每次打开详情都调用，
+       * 可返回清理函数。saveConfig(values) 只存本拓展清单 config 里声明过的项，回生效配置。
+       */
+      registerSettingsPanel(definition, options = {}) {
+        return codexPlusRegisterSettingsPanel(definition, options);
       },
 
       /** 在会话行「更多操作」里加一项。 */
@@ -20141,6 +18847,15 @@
     }
   }
 
+  /**
+   * Codex++ 后台经 CDP 发给拓展的公开事件（只认 codexpp/ 前缀），例如会话索引修复结束的
+   * `codexpp/session-index-repaired`。拓展用 ctx.on 订阅。
+   */
+  window.__codexPlusEmitHostEvent = (event, payload) => {
+    if (typeof event !== "string" || !event.startsWith("codexpp/")) return false;
+    codexPlusEmitExtensionEvent(event, [payload]);
+    return true;
+  };
   /** 通知所有监听者。逐个隔离：一个处理器抛错不影响其余。 */
   function codexPlusEmitExtensionEvent(event, args = []) {
     const listeners = codexPlusExtensionListeners.get(event);
@@ -20200,6 +18915,16 @@
       "item/completed",
       "item/agentMessage/delta",
       "error",
+      // 用量与等待用户的通知（Agent 桌宠拓展的大肥鱼用它显示本轮用量、等待审批 / 提问）。
+      "thread/tokenUsage/updated",
+      "item/tool/requestUserInput",
+      "item/commandExecution/requestApproval",
+      "item/fileChange/requestApproval",
+      "item/permissions/requestApproval",
+      "mcpServer/elicitation/request",
+      "serverRequest/resolved",
+      "item/tool/userInputAnswered",
+      "item/approval/responded",
     ];
     try {
       const current = window.__codexPlusExtensionEventBridge;
@@ -20681,6 +19406,9 @@
       },
       registerFloatingTab(definition, itemOptions) {
         return track(codexPlusRegisterFloatingTab(definition, registerOptions(itemOptions)));
+      },
+      registerSettingsPanel(definition, itemOptions) {
+        return track(codexPlusRegisterSettingsPanel(definition, registerOptions(itemOptions)));
       },
       registerToolView(definition, itemOptions) {
         const view = codexPlusRegisterToolView(definition, registerOptions(itemOptions));
@@ -22977,6 +21705,7 @@
    * - registerToolView：对话里的工具调用 / 命令条目末尾挂一块自己的内容（在 activity.after 插槽上），
    *   按工具名或条目类型匹配；render 收到的 call 带工具名、参数、结果（从会话日志里按调用 id 找）。
    * - registerSettingsSection：Codex 设置页左侧导航末尾加一项，点开是拓展自己画的页面。
+   * - registerSettingsPanel：「拓展」页面里本拓展详情下方的设置面板，由 40-backend-settings.js 挂载。
    */
 
   // ---------------------------------------------------------------- 悬浮球页签
@@ -23117,6 +21846,30 @@
       disposeSlot();
       disposePage();
     };
+  }
+
+  // ---------------------------------------------------------------- 拓展详情页的设置面板
+  /**
+   * 每个拓展一个设置面板，登记在注册表里（持久）；面板 DOM 由「拓展」详情页每次打开时向拓展要（瞬态）。
+   * 注册 / 撤销时通知详情页：正显示着这个拓展时重画，热重载后看到的是新代码画的面板。
+   */
+  function codexPlusRegisterSettingsPanel(definition, options = {}) {
+    if (typeof definition?.render !== "function") throw new Error("设置面板需要 render({ container, config, saveConfig })");
+    const scriptKey = codexPlusCurrentExtensionScriptKey(options);
+    const dispose = registerCodexPlusExtension("settingsPanel", codexPlusRegistry.settingsPanels, `${scriptKey}:settingsPanel`, definition, scriptKey);
+    // 详情页宿主在 40-backend-settings.js；单独切出这一段测试时没有它。
+    const changed = () => {
+      if (typeof codexPlusSettingsPanelChanged === "function") codexPlusSettingsPanelChanged(scriptKey);
+    };
+    changed();
+    return () => {
+      dispose();
+      changed();
+    };
+  }
+
+  function codexPlusSettingsPanelFor(scriptKey) {
+    return [...codexPlusRegistry.settingsPanels.values()].find((item) => item.scriptKey === scriptKey) || null;
   }
   // API Key 听写使用独立的 ASR 服务。新版原生 capability / app-host RPC 是只读的，
   // 因此入口与录音由 CPP 管理，识别结果通过原生编辑器事务回填，保持草稿和附件。
@@ -23723,422 +22476,6 @@
     window.removeEventListener("pagehide", codexPlusDictationDispose);
     codexPlusDictationDispose();
   } };
-  // 特效只观察原生编辑事件；不写输入框、不改选区，也不触发 React 输入事务。
-  window.__codexPlusTypingEffectsRuntime?.dispose?.();
-  const codexPlusTypingEffects = {
-    installed: false, disposed: false, mode: "off", canvas: null, context: null,
-    bounds: null, particles: [], frame: null, frameAt: 0, lastBurstAt: -Infinity,
-    editor: null, composition: null, compositionFrame: null, media: null,
-  };
-  const codexPlusTypingEffectMaxParticles = 180;
-  const codexPlusTypingEffectInterval = 40;
-  const codexPlusTypingEffectOwner = "builtin-typing-effects";
-  registerCodexPlusExtensionSelector('[data-codex-plus-ext="builtin-typing-effects"]');
-
-  function codexPlusTypingEffectMode() {
-    if (!!globalThis.__codexPlusBuiltinInactive?.has("typing-effects")) return "off";
-    const value = codexPlusSettings().typingEffect;
-    return ["rainbow", "fireworks", "stars"].includes(value) ? value : "off";
-  }
-
-  function clearCodexPlusTypingEffects(resetComposition = true) {
-    const state = codexPlusTypingEffects;
-    if (state.frame !== null) cancelAnimationFrame(state.frame);
-    state.frame = null;
-    state.canvas?.remove();
-    state.canvas = state.context = state.bounds = state.editor = null;
-    if (resetComposition !== false) {
-      state.composition = null;
-      if (state.compositionFrame !== null) cancelAnimationFrame(state.compositionFrame);
-      state.compositionFrame = null;
-    }
-    state.particles.length = 0;
-    state.frameAt = 0;
-    state.lastBurstAt = -Infinity;
-  }
-
-  function syncCodexPlusTypingEffects() {
-    const state = codexPlusTypingEffects;
-    const mode = codexPlusTypingEffectMode();
-    if (state.mode !== mode || mode === "off" || state.media?.matches || document.hidden) clearCodexPlusTypingEffects();
-    state.mode = mode;
-  }
-
-  function codexPlusTypingEffectEditor(target) {
-    const editor = target?.closest?.('.ProseMirror[contenteditable="true"], textarea, [role="textbox"][contenteditable="true"]');
-    if (!editor?.isConnected || editor.matches(':disabled, [readonly], [contenteditable="false"]')
-        || isExtensionUiNode(editor) || editor.closest('[inert], [aria-hidden="true"]') || !visibleElement(editor)) return null;
-    // 新版有明确 composer 标记；旧版必须与 composer-footer 同属一个局部容器。
-    let composer = editor.closest('[data-codex-composer-root], [data-composer-surface-variant]');
-    if (!composer) {
-      let parent = editor.parentElement;
-      for (let depth = 0; parent && parent !== document.body && depth < 4; depth++, parent = parent.parentElement) {
-        if (parent.querySelector?.('.composer-footer')) { composer = parent; break; }
-        if (parent.tagName === "FORM") break;
-      }
-    }
-    return composer && (document.activeElement === editor || editor.contains(document.activeElement)) ? editor : null;
-  }
-
-  function codexPlusTypingEffectText(editor) {
-    return editor instanceof HTMLTextAreaElement ? editor.value : editor.textContent || "";
-  }
-
-  function codexPlusTypingEffectTextareaCaret(editor) {
-    const style = getComputedStyle(editor);
-    const rect = editor.getBoundingClientRect();
-    const width = editor.offsetWidth || rect.width;
-    const height = editor.offsetHeight || rect.height;
-    // 镜像不显示滚动条，须扣除原生 textarea 的滚动条占用，保持实际换行列宽。
-    const mirrorWidth = editor.clientWidth > 0
-      ? editor.clientWidth + (parseFloat(style.borderLeftWidth) || 0) + (parseFloat(style.borderRightWidth) || 0) : width;
-    const mirror = document.createElement("div");
-    mirror.setAttribute("data-codex-plus-ext", codexPlusTypingEffectOwner);
-    mirror.setAttribute("aria-hidden", "true");
-    // offsetWidth 使用布局尺寸，最终按真实 rect 缩放，兼容编辑器祖先上的 CSS zoom。
-    const properties = ["direction", "fontFamily", "fontSize", "fontWeight", "fontStyle", "fontVariant", "fontStretch",
-      "fontKerning", "fontFeatureSettings", "fontVariationSettings", "lineHeight", "letterSpacing", "wordSpacing", "textTransform", "textIndent", "textAlign", "tabSize", "wordBreak",
-      "paddingTop", "paddingRight", "paddingBottom", "paddingLeft", "borderTopWidth", "borderRightWidth", "borderBottomWidth", "borderLeftWidth"];
-    for (const property of properties) mirror.style[property] = style[property];
-    Object.assign(mirror.style, {
-      position: "fixed", left: "-100000px", top: "0", visibility: "hidden", pointerEvents: "none",
-      boxSizing: "border-box", width: `${mirrorWidth}px`, height: "auto", minHeight: "0", maxHeight: "none",
-      borderStyle: "solid", overflow: "hidden", whiteSpace: editor.wrap === "off" ? "pre" : "pre-wrap",
-      overflowWrap: editor.wrap === "off" ? "normal" : "break-word", zoom: "1",
-    });
-    const position = editor.selectionEnd ?? editor.value.length;
-    mirror.textContent = editor.value.slice(0, position);
-    const marker = document.createElement("span");
-    marker.textContent = editor.value.slice(position) || "\u200b";
-    mirror.appendChild(marker);
-    document.body.appendChild(mirror);
-    try {
-      const mirrorRect = mirror.getBoundingClientRect();
-      const markerRect = marker.getClientRects()[0] || marker.getBoundingClientRect();
-      const mirrorScale = mirrorRect.width / mirrorWidth || 1;
-      const scaleX = rect.width / width || 1;
-      const scaleY = rect.height / height || 1;
-      const lineHeight = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.25 || 20;
-      return {
-        x: rect.left + ((markerRect.left - mirrorRect.left) / mirrorScale - editor.scrollLeft) * scaleX,
-        y: rect.top + ((markerRect.top - mirrorRect.top) / mirrorScale - editor.scrollTop + lineHeight * .55) * scaleY,
-      };
-    } finally { mirror.remove(); }
-  }
-
-  function codexPlusTypingEffectCaret(editor) {
-    const box = editor.getBoundingClientRect();
-    let point;
-    if (editor instanceof HTMLTextAreaElement) point = codexPlusTypingEffectTextareaCaret(editor);
-    else {
-      const selection = window.getSelection?.();
-      if (!selection?.rangeCount || !editor.contains(selection.anchorNode) || !editor.contains(selection.focusNode)) return null;
-      const range = selection.getRangeAt(0).cloneRange();
-      range.collapse(false);
-      let rect = range.getClientRects()[0] || range.getBoundingClientRect();
-      let precedingCharacter = false;
-      if (!rect?.height && range.endContainer?.nodeType === 3 && range.endOffset > 0) {
-        range.setStart(range.endContainer, range.endOffset - 1);
-        rect = range.getBoundingClientRect();
-        precedingCharacter = true;
-      }
-      const style = getComputedStyle(editor);
-      const lineHeight = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.25 || 20;
-      if (rect?.height) point = {
-        x: precedingCharacter && style.direction !== "rtl" ? rect.right : rect.left,
-        y: rect.top + rect.height * .55,
-      };
-      else {
-        // 空段落/BR 的 collapsed Range 可能没有几何，使用所在行而非整个 editor 的首行。
-        let node = range.endContainer?.nodeType === 1 ? range.endContainer : range.endContainer?.parentElement;
-        const child = node?.childNodes?.[range.endOffset] || node?.childNodes?.[Math.max(0, range.endOffset - 1)];
-        if (child?.nodeType === 1) node = child;
-        let fallback = box;
-        let fallbackStyle = style;
-        for (let depth = 0; node && editor.contains(node) && depth < 4; depth++, node = node.parentElement) {
-          const nodeRect = node.getBoundingClientRect?.();
-          if (nodeRect?.height > 0) { fallback = nodeRect; fallbackStyle = getComputedStyle(node); break; }
-        }
-        const scaleX = box.width / (editor.offsetWidth || box.width) || 1;
-        const scaleY = box.height / (editor.offsetHeight || box.height) || 1;
-        const fallbackLineHeight = parseFloat(fallbackStyle.lineHeight) || parseFloat(fallbackStyle.fontSize) * 1.25 || lineHeight;
-        point = {
-          x: fallback.left + (parseFloat(fallbackStyle.paddingLeft) || 0) * scaleX,
-          y: fallback.top + ((parseFloat(fallbackStyle.paddingTop) || 0) + fallbackLineHeight * .55) * scaleY,
-        };
-      }
-    }
-    if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) return null;
-    return { x: Math.max(box.left, Math.min(box.right, point.x)), y: Math.max(box.top, Math.min(box.bottom, point.y)) };
-  }
-
-  function createCodexPlusTypingEffectCanvas() {
-    const state = codexPlusTypingEffects;
-    if (state.canvas?.isConnected) return true;
-    const canvas = document.createElement("canvas");
-    canvas.setAttribute("data-codex-plus-ext", codexPlusTypingEffectOwner);
-    canvas.setAttribute("aria-hidden", "true");
-    Object.assign(canvas.style, {
-      position: "fixed", top: "0", left: "0", width: "100%", height: "100%", pointerEvents: "none",
-      zIndex: "2147483000", background: "transparent",
-    });
-    const context = canvas.getContext("2d");
-    if (!context) return false;
-    document.documentElement.appendChild(canvas);
-    const bounds = canvas.getBoundingClientRect();
-    const ratio = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
-    canvas.width = Math.max(1, Math.round(bounds.width * ratio));
-    canvas.height = Math.max(1, Math.round(bounds.height * ratio));
-    context.setTransform(ratio, 0, 0, ratio, 0, 0);
-    Object.assign(state, { canvas, context, bounds });
-    return true;
-  }
-
-  function drawCodexPlusTypingEffects(timestamp) {
-    const state = codexPlusTypingEffects;
-    state.frame = null;
-    if (state.disposed || state.mode !== codexPlusTypingEffectMode() || state.media?.matches || document.hidden
-        || !state.editor?.isConnected || codexPlusTypingEffectEditor(document.activeElement) !== state.editor || !state.canvas?.isConnected) {
-      clearCodexPlusTypingEffects(); return;
-    }
-    const elapsed = state.frameAt ? Math.max(0, Math.min(32, timestamp - state.frameAt)) : 16;
-    state.frameAt = timestamp;
-    const context = state.context;
-    context.clearRect(0, 0, state.bounds.width, state.bounds.height);
-    state.particles = state.particles.filter((particle) => {
-      particle.age += elapsed;
-      if (particle.age >= particle.life) return false;
-      particle.x += particle.vx * elapsed / 1000;
-      particle.y += particle.vy * elapsed / 1000;
-      particle.vy += particle.gravity * elapsed / 1000;
-      const alpha = (1 - particle.age / particle.life) ** 1.5;
-      context.save();
-      context.globalAlpha = alpha;
-      context.fillStyle = particle.color;
-      context.translate(particle.x - state.bounds.left, particle.y - state.bounds.top);
-      context.rotate(particle.rotation + particle.age / 700);
-      if (particle.star) {
-        context.beginPath();
-        for (let index = 0; index < 10; index++) {
-          const radius = particle.size * (index % 2 ? .42 : 1);
-          const angle = index * Math.PI / 5 - Math.PI / 2;
-          if (index === 0) context.moveTo(Math.cos(angle) * radius, Math.sin(angle) * radius);
-          else context.lineTo(Math.cos(angle) * radius, Math.sin(angle) * radius);
-        }
-        context.closePath(); context.fill();
-      } else context.fillRect(-particle.size / 2, -particle.size / 2, particle.size, particle.size * 1.7);
-      context.restore();
-      return true;
-    });
-    if (state.particles.length) state.frame = requestAnimationFrame(drawCodexPlusTypingEffects);
-    else clearCodexPlusTypingEffects(false);
-  }
-
-  function emitCodexPlusTypingEffects(editor) {
-    const state = codexPlusTypingEffects;
-    syncCodexPlusTypingEffects();
-    if (state.disposed || state.mode === "off" || state.media?.matches || document.hidden) return false;
-    const now = performance.now();
-    if (now - state.lastBurstAt < codexPlusTypingEffectInterval) return false;
-    const point = codexPlusTypingEffectCaret(editor);
-    if (!point || !createCodexPlusTypingEffectCanvas()) return false;
-    state.lastBurstAt = now;
-    state.editor = editor;
-    const count = state.mode === "fireworks" ? 26 : state.mode === "stars" ? 10 : 16;
-    const available = Math.max(0, codexPlusTypingEffectMaxParticles - state.particles.length);
-    if (!available) return false;
-    const hue = now / 9 % 360;
-    for (let index = 0; index < Math.min(count, available); index++) {
-      const angle = state.mode === "fireworks" ? index / count * Math.PI * 2 : -Math.PI + Math.random() * Math.PI;
-      const speed = state.mode === "fireworks" ? 65 + Math.random() * 100 : 35 + Math.random() * 95;
-      state.particles.push({
-        x: point.x, y: point.y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed,
-        gravity: state.mode === "stars" ? 95 : 180, age: 0, life: 420 + Math.random() * 360,
-        size: state.mode === "stars" ? 3 + Math.random() * 3 : 1.5 + Math.random() * 2.2,
-        star: state.mode === "stars", rotation: Math.random() * Math.PI,
-        color: `hsl(${state.mode === "stars" ? 38 + Math.random() * 22 : hue + index * 360 / count} 95% 68%)`,
-      });
-    }
-    if (state.particles.length && state.frame === null) state.frame = requestAnimationFrame(drawCodexPlusTypingEffects);
-    return true;
-  }
-
-  function createCodexPlusTypingEffectComposition(editor, before = codexPlusTypingEffectText(editor)) {
-    return { editor, before, ended: false, emitted: false, lastEmittedText: null, lastInputText: before, sawTrustedInput: false, attempts: 0 };
-  }
-
-  function commitCodexPlusTypingEffectComposition(composition) {
-    const state = codexPlusTypingEffects;
-    if (state.composition !== composition || !composition.data || !composition.trusted
-        || !codexPlusTypingEffectEditor(composition.editor)) return false;
-    const text = codexPlusTypingEffectText(composition.editor);
-    if (composition.emitted && text === composition.committed) return true;
-    // 最终 input 通常紧接组词 input；同一份已绘制文本不重复发射。
-    if (text !== composition.lastEmittedText) {
-      if (text === composition.before || !emitCodexPlusTypingEffects(composition.editor)) return false;
-    }
-    composition.emitted = true;
-    composition.committed = text;
-    composition.lastEmittedText = text;
-    return true;
-  }
-
-  function updateCodexPlusTypingEffectComposition(composition) {
-    const state = codexPlusTypingEffects;
-    if (state.composition !== composition || state.disposed || !codexPlusTypingEffectEditor(composition.editor)) return;
-    let emitted;
-    if (composition.ended) emitted = commitCodexPlusTypingEffectComposition(composition);
-    else {
-      const text = codexPlusTypingEffectText(composition.editor);
-      emitted = text === composition.lastEmittedText || (composition.lastInputData === "" && !composition.backwardDeletion);
-      if (!emitted && (text !== composition.before || composition.backwardDeletion) && emitCodexPlusTypingEffects(composition.editor)) {
-        composition.lastEmittedText = text;
-        emitted = true;
-      }
-    }
-    if (emitted) {
-      if (state.compositionFrame !== null) cancelAnimationFrame(state.compositionFrame);
-      state.compositionFrame = null;
-      composition.attempts = 0;
-    } else if (state.composition === composition && state.compositionFrame === null && composition.attempts < 3) {
-      // 输入法/编辑器可能在事件之后才恢复选区；只做有界补发，不开启常驻扫描。
-      state.compositionFrame = requestAnimationFrame(() => {
-        state.compositionFrame = null;
-        composition.attempts += 1;
-        updateCodexPlusTypingEffectComposition(composition);
-      });
-    }
-  }
-
-  function codexPlusTypingEffectInput(event) {
-    if (event.isTrusted !== true) return;
-    const backwardDeletion = ["deleteContentBackward", "deleteWordBackward", "deleteSoftLineBackward", "deleteHardLineBackward"].includes(event.inputType);
-    if (!backwardDeletion && !["insertText", "insertLineBreak", "insertParagraph", "insertCompositionText", "insertFromComposition"].includes(event.inputType)) return;
-    const editor = codexPlusTypingEffectEditor(event.target);
-    if (!editor) return;
-    const state = codexPlusTypingEffects;
-    let composition = state.composition;
-    const compositionInput = event.isComposing || ["insertCompositionText", "insertFromComposition"].includes(event.inputType);
-    if (compositionInput && (!composition || composition.editor !== editor
-        || (composition.ended && composition.emitted && (event.isComposing || codexPlusTypingEffectText(editor) !== composition.committed)))) {
-      // 部分输入法不会派发 compositionstart，但仍有可信的原生组词 input。
-      if (state.compositionFrame !== null) cancelAnimationFrame(state.compositionFrame);
-      state.compositionFrame = null;
-      composition = state.composition = createCodexPlusTypingEffectComposition(editor, null);
-      if (event.inputType === "insertFromComposition") Object.assign(composition, { ended: true, data: event.data, trusted: true });
-    }
-    if (composition?.editor === editor) {
-      if (backwardDeletion && composition.ended && !event.isComposing) {
-        if (state.compositionFrame !== null) cancelAnimationFrame(state.compositionFrame);
-        state.compositionFrame = null;
-        state.composition = null;
-        emitCodexPlusTypingEffects(editor);
-        return;
-      }
-      if (!composition.ended || !composition.emitted) {
-        const text = codexPlusTypingEffectText(editor);
-        // 输入法退格也可能沿用 insertCompositionText，且清空组词时 data 为空。
-        const shorterPreedit = compositionInput && typeof composition.lastInputText === "string" && text.length < composition.lastInputText.length;
-        Object.assign(composition, {
-          sawTrustedInput: true, lastInputData: event.data, lastInputText: text,
-          backwardDeletion: backwardDeletion || shorterPreedit, attempts: 0,
-        });
-        updateCodexPlusTypingEffectComposition(composition);
-        return;
-      }
-      if (codexPlusTypingEffectText(editor) === composition.committed) return;
-      state.composition = null;
-    }
-    if (event.isComposing || (!backwardDeletion && !["insertText", "insertLineBreak", "insertParagraph"].includes(event.inputType))) return;
-    if (event.inputType === "insertText" && !event.data) return;
-    emitCodexPlusTypingEffects(editor);
-  }
-
-  function codexPlusTypingEffectCompositionStart(event) {
-    if (event.isTrusted !== true) return;
-    syncCodexPlusTypingEffects();
-    if (codexPlusTypingEffects.mode === "off" || codexPlusTypingEffects.media?.matches || document.hidden) return;
-    const editor = codexPlusTypingEffectEditor(event.target);
-    if (editor) {
-      if (codexPlusTypingEffects.compositionFrame !== null) cancelAnimationFrame(codexPlusTypingEffects.compositionFrame);
-      codexPlusTypingEffects.compositionFrame = null;
-      codexPlusTypingEffects.composition = createCodexPlusTypingEffectComposition(editor);
-    }
-  }
-
-  function codexPlusTypingEffectCompositionEnd(event) {
-    const composition = codexPlusTypingEffects.composition;
-    if (!composition || composition.editor !== codexPlusTypingEffectEditor(event.target)) return;
-    // 有些输入法/宿主转发结束事件，isTrusted 为 false；仅接纳之前已观察到的可信组词内容。
-    if (event.isTrusted !== true && (!composition.sawTrustedInput || (event.data && event.data !== composition.lastInputData))) return;
-    if (!event.data) {
-      codexPlusTypingEffects.composition = null;
-      if (codexPlusTypingEffects.compositionFrame !== null) cancelAnimationFrame(codexPlusTypingEffects.compositionFrame);
-      codexPlusTypingEffects.compositionFrame = null;
-      return;
-    }
-    Object.assign(composition, { ended: true, data: event.data, trusted: event.isTrusted === true || composition.sawTrustedInput });
-    queueMicrotask(() => {
-      updateCodexPlusTypingEffectComposition(composition);
-    });
-  }
-
-  function codexPlusTypingEffectFocusOut(event) {
-    const state = codexPlusTypingEffects;
-    if (event.target === state.editor || event.target === state.composition?.editor) clearCodexPlusTypingEffects();
-  }
-
-  /** 摘掉打字特效的全局监听（内置拓展卸下时）。 */
-  function uninstallCodexPlusTypingEffects() {
-    const state = codexPlusTypingEffects;
-    if (!state.installed) return;
-    state.installed = false;
-    document.removeEventListener("input", codexPlusTypingEffectInput, true);
-    document.removeEventListener("compositionstart", codexPlusTypingEffectCompositionStart, true);
-    document.removeEventListener("compositionend", codexPlusTypingEffectCompositionEnd, true);
-    document.removeEventListener("focusout", codexPlusTypingEffectFocusOut, true);
-    document.removeEventListener("visibilitychange", syncCodexPlusTypingEffects);
-    window.removeEventListener("blur", clearCodexPlusTypingEffects);
-    window.removeEventListener("resize", clearCodexPlusTypingEffects);
-    state.media?.removeEventListener?.("change", syncCodexPlusTypingEffects);
-    clearCodexPlusTypingEffects();
-  }
-
-  function installCodexPlusTypingEffects() {
-    const state = codexPlusTypingEffects;
-    if (state.disposed) return;
-    if (!state.installed) {
-      state.installed = true;
-      state.media = window.matchMedia?.("(prefers-reduced-motion: reduce)") || null;
-      document.addEventListener("input", codexPlusTypingEffectInput, true);
-      document.addEventListener("compositionstart", codexPlusTypingEffectCompositionStart, true);
-      document.addEventListener("compositionend", codexPlusTypingEffectCompositionEnd, true);
-      document.addEventListener("focusout", codexPlusTypingEffectFocusOut, true);
-      document.addEventListener("visibilitychange", syncCodexPlusTypingEffects);
-      window.addEventListener("blur", clearCodexPlusTypingEffects);
-      window.addEventListener("resize", clearCodexPlusTypingEffects);
-      state.media?.addEventListener?.("change", syncCodexPlusTypingEffects);
-    }
-    syncCodexPlusTypingEffects();
-  }
-
-  window.__codexPlusTypingEffectsRuntime = {
-    dispose() {
-      const state = codexPlusTypingEffects;
-      state.disposed = true;
-      clearCodexPlusTypingEffects();
-      if (!state.installed) return;
-      document.removeEventListener("input", codexPlusTypingEffectInput, true);
-      document.removeEventListener("compositionstart", codexPlusTypingEffectCompositionStart, true);
-      document.removeEventListener("compositionend", codexPlusTypingEffectCompositionEnd, true);
-      document.removeEventListener("focusout", codexPlusTypingEffectFocusOut, true);
-      document.removeEventListener("visibilitychange", syncCodexPlusTypingEffects);
-      window.removeEventListener("blur", clearCodexPlusTypingEffects);
-      window.removeEventListener("resize", clearCodexPlusTypingEffects);
-      state.media?.removeEventListener?.("change", syncCodexPlusTypingEffects);
-      state.installed = false;
-    },
-  };
   function ensureConversationViewRuntime() {
     if (conversationViewState.runtimeStarted) return;
     conversationViewState.ro = conversationViewState.ro || new ResizeObserver(() => scheduleConversationViewAlign());
@@ -24821,612 +23158,6 @@
     runScanStep(scanLightweight);
     scheduleDeferredScan();
   }
-  // 完整上游引擎的词法宿主：不替换页面全局 API；挂件关闭时释放所有副作用。
-  const codexPlusWhaleFullStoragePrefix = "codexPlus.whale.full.v1.";
-  function codexPlusWhaleFullNumber(value) {
-    if (value === null || value === undefined || value === "") return null;
-    const n = Number(value); return Number.isFinite(n) && n >= 0 ? n : null;
-  }
-  function codexPlusWhaleFullBuiltin(url) {
-    let parsed;
-    try { parsed = new URL(String(url), "https://codex-whale.invalid"); } catch { return ""; }
-    const path = parsed.pathname, id = parsed.searchParams.get("id"), set = parsed.searchParams.get("set");
-    const aliases = { "/dsh-whale/image.png": "DSniang1.png", "/dsh-whale/rua.gif": "rua.gif" };
-    const fragments = { ya1: "Ya1.mp3", ya2: "Ya2.mp3", d1: "D1.mp3", d2: "D2.mp3", exp_orb: "minecraft-exp-orb.wav", end_a: "task-end-a.wav", taskEnd: "task-end-a.wav" };
-    let file = aliases[path];
-    if (path === "/dsh-whale/audio-fragment.wav") file = fragments[id];
-    if (path === "/dsh-whale/bubble-img.png") file = ({ bimg_petpet: "bubble-petpet.gif", bimg_money1: "bubble-money1.gif" })[id];
-    if (/^\/dsh-whale\/sound\/(press|release)\.mp3$/.test(path) && (!set || set === "duck" || set === "fx1")) file = fragments[(set === "fx1" ? "d" : "ya") + (path.includes("press") ? "1" : "2")];
-    if (path === "/dsh-whale/role-image.png" && id === "default") file = "DSniang1.png";
-    return file ? window.__CODEX_PLUS_WHALE_ASSETS__?.[file] || (file === "DSniang1.png" ? window.__CODEX_PLUS_WHALE_IMAGE__ : "") || "" : "";
-  }
-
-  function codexPlusWhaleFullDataResponse(source) {
-    // 直接读取本地内嵌字节，避免 fetch(data:) 受到宿主 connect-src 限制。
-    const match = /^data:((?:audio|image)\/[A-Za-z0-9.+-]+);base64,([A-Za-z0-9+/]*={0,2})$/.exec(source);
-    if (!match) throw new Error("不支持的本地媒体数据");
-    const bytes = Uint8Array.from(atob(match[2]), (character) => character.charCodeAt(0));
-    return new Response(bytes, { status: 200, headers: { "Content-Type": match[1] } });
-  }
-
-  function createCodexPlusWhaleFullRuntime() {
-    const state = { disposed: false, paused: document.hidden === true, timers: new Map(), rafs: new Map(), observers: new Set(), nodes: new Set(), listeners: [], audio: new Set(), pending: new Set(), media: new Map(), objectUrls: new Set(), subscriptions: [], dispatcher: null, sessionId: "", session: null, sessionAt: 0, sessionPending: null, history: null, historyAt: 0, historyPrices: "", historyPending: null, models: [], relayProfiles: [], turn: null, completed: new Set(), seq: 0, pendingWait: null, completion: null, controls: null, serial: 0 };
-    const isolated = Object.create(null);
-    const wrappedMedia = new WeakSet();
-    const storage = {
-      getItem(key) { return localStorage.getItem(codexPlusWhaleFullStoragePrefix + key); },
-      setItem(key, value) { return localStorage.setItem(codexPlusWhaleFullStoragePrefix + key, String(value)); },
-      removeItem(key) { return localStorage.removeItem(codexPlusWhaleFullStoragePrefix + key); },
-    };
-    try { state.seq = Math.max(0, Number(storage.getItem("dshw-last-seq")) || 0); } catch {}
-    state.initialSeq = state.seq;
-    state.priceRevision = 0;
-    state.statRevision = 0;
-    const active = () => !state.disposed;
-    function listen(target, name, callback, options) {
-      const wrapped = typeof callback === "function" ? function (event) { if (active()) callback.call(target, event); } : { handleEvent(event) { if (active()) callback?.handleEvent?.(event); } };
-      target.addEventListener(name, wrapped, options);
-      state.listeners.push({ target, name, callback, wrapped, options });
-    }
-    function unlisten(target, name, callback, options) {
-      for (let i = state.listeners.length - 1; i >= 0; i--) {
-        const entry = state.listeners[i];
-        if (entry.target === target && entry.name === name && entry.callback === callback) {
-          target.removeEventListener(name, entry.wrapped, options ?? entry.options); state.listeners.splice(i, 1);
-        }
-      }
-    }
-    function arm(id, timer) {
-      if (!active() || state.paused) return;
-      timer.native = setTimeout(() => {
-        if (!state.timers.has(id) || !active() || state.paused) return;
-        timer.native = null;
-        if (!timer.repeat) state.timers.delete(id);
-        try { timer.callback(...timer.args); } finally { if (timer.repeat && state.timers.has(id)) arm(id, timer); }
-      }, timer.delay);
-    }
-    function schedule(callback, delay, repeat, args) {
-      if (!active() || typeof callback !== "function") return 0;
-      const id = ++state.serial, timer = { callback, delay: Math.max(0, Number(delay) || 0), repeat, args, native: null };
-      state.timers.set(id, timer); arm(id, timer); return id;
-    }
-    function clearTimer(id) { const timer = state.timers.get(id); if (timer?.native !== null) clearTimeout(timer?.native); state.timers.delete(id); }
-    function raf(callback) {
-      if (!active()) return 0;
-      const id = ++state.serial, frame = { callback, native: null };
-      state.rafs.set(id, frame);
-      if (!state.paused) frame.native = requestAnimationFrame((time) => { state.rafs.delete(id); if (active() && !state.paused) callback(time); });
-      return id;
-    }
-    function cancelRaf(id) { const frame = state.rafs.get(id); if (frame?.native !== null) cancelAnimationFrame(frame?.native); state.rafs.delete(id); }
-    function trackedObserver(Native) {
-      if (typeof Native !== "function") return undefined;
-      return class {
-        constructor(callback) { this.records = []; this.native = new Native((entries, observer) => { if (active() && !state.paused) callback(entries, this); }); state.observers.add(this); }
-        observe(target, options) { this.records.push([target, options]); if (active() && !state.paused) this.native.observe(target, options); }
-        disconnect() { this.native.disconnect(); this.records = []; }
-        takeRecords() { return this.native.takeRecords?.() || []; }
-      };
-    }
-    function trackedAudioContext(options) {
-      const Native = window.AudioContext || window.webkitAudioContext;
-      if (!Native || !active()) throw new Error("音频不可用");
-      const audio = new Native(options); state.audio.add(audio); return audio;
-    }
-    trackedAudioContext.prototype = (window.AudioContext || window.webkitAudioContext)?.prototype || Object.prototype;
-    function bridge(path, payload) {
-      if (!active() || state.paused) return Promise.reject(new Error("挂件已暂停"));
-      return new Promise((resolve, reject) => {
-        let done = false;
-        const finish = (error, value) => { if (done) return; done = true; clearTimeout(timer); state.pending.delete(cancel); error ? reject(error) : resolve(value); };
-        const cancel = () => finish(new Error("挂件请求已取消"));
-        const timer = setTimeout(() => finish(new Error("挂件请求超时")), 45000);
-        state.pending.add(cancel);
-        Promise.resolve(postJson(path, payload)).then((value) => finish(active() ? null : new Error("挂件已关闭"), value), (error) => finish(error));
-      });
-    }
-    function context() {
-      const ref = currentSessionRef() || {}, id = String(ref.session_id || ""), host = String(ref.host_id || "local");
-      if (id !== state.sessionId || host !== state.sessionHost) {
-        state.sessionId = id; state.session = null; state.sessionAt = 0; state.sessionPending = null; state.turn = null; state.pendingWait = null; state.lastTurnResult = null; state.lastTurnPending = null;
-      }
-      state.sessionHost = host; state.sessionRef = ref; state.remote = host !== "local";
-      return id;
-    }
-    function observe(turn, baseline = false) {
-      if (!turn?.id) return;
-      const previous = state.turn;
-      if (!baseline && previous?.id === turn.id && previous.status === "running" && turn.status === "completed" && !state.completed.has(turn.id)) {
-        state.seq += 1; state.completed.add(turn.id);
-        if (state.completed.size > 128) state.completed.delete(state.completed.values().next().value);
-      }
-      if (baseline && turn.status === "completed") state.completed.add(turn.id);
-      state.turn = { id: turn.id, status: turn.status, usage: turn.usage || null };
-    }
-    function setStatsEnabled(value) {
-      const enabled = value !== false;
-      if (state.codexStatsOn === enabled) return;
-      state.codexStatsOn = enabled; state.statRevision += 1;
-      state.history = null; state.historyAt = 0; state.historyPending = null; state.session = null; state.sessionAt = 0; state.sessionPending = null; state.lastTurnResult = null; state.lastTurnPending = null;
-    }
-    async function session() {
-      const id = context();
-      if (!id) return null;
-      if (state.codexStatsOn === false || state.remote) return { status: "ok", sessionId: id, title: state.sessionRef?.title || "", lastTurn: state.turn, total: state.nativeUsage?.total || null, today: null, rateLimits: [] };
-      if (state.session && Date.now() - state.sessionAt < 5000) return state.session;
-      if (state.sessionPending) return state.sessionPending;
-      const baseline = !state.session && !state.turn;
-      const statRevision = state.statRevision;
-      const pending = bridge("/whale/session", { ...state.sessionRef, session_id: id }).then((data) => {
-        if (!active() || context() !== id || statRevision !== state.statRevision || state.codexStatsOn === false || state.remote) return null;
-        state.session = data; state.sessionAt = Date.now();
-        if (data?.status === "ok" && !(Date.now() - (state.nativeTurnAt || 0) < 10000 && state.turn?.id === data.lastTurn?.id && state.turn.status === "completed" && data.lastTurn.status === "running")) observe(data.lastTurn, baseline);
-        return data;
-      }).finally(() => { if (state.sessionPending === pending) state.sessionPending = null; });
-      state.sessionPending = pending; return pending;
-    }
-    function prices() {
-      const result = [];
-      for (const model of state.models) {
-        const price = model.price;
-        if (!price || ![price.hit, price.miss, price.out].every((value) => value !== "" && codexPlusWhaleFullNumber(value) !== null)) continue;
-        const matchIds = model.matchIds?.length ? model.matchIds : [model.id];
-        const currency = String(price.cur || "USD").toUpperCase(), rate = currency === "CNY" ? 1 : codexPlusWhaleFullNumber(price.rate);
-        if (!(rate > 0) || !["CNY", "USD"].includes(currency)) continue;
-        // 匹配交给数据层：精确匹配优先，其次最长的大小写不敏感子串。
-        for (const id of matchIds) result.push({ model: id, currency: "CNY", input: Number(price.miss) * rate, cachedInput: Number(price.hit) * rate, output: Number(price.out) * rate });
-      }
-      return result;
-    }
-    function pricingFingerprint() { return JSON.stringify(state.models.map((model) => ({ id: model.id, price: model.price, matchIds: model.matchIds }))); }
-    async function history(force = false) {
-      if (state.codexStatsOn === false) return { status: "disabled", complete: false, codex: { ok: false, disabled: true } };
-      const quote = prices(), fingerprint = JSON.stringify(quote);
-      if (!force && state.history && state.historyPrices === fingerprint && Date.now() - state.historyAt < 60000) return state.history;
-      if (state.historyPending) return state.historyPending;
-      const revision = state.priceRevision, statRevision = state.statRevision;
-      const pending = bridge("/whale/history", { period: "all", page: 1, pageSize: 500, prices: quote }).then((data) => {
-        if (statRevision !== state.statRevision || state.codexStatsOn === false) return { status: "disabled", complete: false, codex: { ok: false, disabled: true } };
-        if (active() && revision !== state.priceRevision) return history(true);
-        if (active()) { state.history = data; state.historyAt = Date.now(); state.historyPrices = fingerprint; } return data;
-      }).finally(() => { if (state.historyPending === pending) state.historyPending = null; });
-      state.historyPending = pending; return pending;
-    }
-    const toTokens = (period) => {
-      if (state.codexStatsOn === false) return "—";
-      const value = state.history?.periods?.[period]?.usage?.totalTokens ?? state.history?.machineSummary?.[({ today: "todayTokens", month: "monthTokens", all: "totalTokens" })[period]];
-      const number = codexPlusWhaleFullNumber(value);
-      if (number === null) return "—";
-      return number.toLocaleString("zh-CN", { maximumFractionDigits: 0 });
-    };
-    function codexModel(model, summary) {
-      const data = summary?.codex || summary?.machineSummary || {};
-      const total = (period) => codexPlusWhaleFullNumber(summary?.periods?.[period]?.usage?.totalTokens);
-      const limits = state.session?.rateLimits || summary?.rateLimits || [];
-      const windows = limits.filter((entry) => entry.resetAt == null || Number(entry.resetAt) * 1000 > Date.now()).map((entry, index) => ({ usedPct: entry.usedPercent, windowMinutes: entry.windowMinutes || (index === 0 ? 300 : 10080), resetAt: entry.resetAt == null ? null : Number(entry.resetAt) * 1000 }));
-      return { ...model, codex: { ...data, ok: summary?.status === "ok" || summary?.status === "partial" || data.ok === true, complete: summary?.complete === true, deferred: summary?.complete === false ? Math.max(1, summary?.scan?.deferred || 1) : 0, todayTokens: total("today") ?? data.todayTokens, monthTokens: total("month") ?? data.monthTokens, totalTokens: total("all") ?? data.totalTokens, sessions: summary?.scan?.sessions ?? data.sessions ?? 0, days7: data.days7 || (summary?.days || []).slice(-7).map((day) => ({ date: day.date, tokens: day.usage?.totalTokens })), windows: data.windows || { primary: windows[0] || null, secondary: windows[1] || null } }, planSupport: windows.length > 0, plan: windows.length ? { ok: true, usedPct: windows[0].usedPct, remainPct: windows[0].usedPct == null ? null : 100 - windows[0].usedPct, windows: windows.map((entry, index) => ({ id: index === 0 ? "rolling" : "weekly", key: index === 0 ? "rolling" : "weekly", label: index === 0 ? "5h" : "周", usedPct: entry.usedPct, remainPct: entry.usedPct == null ? null : 100 - entry.usedPct, resetAt: entry.resetAt })) } : model.plan };
-    }
-    function subscribe() {
-      const dispatcher = window.__codexPlusRemoteSessionRecoveryDispatcher;
-      if (state.dispatcher === dispatcher && state.onEvent) return;
-      for (const unsubscribe of state.subscriptions.splice(0)) { try { unsubscribe(); } catch {} }
-      state.dispatcher = dispatcher;
-      const onEvent = (payload, method) => {
-        if (!active() || state.paused) return;
-        const data = payload?.params || payload || {}, turn = data.turn || data;
-        const thread = String(data.threadId || data.thread_id || data.conversationId || "").replace(/^local:/, "");
-        if (!thread || thread !== context().replace(/^local:/, "")) return;
-        if (method === "thread/tokenUsage/updated") {
-          state.nativeUsage = data.tokenUsage || null;
-          if (state.turn && data.tokenUsage?.last) state.turn.usage = data.tokenUsage.last;
-        } else if (["serverRequest/resolved", "item/tool/userInputAnswered", "item/approval/responded", "item/completed"].includes(method)) {
-          const id = String(data.requestId || data.itemId || data.item?.id || data.id || "");
-          if (state.pendingWait && (id === state.pendingWait.id || id === state.pendingWait.itemId)) { state.pendingWait = null; void state.controls?.pollWaitState?.(); }
-        } else if (method === "turn/started" || method === "turn/completed") {
-          const id = turn.id || data.turnId;
-          observe({ id, status: method === "turn/started" ? "running" : ({ failed: "failed", interrupted: "aborted", aborted: "aborted" })[turn.status] || "completed", usage: turn.usage });
-          state.nativeTurnAt = Date.now();
-          state.pendingWait = null;
-          state.sessionAt = 0;
-          void state.controls?.pollLastTurn?.();
-        } else {
-          state.pendingWait = { id: String(payload?.id || data.requestId || data.itemId || data.id || ""), itemId: String(data.itemId || ""), kind: method.includes("requestUserInput") || method === "mcpServer/elicitation/request" ? "question" : "approval" };
-          void state.controls?.pollWaitState?.();
-        }
-      };
-      state.onEvent = onEvent;
-      if (!dispatcher?.subscribe) return;
-      for (const method of ["turn/started", "turn/completed", "thread/tokenUsage/updated", "item/tool/requestUserInput", "item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval", "mcpServer/elicitation/request", "serverRequest/resolved", "item/tool/userInputAnswered", "item/approval/responded", "item/completed"]) {
-        try { const remove = dispatcher.subscribe(method, (payload) => onEvent(payload, method)); if (typeof remove === "function") state.subscriptions.push(remove); } catch {}
-      }
-    }
-    function nativeEnvelope(value, depth = 0) {
-      if (!active() || state.paused || !value || typeof value !== "object" || depth > 4) return;
-      if (typeof value.method === "string" && /^(turn\/(started|completed)|thread\/tokenUsage\/updated|item\/(tool\/requestUserInput|commandExecution\/requestApproval|fileChange\/requestApproval|permissions\/requestApproval|completed)|mcpServer\/elicitation\/request|serverRequest\/resolved)$/.test(value.method)) state.onEvent?.(value, value.method);
-      if (value.id != null && (Object.hasOwn(value, "result") || Object.hasOwn(value, "error") || Object.hasOwn(value, "response")) && String(value.id) === state.pendingWait?.id) {
-        state.pendingWait = null; void state.controls?.pollWaitState?.();
-      }
-      for (const key of ["message", "request", "payload", "data", "notification"]) if (value[key] && typeof value[key] === "object") nativeEnvelope(value[key], depth + 1);
-    }
-    async function lastTurn() {
-      await session().catch(() => null);
-      if (state.lastTurnResult?.body?.seq === state.seq) return state.lastTurnResult;
-      if (state.lastTurnPending) return state.lastTurnPending;
-      const seq = state.seq;
-      const turn = state.turn?.status === "completed" ? state.turn : null;
-      let amount = null, currency = null, usage = turn?.usage || state.session?.lastTurn?.usage || null;
-      if (turn && seq > state.initialSeq && prices().length && state.codexStatsOn !== false && !state.remote) {
-        const pending = (async () => {
-        const details = await bridge("/whale/history", { period: "all", sessionId: context().replace(/^local:/, ""), turnId: turn.id, page: 1, pageSize: 500, prices: prices() }).catch(() => null);
-        const totals = {};
-        for (const record of details?.records || []) {
-          if (record.turnId !== turn.id || !record.estimatedCost) continue;
-          const cost = record.estimatedCost; totals[cost.currency] = (totals[cost.currency] || 0) + cost.amount;
-        }
-        const currencies = Object.keys(totals);
-        if (currencies.length === 1) { currency = currencies[0]; amount = totals[currency]; }
-        const result = { status: 200, body: { ok: true, seq, turn, amount, currency, usage, estimated: amount !== null } };
-        if (active() && state.seq === seq) state.lastTurnResult = result;
-        return result;
-        })().finally(() => { if (state.lastTurnPending === pending) state.lastTurnPending = null; });
-        state.lastTurnPending = pending; return pending;
-      }
-      const result = { status: 200, body: { ok: true, seq, turn, amount, currency, usage, estimated: amount !== null } };
-      state.lastTurnResult = result; return result;
-    }
-    async function compatibilityJson(path, method, query, body) {
-      subscribe();
-      if (path === "/dsh-whale/size.json" && method === "GET" && state.startupConfig) return { status: 200, body: state.startupConfig };
-      if (path === "/dsh-whale/last-turn.json") {
-        return lastTurn();
-      }
-      if (path === "/dsh-whale/wait.json") {
-        const data = await session().catch(() => null);
-        return { status: 200, body: { ok: true, sessionName: data?.sessionName || data?.title || state.sessionRef?.title || "", pending: data?.pending || state.pendingWait || null } };
-      }
-      const response = await bridge("/whale/full", { path, method, query, body });
-      if (path === "/dsh-whale/size.json" && method === "PUT" && response?.status === 200) {
-        setStatsEnabled(body.codexStatsOn);
-      }
-      if (path === "/dsh-whale/api-models.json" && response?.body?.ok) {
-        state.relayProfiles = response.body.relayProfiles || state.relayProfiles;
-        setStatsEnabled(response.body.codexStatsOn);
-        const previous = pricingFingerprint();
-        state.models = response.body.models || state.models;
-        if (pricingFingerprint() !== previous) { state.priceRevision += 1; state.history = null; state.historyAt = 0; state.historyPending = null; state.lastTurnResult = null; state.lastTurnPending = null; }
-        if (method === "GET") {
-          const statsOn = response.body.codexStatsOn !== false;
-          const summary = statsOn ? await history().catch(() => null) : null;
-          response.body.models = (response.body.models || []).map((model) => model.id === "codex" ? statsOn ? codexModel(model, summary) : { ...model, codex: { ok: false, disabled: true } } : model);
-        }
-        state.models = response.body.models || state.models;
-      }
-      if (path === "/dsh-whale/usage-records.json" && method === "GET") {
-        state.recordsAccountBase = JSON.parse(JSON.stringify(response.body));
-        const data = await history().catch(() => null);
-        response.body = mergeRecords(response.body, data);
-      }
-      return response;
-    }
-    function mergeRecords(base, data) {
-      if (!data?.today || !data?.days7 || !data?.all) return base;
-      const merge = (account, local) => ({ ...local, ...account, modelTotal: local?.modelTotal, models: local?.models || [], estimatedCosts: local?.estimatedCosts, unpricedRecords: local?.unpricedRecords });
-      const mergeDays = (account, local) => { const days = new Map((local || []).map((day) => [day.date, day])); for (const day of account || []) days.set(day.date, merge(day, days.get(day.date))); return [...days.values()].sort((a, b) => a.date.localeCompare(b.date)); };
-      return { ...base, today: merge(base?.today, data.today), days7: mergeDays(base?.days7, data.days7), all: { ...base?.all, days: mergeDays(base?.all?.days, data.all.days), events: data.all.events || [] }, complete: data.complete, historyPagination: data.pagination, historyArchive: data.archive, ok: true };
-    }
-    const nativeFetch = window.fetch?.bind(window) || globalThis.fetch;
-    function responseOf(result) {
-      if (result?.data) {
-        const bytes = Uint8Array.from(atob(result.data), (c) => c.charCodeAt(0));
-        return new Response(bytes, { status: result.status || 200, headers: { "Content-Type": result.mimeType || "application/octet-stream" } });
-      }
-      return new Response(JSON.stringify(result?.body ?? null), { status: result?.status || 200, headers: { "Content-Type": "application/json" } });
-    }
-    async function fetchCompat(value, options = {}) {
-      if (!active() || state.paused) throw new Error("挂件已暂停");
-      const raw = String(value), builtin = codexPlusWhaleFullBuiltin(raw);
-      if (builtin) return codexPlusWhaleFullDataResponse(builtin);
-      const parsed = new URL(raw, "https://codex-whale.invalid");
-      if (parsed.origin !== "https://codex-whale.invalid" || !parsed.pathname.startsWith("/dsh-whale/")) {
-        // 上游只有本机资源 fetch；用户显式配置的超链接通过 window.open。
-        if (raw.startsWith("data:")) return codexPlusWhaleFullDataResponse(raw);
-        if (raw.startsWith("blob:")) return nativeFetch(raw, options);
-        throw new Error("挂件资源只允许本机桥接");
-      }
-      const method = String(options.method || "GET").toUpperCase();
-      const query = Object.fromEntries(parsed.searchParams.entries());
-      let body = {};
-      if (options.body) { try { body = JSON.parse(options.body); } catch { throw new Error("无效挂件请求"); } }
-      if (options.signal?.aborted) throw new Error("挂件请求已取消");
-      const result = await compatibilityJson(parsed.pathname, method, query, body);
-      if (!active() || options.signal?.aborted) throw new Error("挂件请求已取消");
-      if (result?.builtinFragmentId) {
-        const uri = codexPlusWhaleFullBuiltin("/dsh-whale/audio-fragment.wav?id=" + encodeURIComponent(result.builtinFragmentId));
-        if (!uri) throw new Error("内置音频缺失");
-        return nativeFetch(uri);
-      }
-      return responseOf(result);
-    }
-    async function resolveMedia(path) {
-      const builtin = codexPlusWhaleFullBuiltin(path); if (builtin) return builtin;
-      if (state.media.has(path)) return state.media.get(path);
-      const pending = (async () => {
-      const result = await fetchCompat(path);
-      if (!result.ok) throw new Error("素材加载失败");
-      const blob = await result.blob();
-      if (!active()) throw new Error("挂件已关闭");
-      const objectUrl = URL.createObjectURL(blob); state.objectUrls.add(objectUrl); state.media.set(path, objectUrl); return objectUrl;
-      })().catch((error) => { if (state.media.get(path) === pending) state.media.delete(path); throw error; });
-      state.media.set(path, pending); return pending;
-    }
-    function mediaNode(node) {
-      if (wrappedMedia.has(node)) return node;
-      wrappedMedia.add(node);
-      let proto = node, descriptor;
-      while (proto && !descriptor) { descriptor = Object.getOwnPropertyDescriptor(proto, "src"); proto = Object.getPrototypeOf(proto); }
-      let revision = 0;
-      const set = (value) => { if (descriptor?.set) descriptor.set.call(node, value); else node.setAttribute("src", value); };
-      try { Object.defineProperty(node, "src", { configurable: true, get() { return descriptor?.get ? descriptor.get.call(node) : node.getAttribute("src") || ""; }, set(value) {
-        const rev = ++revision, raw = String(value || "");
-        if (!raw.startsWith("/dsh-whale/")) { if (!raw || /^(data:image\/(png|jpeg|webp|gif|avif);|data:audio\/|blob:)/i.test(raw)) set(raw); return; }
-        const builtin = codexPlusWhaleFullBuiltin(raw);
-        if (builtin) { set(builtin); return; }
-        void resolveMedia(raw).then((url) => { if (active() && rev === revision) set(url); }).catch(() => { if (active() && rev === revision) node.dispatchEvent?.(new Event("error")); });
-      } }); } catch {}
-      return node;
-    }
-    function mark(node) {
-      if (!active()) throw new Error("挂件已关闭");
-      if (!node) return node;
-      node.setAttribute?.("data-codex-plus-ext", "whale-widget");
-      if (["IMG", "AUDIO", "VIDEO", "SOURCE"].includes(node.tagName)) mediaNode(node);
-      return node;
-    }
-    const head = new Proxy(document.head, { get(target, key) {
-      if (["appendChild", "insertBefore", "append", "prepend", "replaceChildren"].includes(key)) return (...args) => { if (!active()) return args[0]; for (const node of args) if (node?.nodeType || node?.tagName) state.nodes.add(node); return target[key](...args); };
-      const value = Reflect.get(target, key, target); return typeof value === "function" ? value.bind(target) : value;
-    } });
-    const doc = new Proxy(document, { get(target, key) {
-      if (key === "head") return head;
-      if (key === "createElement") return (...args) => mark(target.createElement(...args));
-      if (key === "createElementNS") return (...args) => mark(target.createElementNS(...args));
-      if (key === "addEventListener") return (name, callback, options) => listen(target, name, callback, options);
-      if (key === "removeEventListener") return (name, callback, options) => unlisten(target, name, callback, options);
-      const value = Reflect.get(target, key, target); return typeof value === "function" ? value.bind(target) : value;
-    } });
-    const win = new Proxy(window, { get(target, key) {
-      if (key === "__codexPlusWhaleHost") return host;
-      if (typeof key === "string" && (key.startsWith("__dsh") || key === "dshwRegisterMask")) return isolated[key];
-      if (key === "document") return doc;
-      if (key === "localStorage") return storage;
-      if (key === "Image") return image;
-      if (key === "Audio") return audio;
-      if (key === "AudioContext" || key === "webkitAudioContext") return window.AudioContext || window.webkitAudioContext ? trackedAudioContext : undefined;
-      if (key === "addEventListener") return (name, callback, options) => listen(target, name, callback, options);
-      if (key === "removeEventListener") return (name, callback, options) => unlisten(target, name, callback, options);
-      const value = Reflect.get(target, key, target); return typeof value === "function" ? value.bind(target) : value;
-    }, set(target, key, value) { if (typeof key === "string" && (key.startsWith("__dsh") || key === "dshwRegisterMask")) { isolated[key] = value; return true; } return Reflect.set(target, key, value, target); } });
-    function image(width, height) { return mark(new window.Image(width, height)); }
-    image.prototype = window.Image?.prototype || Object.prototype;
-    function audio(url) { const node = mark(new window.Audio()); if (url) node.src = url; return node; }
-    audio.prototype = window.Audio?.prototype || Object.prototype;
-    const host = {
-      active, state, tokens: toTokens,
-      attach(node) { if (active()) state.nodes.add(node); },
-      detach(node) { state.nodes.delete(node); },
-      initialSound() { return state.startupConfig?.sound !== false; },
-      complete(data, show) { state.completion = data; show(data.amount); },
-      completionCost(amount) {
-        const completion = state.completion;
-        if (amount == null) return completion?.usage?.totalTokens == null ? "用量暂不可用" : Number(completion.usage.totalTokens).toLocaleString("zh-CN") + " tokens";
-        return Number(amount).toLocaleString("zh-CN", { maximumFractionDigits: 6 }) + " " + (completion?.currency || "") + "（估算）";
-      },
-      completionModules(modules) {
-        const unknown = state.completion?.amount == null;
-        return modules.map((module) => module.type === "text" ? { ...module, text: String(module.text).replace("上一轮对话消耗:", unknown ? "Codex 任务完成" : "上一轮费用估算:").replace(/^¥\s*/, "") } : module).concat(unknown ? [{ type: "text", text: "未配置单价，费用未知", size: 2, color: "#9fb0d9" }] : []);
-      },
-      recordsPager(body, data, render) {
-        const pagination = data.historyPagination;
-        if (!pagination) return;
-        const area = mark(document.createElement("div")); area.className = "dshwv-usage-hint"; area.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:4px 0 10px";
-        const page = pagination.page || 1, pages = Math.max(1, pagination.pages || 1);
-        const label = mark(document.createElement("span")); label.textContent = `明细第 ${page} / ${pages} 页 · 共 ${pagination.total || 0} 条${data.complete === false ? " · 正在统计" : ""}`; area.appendChild(label);
-        const input = mark(document.createElement("input")); input.type = "search"; input.placeholder = "搜索全部明细：日期或模型"; input.value = state.recordsSearch || ""; input.className = "dshwv-colnat"; input.style.width = "100%"; area.appendChild(input);
-        const request = async (next) => {
-          state.recordsRevision = (state.recordsRevision || 0) + 1;
-          const revision = state.recordsRevision, priceRevision = state.priceRevision;
-          const result = await bridge("/whale/history", { period: "all", page: next, pageSize: pagination.pageSize || 500, search: input.value, prices: prices() }).catch(() => null);
-          if (!active() || !body.isConnected || revision !== state.recordsRevision || priceRevision !== state.priceRevision || !result) return;
-          state.recordsSearch = input.value; render(mergeRecords(state.recordsAccountBase, result));
-        };
-        for (const [text, next, disabled] of [["上一页", page - 1, page <= 1], ["下一页", page + 1, page >= pages]]) {
-          const button = mark(document.createElement("button")); button.type = "button"; button.textContent = text; button.className = "dshwv-snapbtn dshwv-snapbtn-no"; button.disabled = disabled; button.addEventListener("click", () => { void request(next); }); area.appendChild(button);
-        }
-        const search = mark(document.createElement("button")); search.type = "button"; search.textContent = "搜索"; search.className = "dshwv-snapbtn dshwv-snapbtn-ok"; search.addEventListener("click", () => { void request(1); }); area.appendChild(search); input.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); void request(1); } });
-        if (data.historyArchive?.detailRetentionDays) { const note = mark(document.createElement("span")); note.textContent = `明细保留 ${data.historyArchive.detailRetentionDays} 天；更早用量保留在日汇总中。`; note.style.width = "100%"; area.appendChild(note); }
-        body.appendChild(area);
-      },
-      fail(error) { state.initializationError = error?.name || "Error"; console.warn("[Codex++] 完整鲸鱼初始化失败", state.initializationError); },
-      bind(controls) { state.controls = controls; subscribe(); },
-      defaultBubbleItems(items) {
-        const copy = JSON.parse(JSON.stringify(items));
-        if (copy[0]?.modules) copy[0].modules = [
-          { type: "text", text: "Codex 本机用量", size: 8, bold: true },
-          { type: "today", modelId: "codex", size: 20, rgb: "indigo", tpl: "{tokens_today}" },
-          { type: "today", modelId: "codex", size: 4, color: "#9fb0d9", tpl: "今日 tokens · 近7天 {tokens_week}" },
-          { type: "balance", modelId: "current-provider", size: 3, tpl: "供应商余额 {balance}" },
-          { type: "session", size: 3, tpl: "{session}", len: 20 },
-        ];
-        return copy;
-      },
-      profileSelect(selected) {
-        const select = mark(document.createElement("select")); select.className = "dshwv-colnat";
-        const profiles = state.relayProfiles.length ? state.relayProfiles : [{ id: selected || "", name: selected || "当前供应商" }];
-        for (const profile of profiles) { const option = mark(document.createElement("option")); option.value = profile.id; option.textContent = profile.name || profile.id; select.appendChild(option); }
-        select.value = selected || profiles[0]?.id || ""; return select;
-      },
-    };
-    const mutation = trackedObserver(window.MutationObserver), resize = trackedObserver(window.ResizeObserver);
-    const environment = [win, doc, fetchCompat, storage, (fn, ms, ...args) => schedule(fn, ms, false, args), clearTimer, (fn, ms, ...args) => schedule(fn, ms, true, args), clearTimer, raf, cancelRaf, mutation, resize, trackedAudioContext, trackedAudioContext, image, audio];
-    async function initialize() {
-      const configuration = await bridge("/whale/full", { path: "/dsh-whale/size.json", method: "GET", query: {}, body: {} });
-      if (configuration?.status !== 200 || !configuration.body) throw new Error("完整挂件设置读取失败");
-      state.startupConfig = configuration.body;
-      setStatsEnabled(configuration.body.codexStatsOn);
-      let legacy;
-      try { legacy = JSON.parse(localStorage.getItem("codexPlus.whaleWidget.v1") || "null"); } catch {}
-      if (!legacy || storage.getItem("legacy-migrated") === "1") return;
-      if (configuration.body.hasSavedConfig === true) { storage.setItem("legacy-migrated", "1"); return; }
-      // 只迁移用户实际保存过的旧偏好；保存失败保留旧数据并允许下次重试。
-      const send = async (path, method, body) => {
-        const result = await bridge("/whale/full", { path: "/dsh-whale/" + path, method, query: {}, body });
-        if (result?.status !== 200 || result.body?.ok === false) throw new Error("旧挂件偏好迁移失败");
-        return result.body;
-      };
-      if (typeof legacy.image === "string" && /^data:image\/(png|jpeg|webp|gif);base64,/.test(legacy.image) && legacy.image.length <= 1400000) {
-        const roles = await send("roles.json", "GET", {});
-        let imported = (roles.roles || []).find((role) => role.name === "原挂件角色");
-        if (!imported) {
-          const result = await send("roles.json", "POST", { name: "原挂件角色", image: legacy.image, format: legacy.image.startsWith("data:image/gif;") ? "gif" : "png" });
-          imported = (result.roles || []).find((role) => role.name === "原挂件角色");
-        }
-        if (imported?.id) storage.setItem("dshw-role", imported.id);
-      }
-      if (typeof legacy.phrase === "string" && legacy.phrase.trim()) {
-        const config = await send("bubble.json", "GET", {});
-        if (!config.config?.items?.length) await send("bubble.json", "POST", { v: 1, tapAdvance: false, lib: [], items: [{ kind: "custom", modules: [{ type: "text", text: legacy.phrase.slice(0, 120), size: 8 }, { type: "today", modelId: "codex", size: 12, tpl: "今日 {tokens_today} tokens" }] }] });
-      }
-      const limits = Object.values(legacy.thresholds || {}).find((value) => value && typeof value === "object");
-      if (limits) {
-        const patch = { models: { "current-provider": {} } };
-        if (codexPlusWhaleFullNumber(limits.low) > 0) patch.models["current-provider"].alert = { on: true, below: Number(limits.low) };
-        if (codexPlusWhaleFullNumber(limits.budget) > 0) patch.models["current-provider"].budget = { on: true, amount: Number(limits.budget) };
-        await send("usage-settings.json", "PUT", patch);
-      }
-      const base = Math.max(122, Math.min(250, Math.min(window.innerWidth || 1024, window.innerHeight || 768) * 0.28));
-      const config = { ...configuration.body, sound: legacy.sound === true, turnCostOn: legacy.completion !== false };
-      if (codexPlusWhaleFullNumber(legacy.size) > 0) config.scale = Math.min(2.5, Math.max(0.6, Number(legacy.size) / (base * 0.5945)));
-      if (codexPlusWhaleFullNumber(legacy.x) !== null && codexPlusWhaleFullNumber(legacy.y) !== null) {
-        const fullSize = base * (config.scale || 1.5), right = Math.max(0, (window.innerWidth || 1024) - Number(legacy.x) - Number(legacy.size || 88)), bottom = Math.max(0, (window.innerHeight || 768) - Number(legacy.y) - Number(legacy.size || 88));
-        storage.setItem("dshw-pos", JSON.stringify({ v: 2, hAnchor: legacy.x < (window.innerWidth || 1024) / 2 ? "left" : "right", hDist: legacy.x < (window.innerWidth || 1024) / 2 ? Math.max(0, legacy.x - fullSize * 0.4055) : right, vAnchor: legacy.y < (window.innerHeight || 768) / 2 ? "top" : "bottom", vDist: legacy.y < (window.innerHeight || 768) / 2 ? Math.max(0, legacy.y - fullSize * 0.4055) : bottom }));
-      }
-      if (legacy.snap === false) storage.setItem("dshw-snap", JSON.stringify({ v: 3, mode: "off" }));
-      const result = await send("size.json", "PUT", config); state.startupConfig = { ...config, ...result, hasSavedConfig: true };
-      storage.setItem("legacy-migrated", "1");
-    }
-    function pause(paused) {
-      if (state.paused === paused || !active()) return;
-      state.paused = paused;
-      if (paused) {
-        for (const timer of state.timers.values()) { if (timer.native !== null) clearTimeout(timer.native); timer.native = null; }
-        for (const frame of state.rafs.values()) { if (frame.native !== null) cancelAnimationFrame(frame.native); frame.native = null; }
-        for (const observer of state.observers) observer.native.disconnect();
-        for (const cancel of [...state.pending]) cancel();
-        for (const audio of state.audio) { try { void audio.suspend?.().catch?.(() => {}); } catch {} }
-        state.turn = null; state.sessionAt = 0; state.pendingWait = null;
-      } else {
-        for (const [id, timer] of state.timers) arm(id, timer);
-        for (const [id, frame] of state.rafs) frame.native = requestAnimationFrame((time) => { state.rafs.delete(id); if (active() && !state.paused) frame.callback(time); });
-        for (const observer of state.observers) for (const [target, options] of observer.records) observer.native.observe(target, options);
-        context(); subscribe(); void state.controls?.refresh?.(false);
-      }
-    }
-    function dispose() {
-      if (state.disposed) return; state.disposed = true;
-      for (const id of [...state.timers.keys()]) clearTimer(id);
-      for (const id of [...state.rafs.keys()]) cancelRaf(id);
-      for (const observer of state.observers) observer.disconnect(); state.observers.clear();
-      for (const entry of state.listeners.splice(0)) entry.target.removeEventListener(entry.name, entry.wrapped, entry.options);
-      for (const unsubscribe of state.subscriptions.splice(0)) { try { unsubscribe(); } catch {} }
-      for (const cancel of [...state.pending]) cancel();
-      for (const context of state.audio) { try { void context.close?.().catch?.(() => {}); } catch {} } state.audio.clear();
-      for (const node of state.nodes) { if (node.parentNode) node.parentNode.removeChild(node); } state.nodes.clear();
-      for (const url of state.objectUrls) URL.revokeObjectURL(url); state.objectUrls.clear(); state.media.clear();
-      state.controls = null;
-    }
-    listen(document, "visibilitychange", () => pause(document.hidden === true));
-    listen(window, "message", (event) => {
-      if (event.source !== window || (event.origin && event.origin !== "null" && event.origin !== window.location?.origin)) return;
-      nativeEnvelope(event.data);
-    }, true);
-    listen(window, "codex-message-from-view", (event) => nativeEnvelope(event.detail), true);
-    // 设置迁移和首次读取在异步等待中也要记录短任务，绑定原 UI 后统一由 seq 消费。
-    subscribe();
-    return { state, environment, host, active, pause, dispose, initialize, fetch: fetchCompat, context, session, history, observe, subscribe, nativeEnvelope, prices };
-  }
-  // 完整版鲸鱼（大肥鱼）由上游原始引擎 + Codex 数据适配层组成；默认关闭。
-  // 它是「Agent 桌宠」的一种类型：后端 `agentPet` 开启、勾选了 Codex 且类型为 whaleWidget 时才挂载，
-  // 与 97-agent-pet.js 的简单桌宠互斥（那边在选中大肥鱼时不挂载）。
-  window.__codexPlusWhaleWidgetRuntime?.dispose?.();
-  const codexPlusWhaleState = { disposed: false, runtime: null, profile: "", missingSource: false, failedUntil: 0, notice: null };
-  function codexPlusWhaleSelected() {
-    const pet = codexPlusBackendSettings?.agentPet;
-    return Boolean(pet && typeof pet === "object" && pet.enabled === true && pet.kind === "whaleWidget"
-      && (!Array.isArray(pet.agents) || pet.agents.includes("codex")));
-  }
-  function codexPlusWhaleEnabled() {
-    // 大肥鱼是 Agent 桌宠的一种类型：跟着内置拓展「Agent 桌宠」停用 / 被顶替。
-    return !codexPlusWhaleState.disposed && codexPlusBackendSettingsLoaded && codexPlusWhaleSelected()
-      && !globalThis?.__codexPlusBuiltinInactive?.has("agent-pet");
-  }
-  function codexPlusWhaleStop() {
-    codexPlusWhaleState.runtime?.dispose();
-    codexPlusWhaleState.runtime = null;
-    codexPlusWhaleState.notice?.remove(); codexPlusWhaleState.notice = null;
-  }
-  function codexPlusWhaleInitializationFailed(runtime) {
-    runtime?.dispose(); codexPlusWhaleState.runtime = null; codexPlusWhaleState.failedUntil = Date.now() + 10000;
-    if (codexPlusWhaleState.notice) return;
-    const notice = document.createElement("div"); notice.setAttribute("data-codex-plus-ext", "whale-widget"); notice.setAttribute("role", "status");
-    notice.style.cssText = "position:fixed;right:20px;bottom:20px;z-index:2147483600;max-width:320px;padding:12px;border-radius:10px;background:#fff5ec;color:#7c3218;font:12px/1.6 system-ui;box-shadow:0 3px 16px #0002";
-    notice.textContent = "鲸鱼挂件暂时无法加载，10 秒后自动重试。可在 Codex++「Agent 桌宠」页关闭后重新开启。";
-    document.body.appendChild(notice); codexPlusWhaleState.notice = notice;
-  }
-  function codexPlusWhaleProfileFingerprint() {
-    const profile = codexRemoteSessionActiveProfile?.();
-    const settings = codexPlusBackendSettings || {};
-    return JSON.stringify([profile?.id || "", profile?.relayMode || "", settings.codexAppWhaleBalanceProtocol,
-      settings.codexAppWhaleBalancePath, settings.codexAppWhaleBalanceField, settings.codexAppWhaleBalanceCurrency,
-      settings.codexAppWhaleBalanceScale]);
-  }
-  function syncCodexPlusWhaleWidget() {
-    if (!codexPlusWhaleEnabled()) { codexPlusWhaleStop(); codexPlusWhaleState.failedUntil = 0; return; }
-    const profile = codexPlusWhaleProfileFingerprint();
-    if (codexPlusWhaleState.profile !== profile) { codexPlusWhaleStop(); codexPlusWhaleState.failedUntil = 0; }
-    codexPlusWhaleState.profile = profile;
-    if (codexPlusWhaleState.runtime) {
-      codexPlusWhaleState.runtime.context();
-      codexPlusWhaleState.runtime.subscribe();
-      codexPlusWhaleState.runtime.pause(document.hidden === true);
-      return;
-    }
-    // 隐藏窗口等恢复可见后再挂载，不在后台构造音频或轮询会话日志。
-    if (document.hidden) return;
-    if (Date.now() < codexPlusWhaleState.failedUntil) return;
-    if (typeof window.__CODEX_PLUS_WHALE_ENGINE__ !== "function") {
-      if (!codexPlusWhaleState.missingSource) console.warn("[Codex++] 完整鲸鱼运行时未随启动器加载，请重新构建启动器。");
-      codexPlusWhaleState.missingSource = true; codexPlusWhaleInitializationFailed(null); return;
-    }
-    const runtime = createCodexPlusWhaleFullRuntime();
-    codexPlusWhaleState.runtime = runtime;
-    registerCodexPlusExtensionSelector("[data-codex-plus-ext=whale-widget]");
-    void runtime.initialize().then(() => {
-      if (runtime.active() && codexPlusWhaleState.runtime === runtime && codexPlusWhaleEnabled()) {
-        window.__CODEX_PLUS_WHALE_ENGINE__(...runtime.environment);
-        if (runtime.state.initializationError || !runtime.state.controls) throw new Error("完整鲸鱼初始化未完成");
-        codexPlusWhaleState.notice?.remove(); codexPlusWhaleState.notice = null;
-      }
-    }).catch((error) => {
-      if (!runtime.active()) return;
-      if (codexPlusWhaleState.runtime === runtime) codexPlusWhaleInitializationFailed(runtime);
-    });
-  }
-  window.__codexPlusWhaleWidgetRuntime = {
-    version: 3,
-    sync: syncCodexPlusWhaleWidget,
-    dispose() { codexPlusWhaleStop(); codexPlusWhaleState.disposed = true; },
-    get state() { return codexPlusWhaleState.runtime?.state || null; },
-  };
   /**
    * 内置拓展：Codex++ 自带的功能也挂在拓展内核上，和第三方拓展走同一套生命周期
    * （没有特权功能：自带的也能单独停用、被别的拓展顶替）。
@@ -25458,18 +23189,15 @@
    */
   function codexPlusBuiltinExtensionCatalog() {
     return [
-      // 大肥鱼（96-whale-widget.js）是桌宠的一种类型，跟着这个内置拓展一起扫描、一起撤下。
-      { id: "agent-pet", name: "Agent 桌宠", apply: codexPlusAgentPetExtension },
+      // Agent 桌宠（含大肥鱼）已改成随 Codex++ 发布的官方拓展包（bundled:agent-pet），不再是内置拓展。
       { id: "usage-statusline", name: "用量状态栏", apply: codexPlusUsageStatusLineExtension },
       { id: "dictation", name: "语音听写", apply: codexPlusDictationExtension },
       { id: "turn-rewind", name: "轮次回退", apply: codexPlusTurnRewindExtension },
-      { id: "typing-effects", name: "打字特效", apply: codexPlusTypingEffectsExtension },
       { id: "side-chat-save", name: "侧聊保存", apply: codexPlusSideChatSaveExtension },
-      // 由 Rust 经 CDP 驱动，页面侧只登记。
+      // 由 Rust 经 CDP 驱动，页面侧只登记；被顶替时 Rust 侧不再补载，顶替它的拓展订阅 codexpp/session-index-repaired 自己做。
       { id: "history-turn-recovery", name: "历史轮次补全" },
       { id: "capacity-auto-retry", name: "容量不足自动重试", apply: codexPlusCapacityAutoRetryExtension },
       { id: "proxy-request-status", name: "请求状态条", apply: codexPlusProxyStatusExtension },
-      { id: "session-share", name: "会话分享", apply: codexPlusSessionShareExtension },
       { id: "model-picker-groups", name: "模型分组", apply: codexPlusModelPickerGroupsExtension },
       { id: "dream-skin", name: "梦皮主题", apply: codexPlusDreamSkinExtension },
       { id: "plugin-market-unlock", name: "插件市场解锁", apply: codexPlusPluginMarketUnlockExtension },
@@ -25486,9 +23214,10 @@
       // 悬浮球是独立运行时，自己按停用集合判断；这两项让它在装卸、改设置时重新算一次。
       { id: "stepwise", name: "下一步建议", apply: codexPlusStepwiseExtension },
       { id: "answer-outline", name: "回答大纲", apply: codexPlusStepwiseExtension },
-      // 启动器每 5 秒按内置拓展状态决定是否驱动，页面侧无事可做。
+      // 启动器每 5 秒按内置拓展状态决定是否驱动，页面侧无事可做。等价写法：/system/cursor-position + /cdp/evaluate。
       { id: "pet-real-mouse", name: "桌宠跟随鼠标" },
-      // 以下由 Rust 侧（启动、注入、本地代理）按设置项与内置拓展状态生效，多数要重启 Codex，页面侧只登记。
+      // 以下由 Rust 侧（启动、注入、本地代理）按设置项生效，多数要重启 Codex，页面侧只登记。被顶替时 Rust 侧按
+      // 「关」处理（builtin_takeover），顶替它的拓展用 preload（页面最早期脚本）、launch（启动前后）、网关中间件写等价功能。
       { id: "model-whitelist-unlock", name: "模型白名单解锁" },
       { id: "native-fast-unlock", name: "原生 Fast 强制解锁" },
       { id: "native-predictions", name: "原生输入预测" },
@@ -25497,13 +23226,7 @@
       { id: "force-chinese-locale", name: "强制中文界面" },
       { id: "native-browser-identification", name: "原生 Edge / Chrome 请求标识兼容" },
       { id: "standalone-quota-unlock", name: "官方额度解锁" },
-      { id: "image-overlay", name: "背景图" },
     ];
-  }
-
-  function syncCodexPlusPetKinds() {
-    syncCodexPlusAgentPet();
-    if (typeof syncCodexPlusWhaleWidget === "function") syncCodexPlusWhaleWidget();
   }
 
   /** 下发的停用 / 顶替状态：{ disabled: [id], replacedBy: { id: 拓展 key } }。 */
@@ -25619,23 +23342,6 @@
     });
   }
 
-  /** Agent 桌宠：经公开的 overlay 插槽拿容器，桌宠挂在里面（拖动、按压的逻辑在 97-agent-pet.js）。 */
-  function codexPlusAgentPetExtension(ctx) {
-    ctx.registerSlot({
-      slot: "overlay",
-      order: 10,
-      render: ({ container }) => {
-        codexPlusAgentPet.host = container;
-        runScanStep(syncCodexPlusAgentPet);
-        return () => {
-          if (codexPlusAgentPet.host === container) codexPlusAgentPet.host = null;
-          runScanStep(syncCodexPlusAgentPet);
-        };
-      },
-    });
-    codexPlusAlignWith(ctx, syncCodexPlusPetKinds, { settings: "heartbeat", scan: "deferred" });
-  }
-
   /** 用量状态栏：经公开的 composer.below 插槽拿每个输入框下方的容器，状态栏放进当前输入框的那个。 */
   function codexPlusUsageStatusLineExtension(ctx) {
     codexPlusUsageState.slotHosts ||= new Set();
@@ -25680,15 +23386,6 @@
     });
   }
 
-  /** 打字特效：全局输入监听随拓展装卸，模式跟着设置对齐。 */
-  function codexPlusTypingEffectsExtension(ctx) {
-    ctx.effect(() => {
-      installCodexPlusTypingEffects();
-      return () => uninstallCodexPlusTypingEffects();
-    });
-    codexPlusAlignWith(ctx, syncCodexPlusTypingEffects, { settings: "heartbeat" });
-  }
-
   /** 语音听写：输入框 footer 会重建，入口跟着页面扫描补；卸下时撤掉入口并取消进行中的录音。 */
   function codexPlusDictationExtension(ctx) {
     ctx.listen(document, "keydown", codexPlusDictationKeyHandler, true);
@@ -25703,11 +23400,6 @@
   /** 容量不足自动重试：轮询定时器装上时按设置启动，改设置即启停，卸下时清掉定时器与浮标。 */
   function codexPlusCapacityAutoRetryExtension(ctx) {
     codexPlusAlignWith(ctx, syncCodexPlusCapacityAutoRetry, { settings: "heartbeat" });
-  }
-
-  /** 会话分享：顶栏的「分享会话」按钮。 */
-  function codexPlusSessionShareExtension(ctx) {
-    codexPlusAlignWith(ctx, installSessionShareButton, { settings: true });
   }
 
   /** 模型分组：模型菜单的轮询随拓展装上开始；卸下时扫描一次清理分组、停下轮询。 */
@@ -27059,361 +24751,6 @@
       }
     }
   }
-  // Agent 桌宠：Codex 窗口里一个可拖动的小角色，按下以底边为支点压扁、松开回弹，并播放按压 / 松开音。
-  // 图片不随应用打包：经桥接 `/agent-pet/image` 由后端联网下载、缓存后以 data URI 返回。
-  // 内嵌的两组音效随启动器注入（window.__CODEX_PLUS_AGENT_PET_SOUNDS__）；下载音效组和用户导入的自定义音效
-  // 经桥接 `/agent-pet/sound` 取 data URI。一律直接从字节解码，不依赖 fetch(data:)。
-  // 设置读后端的 `agentPet`，与「Codex 增强」总开关无关；目前只有 Codex 一个 Agent。
-  // `agentPet.kind` 为 whaleWidget（大肥鱼）时这里不挂载，由 96-whale-widget.js 显示完整鲸鱼挂件。
-  window.__codexPlusAgentPetRuntime?.dispose?.();
-  const codexPlusAgentPetPositionKey = "codexPlus.agentPet.position.v1";
-  const codexPlusAgentPetSquash = "scaleY(0.88) scaleX(1.05)";
-  // 点按时松开音提前进场的毫秒数，与按压音末尾轻微交叠，听感更「黏」。
-  const codexPlusAgentPetReleaseLeadMs = 40;
-  const codexPlusAgentPet = {
-    disposed: false,
-    root: null,
-    /** overlay 插槽给的容器（内置拓展装上时有）；mountedHost 是桌宠当前挂在的那个（挂在 body 上时为 null）。 */
-    host: null,
-    mountedHost: null,
-    body: null,
-    image: null,
-    imageKey: "",
-    imageRequest: 0,
-    retryAt: 0,
-    failureLogged: false,
-    audio: null,
-    buffers: new Map(),
-    soundKey: "",
-    soundRequest: 0,
-    soundRetryAt: 0,
-    soundFailureLogged: false,
-    press: null,
-    drag: null,
-    cleanup: [],
-  };
-
-  function codexPlusAgentPetSettings() {
-    if (!codexPlusBackendSettingsLoaded) return null;
-    const raw = codexPlusBackendSettings?.agentPet;
-    if (!raw || typeof raw !== "object") return null;
-    const size = Number(raw.size);
-    const volume = Number(raw.volume);
-    return {
-      enabled: raw.enabled === true,
-      // `whaleWidget` 表示选了大肥鱼（完整鲸鱼挂件，见 96-whale-widget.js），其余都按简单桌宠处理。
-      kind: raw.kind === "whaleWidget" ? "whaleWidget" : "image",
-      agents: Array.isArray(raw.agents) ? raw.agents : ["codex"],
-      image: typeof raw.image === "string" ? raw.image : "whale",
-      customImageUrl: typeof raw.customImageUrl === "string" ? raw.customImageUrl : "",
-      size: Number.isFinite(size) ? Math.min(240, Math.max(64, size)) : 112,
-      soundEnabled: raw.soundEnabled !== false,
-      soundSet: typeof raw.soundSet === "string" && raw.soundSet ? raw.soundSet : "duck",
-      customSoundPress: typeof raw.customSoundPress === "string" ? raw.customSoundPress : "",
-      customSoundRelease: typeof raw.customSoundRelease === "string" ? raw.customSoundRelease : "",
-      volume: Number.isFinite(volume) ? Math.min(1, Math.max(0, volume)) : 0.6,
-    };
-  }
-
-  // 选了大肥鱼时简单桌宠不挂载：两者互斥，同一时间只显示一个。
-  function codexPlusAgentPetActive(settings) {
-    return !codexPlusAgentPet.disposed && Boolean(settings?.enabled) && settings.kind !== "whaleWidget"
-      && settings.agents.includes("codex") && !globalThis.__codexPlusBuiltinInactive?.has("agent-pet");
-  }
-
-  function readCodexPlusAgentPetPosition() {
-    try {
-      const value = JSON.parse(localStorage.getItem(codexPlusAgentPetPositionKey) || "null");
-      if (value && Number.isFinite(value.right) && Number.isFinite(value.bottom)) return value;
-    } catch {}
-    // 默认在右下角、输入框上方。
-    return { right: 28, bottom: 132 };
-  }
-
-  function writeCodexPlusAgentPetPosition(position) {
-    try { localStorage.setItem(codexPlusAgentPetPositionKey, JSON.stringify(position)); } catch {}
-  }
-
-  // 以右下角为基准记位置：窗口缩放时桌宠跟着右下角走，再夹回可视区。
-  function placeCodexPlusAgentPet(position) {
-    const root = codexPlusAgentPet.root;
-    if (!root) return;
-    const size = root.offsetWidth || 112;
-    const maxRight = Math.max(0, window.innerWidth - size);
-    const maxBottom = Math.max(0, window.innerHeight - size);
-    const right = Math.min(maxRight, Math.max(0, position.right));
-    const bottom = Math.min(maxBottom, Math.max(0, position.bottom));
-    root.style.right = `${right}px`;
-    root.style.bottom = `${bottom}px`;
-    return { right, bottom };
-  }
-
-  function codexPlusAgentPetAudioContext() {
-    if (codexPlusAgentPet.audio) return codexPlusAgentPet.audio;
-    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-    if (typeof AudioContextClass !== "function") return null;
-    try { codexPlusAgentPet.audio = new AudioContextClass(); } catch { return null; }
-    return codexPlusAgentPet.audio;
-  }
-
-  function decodeCodexPlusAgentPetSound(context, dataUri) {
-    const comma = typeof dataUri === "string" ? dataUri.indexOf(",") : -1;
-    if (comma < 0) return Promise.resolve(null);
-    try {
-      const binary = atob(dataUri.slice(comma + 1));
-      const bytes = new Uint8Array(binary.length);
-      for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
-      return context.decodeAudioData(bytes.buffer).catch(() => null);
-    } catch {
-      return Promise.resolve(null);
-    }
-  }
-
-  // 与后端 `agent_pet::load_sound` 返回的 key 同一规则：自定义音效带文件名，换了文件就重新取。
-  function codexPlusAgentPetSoundKey(settings) {
-    return settings.soundSet === "custom"
-      ? `custom:${settings.customSoundPress}:${settings.customSoundRelease}`
-      : settings.soundSet;
-  }
-
-  function decodeCodexPlusAgentPetSounds(context, key, sounds) {
-    for (const slot of ["press", "release"]) {
-      const bufferKey = `${key}:${slot}`;
-      if (codexPlusAgentPet.buffers.has(bufferKey) || !sounds?.[slot]) continue;
-      codexPlusAgentPet.buffers.set(bufferKey, null);
-      void decodeCodexPlusAgentPetSound(context, sounds[slot]).then((buffer) => {
-        if (buffer) codexPlusAgentPet.buffers.set(bufferKey, buffer);
-        else codexPlusAgentPet.buffers.delete(bufferKey);
-      });
-    }
-  }
-
-  // 下载 / 自定义音效：向后端要一次，失败 30 秒后再试。
-  function requestCodexPlusAgentPetSounds(context, key) {
-    if (codexPlusAgentPet.soundKey === key) return;
-    if (Date.now() < codexPlusAgentPet.soundRetryAt) return;
-    codexPlusAgentPet.soundKey = key;
-    const request = ++codexPlusAgentPet.soundRequest;
-    void Promise.resolve(postJson("/agent-pet/sound", {})).then((result) => {
-      if (request !== codexPlusAgentPet.soundRequest || codexPlusAgentPet.audio !== context) return;
-      if (result?.status !== "ok" || typeof result.key !== "string") {
-        throw new Error(result?.message || result?.status || "音效不可用");
-      }
-      codexPlusAgentPet.soundRetryAt = 0;
-      codexPlusAgentPet.soundFailureLogged = false;
-      decodeCodexPlusAgentPetSounds(context, result.key, result);
-    }).catch((error) => {
-      if (request !== codexPlusAgentPet.soundRequest) return;
-      codexPlusAgentPet.soundKey = "";
-      codexPlusAgentPet.soundRetryAt = Date.now() + 30000;
-      if (!codexPlusAgentPet.soundFailureLogged) {
-        codexPlusAgentPet.soundFailureLogged = true;
-        void sendCodexPlusDiagnostic("agent_pet_sound_failed", { message: String(error?.message || error) });
-      }
-    });
-  }
-
-  // 预解码一组按压 / 松开音；起播走同步路径，手感才贴手。
-  function warmCodexPlusAgentPetSounds(settings) {
-    const context = codexPlusAgentPetAudioContext();
-    if (!context) return;
-    const embedded = window.__CODEX_PLUS_AGENT_PET_SOUNDS__?.[settings.soundSet];
-    if (embedded) decodeCodexPlusAgentPetSounds(context, settings.soundSet, embedded);
-    else requestCodexPlusAgentPetSounds(context, codexPlusAgentPetSoundKey(settings));
-  }
-
-  function playCodexPlusAgentPetSound(settings, slot, delaySeconds = 0) {
-    const context = codexPlusAgentPet.audio;
-    const buffer = codexPlusAgentPet.buffers.get(`${codexPlusAgentPetSoundKey(settings)}:${slot}`);
-    if (!context || !buffer || settings.volume <= 0) return null;
-    try {
-      if (context.state === "suspended") void context.resume();
-      const source = context.createBufferSource();
-      const gain = context.createGain();
-      gain.gain.value = settings.volume;
-      source.buffer = buffer;
-      source.connect(gain).connect(context.destination);
-      const startAt = context.currentTime + Math.max(0, delaySeconds);
-      source.start(startAt);
-      return { source, startAt, duration: buffer.duration };
-    } catch {
-      return null;
-    }
-  }
-
-  function stopCodexPlusAgentPetSound(playing) {
-    try { playing?.source?.stop(); } catch {}
-  }
-
-  function pressCodexPlusAgentPet() {
-    const settings = codexPlusAgentPetSettings();
-    codexPlusAgentPet.body.style.transform = codexPlusAgentPetSquash;
-    stopCodexPlusAgentPetSound(codexPlusAgentPet.press?.release);
-    codexPlusAgentPet.press = { sound: null, release: null };
-    if (!settings?.soundEnabled) return;
-    // 首次按下才建音频上下文（需要用户手势），这次按压的音若还没解码好就静音，下一次就有了。
-    warmCodexPlusAgentPetSounds(settings);
-    codexPlusAgentPet.press.sound = playCodexPlusAgentPetSound(settings, "press");
-  }
-
-  function releaseCodexPlusAgentPet() {
-    const settings = codexPlusAgentPetSettings();
-    codexPlusAgentPet.body.style.transform = "";
-    const press = codexPlusAgentPet.press;
-    if (!press || !settings?.soundEnabled) return;
-    // 点按：松开音排到按压音结束前一点点；按住超过按压音时长：立即播放。
-    let delay = 0;
-    if (press.sound && codexPlusAgentPet.audio) {
-      const end = press.sound.startAt + press.sound.duration - codexPlusAgentPetReleaseLeadMs / 1000;
-      delay = Math.max(0, end - codexPlusAgentPet.audio.currentTime);
-    }
-    press.release = playCodexPlusAgentPetSound(settings, "release", delay);
-  }
-
-  function mountCodexPlusAgentPet(settings) {
-    const root = document.createElement("div");
-    root.setAttribute("data-codex-plus-ext", "agent-pet");
-    root.setAttribute("role", "img");
-    root.setAttribute("aria-label", "Agent 桌宠");
-    root.style.cssText = "position:fixed;z-index:2147483000;display:none;touch-action:none;user-select:none;-webkit-user-select:none;cursor:grab;";
-    const body = document.createElement("div");
-    body.setAttribute("data-codex-plus-ext", "agent-pet");
-    // 与管理器里的预览同一组参数：底边为支点，松开时带一点过冲回弹。
-    body.style.cssText = "width:100%;height:100%;transform-origin:50% 100%;transition:transform .22s cubic-bezier(.34,1.56,.64,1);";
-    const image = document.createElement("img");
-    image.setAttribute("data-codex-plus-ext", "agent-pet");
-    image.alt = "";
-    image.draggable = false;
-    image.style.cssText = "width:100%;height:100%;object-fit:contain;pointer-events:none;filter:drop-shadow(0 4px 8px rgba(0,0,0,.18));";
-    body.appendChild(image);
-    root.appendChild(body);
-    // 内置拓展经公开的 overlay 插槽给了容器就放进去（见 96-builtin-extensions.js），否则直接挂在 body 上。
-    const slotHost = codexPlusAgentPet.host?.isConnected ? codexPlusAgentPet.host : null;
-    (slotHost || document.body).appendChild(root);
-    codexPlusAgentPet.mountedHost = slotHost;
-    codexPlusAgentPet.root = root;
-    codexPlusAgentPet.body = body;
-    codexPlusAgentPet.image = image;
-    registerCodexPlusExtensionSelector("[data-codex-plus-ext=agent-pet]");
-
-    const onPointerDown = (event) => {
-      if (event.button !== 0 && event.pointerType === "mouse") return;
-      event.preventDefault();
-      try { root.setPointerCapture(event.pointerId); } catch {}
-      const current = readCodexPlusAgentPetPosition();
-      codexPlusAgentPet.drag = { id: event.pointerId, x: event.clientX, y: event.clientY, start: current, moved: false };
-      root.style.cursor = "grabbing";
-      pressCodexPlusAgentPet();
-    };
-    const onPointerMove = (event) => {
-      const drag = codexPlusAgentPet.drag;
-      if (!drag || drag.id !== event.pointerId) return;
-      const dx = event.clientX - drag.x;
-      const dy = event.clientY - drag.y;
-      if (!drag.moved && Math.hypot(dx, dy) < 4) return;
-      drag.moved = true;
-      drag.position = placeCodexPlusAgentPet({ right: drag.start.right - dx, bottom: drag.start.bottom - dy });
-    };
-    const onPointerEnd = (event) => {
-      const drag = codexPlusAgentPet.drag;
-      if (!drag || drag.id !== event.pointerId) return;
-      codexPlusAgentPet.drag = null;
-      root.style.cursor = "grab";
-      if (drag.moved && drag.position) writeCodexPlusAgentPetPosition(drag.position);
-      releaseCodexPlusAgentPet();
-    };
-    const onResize = () => placeCodexPlusAgentPet(readCodexPlusAgentPetPosition());
-    root.addEventListener("pointerdown", onPointerDown);
-    root.addEventListener("pointermove", onPointerMove);
-    root.addEventListener("pointerup", onPointerEnd);
-    root.addEventListener("pointercancel", onPointerEnd);
-    root.addEventListener("contextmenu", (event) => event.preventDefault());
-    window.addEventListener("resize", onResize);
-    codexPlusAgentPet.cleanup.push(() => window.removeEventListener("resize", onResize));
-    applyCodexPlusAgentPetSize(settings);
-  }
-
-  function applyCodexPlusAgentPetSize(settings) {
-    const root = codexPlusAgentPet.root;
-    if (!root) return;
-    const size = `${settings.size}px`;
-    if (root.style.width !== size) {
-      root.style.width = size;
-      root.style.height = size;
-      placeCodexPlusAgentPet(readCodexPlusAgentPetPosition());
-    }
-  }
-
-  function unmountCodexPlusAgentPet() {
-    codexPlusAgentPet.cleanup.splice(0).forEach((cleanup) => cleanup());
-    codexPlusAgentPet.root?.remove();
-    codexPlusAgentPet.root = null;
-    codexPlusAgentPet.body = null;
-    codexPlusAgentPet.image = null;
-    codexPlusAgentPet.imageKey = "";
-    codexPlusAgentPet.imageRequest += 1;
-    codexPlusAgentPet.drag = null;
-    codexPlusAgentPet.press = null;
-    try { void codexPlusAgentPet.audio?.close(); } catch {}
-    codexPlusAgentPet.audio = null;
-    codexPlusAgentPet.buffers.clear();
-    codexPlusAgentPet.soundKey = "";
-    codexPlusAgentPet.soundRequest += 1;
-  }
-
-  function loadCodexPlusAgentPetImage(settings) {
-    const key = settings.image === "custom" ? `custom:${settings.customImageUrl}` : settings.image;
-    if (codexPlusAgentPet.imageKey === key) return;
-    if (Date.now() < codexPlusAgentPet.retryAt) return;
-    codexPlusAgentPet.imageKey = key;
-    const request = ++codexPlusAgentPet.imageRequest;
-    void Promise.resolve(postJson("/agent-pet/image", {})).then((result) => {
-      if (request !== codexPlusAgentPet.imageRequest || !codexPlusAgentPet.image) return;
-      if (result?.status !== "ok" || typeof result.image !== "string" || !result.image.startsWith("data:image/")) {
-        throw new Error(result?.message || result?.status || "图片不可用");
-      }
-      codexPlusAgentPet.image.src = result.image;
-      codexPlusAgentPet.root.style.display = "block";
-      codexPlusAgentPet.retryAt = 0;
-      codexPlusAgentPet.failureLogged = false;
-      placeCodexPlusAgentPet(readCodexPlusAgentPetPosition());
-    }).catch((error) => {
-      if (request !== codexPlusAgentPet.imageRequest) return;
-      // 下载失败（离线、地址失效）：30 秒后再试，期间不显示空白框。
-      codexPlusAgentPet.imageKey = "";
-      codexPlusAgentPet.retryAt = Date.now() + 30000;
-      if (!codexPlusAgentPet.failureLogged) {
-        codexPlusAgentPet.failureLogged = true;
-        void sendCodexPlusDiagnostic("agent_pet_image_failed", { message: String(error?.message || error) });
-      }
-    });
-  }
-
-  function syncCodexPlusAgentPet() {
-    const settings = codexPlusAgentPetSettings();
-    if (!codexPlusAgentPetActive(settings)) {
-      if (codexPlusAgentPet.root) unmountCodexPlusAgentPet();
-      codexPlusAgentPet.retryAt = 0;
-      return;
-    }
-    if (!document.body) return;
-    const wantedHost = codexPlusAgentPet.host?.isConnected ? codexPlusAgentPet.host : null;
-    if (!codexPlusAgentPet.root || !codexPlusAgentPet.root.isConnected || codexPlusAgentPet.mountedHost !== wantedHost) {
-      if (codexPlusAgentPet.root) unmountCodexPlusAgentPet();
-      mountCodexPlusAgentPet(settings);
-    }
-    applyCodexPlusAgentPetSize(settings);
-    // 挂载后就预解码当前音效组（上下文此时可能是 suspended，按下时再 resume），第一次按压也有声音。
-    if (settings.soundEnabled) warmCodexPlusAgentPetSounds(settings);
-    loadCodexPlusAgentPetImage(settings);
-  }
-
-  window.__codexPlusAgentPetRuntime = {
-    version: 1,
-    sync: syncCodexPlusAgentPet,
-    dispose() { unmountCodexPlusAgentPet(); codexPlusAgentPet.disposed = true; },
-    get state() { return { mounted: Boolean(codexPlusAgentPet.root), imageKey: codexPlusAgentPet.imageKey, dragging: Boolean(codexPlusAgentPet.drag) }; },
-  };
   window.__codexPlusScanScheduleCleanup?.();
   clearTimeout(window.__codexSessionDeleteScanTimer);
   cancelAnimationFrame(window.__codexSessionDeleteDeferredRaf);

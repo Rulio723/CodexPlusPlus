@@ -29,18 +29,15 @@
    */
   function codexPlusBuiltinExtensionCatalog() {
     return [
-      // 大肥鱼（96-whale-widget.js）是桌宠的一种类型，跟着这个内置拓展一起扫描、一起撤下。
-      { id: "agent-pet", name: "Agent 桌宠", apply: codexPlusAgentPetExtension },
+      // Agent 桌宠（含大肥鱼）已改成随 Codex++ 发布的官方拓展包（bundled:agent-pet），不再是内置拓展。
       { id: "usage-statusline", name: "用量状态栏", apply: codexPlusUsageStatusLineExtension },
       { id: "dictation", name: "语音听写", apply: codexPlusDictationExtension },
       { id: "turn-rewind", name: "轮次回退", apply: codexPlusTurnRewindExtension },
-      { id: "typing-effects", name: "打字特效", apply: codexPlusTypingEffectsExtension },
       { id: "side-chat-save", name: "侧聊保存", apply: codexPlusSideChatSaveExtension },
-      // 由 Rust 经 CDP 驱动，页面侧只登记。
+      // 由 Rust 经 CDP 驱动，页面侧只登记；被顶替时 Rust 侧不再补载，顶替它的拓展订阅 codexpp/session-index-repaired 自己做。
       { id: "history-turn-recovery", name: "历史轮次补全" },
       { id: "capacity-auto-retry", name: "容量不足自动重试", apply: codexPlusCapacityAutoRetryExtension },
       { id: "proxy-request-status", name: "请求状态条", apply: codexPlusProxyStatusExtension },
-      { id: "session-share", name: "会话分享", apply: codexPlusSessionShareExtension },
       { id: "model-picker-groups", name: "模型分组", apply: codexPlusModelPickerGroupsExtension },
       { id: "dream-skin", name: "梦皮主题", apply: codexPlusDreamSkinExtension },
       { id: "plugin-market-unlock", name: "插件市场解锁", apply: codexPlusPluginMarketUnlockExtension },
@@ -57,9 +54,10 @@
       // 悬浮球是独立运行时，自己按停用集合判断；这两项让它在装卸、改设置时重新算一次。
       { id: "stepwise", name: "下一步建议", apply: codexPlusStepwiseExtension },
       { id: "answer-outline", name: "回答大纲", apply: codexPlusStepwiseExtension },
-      // 启动器每 5 秒按内置拓展状态决定是否驱动，页面侧无事可做。
+      // 启动器每 5 秒按内置拓展状态决定是否驱动，页面侧无事可做。等价写法：/system/cursor-position + /cdp/evaluate。
       { id: "pet-real-mouse", name: "桌宠跟随鼠标" },
-      // 以下由 Rust 侧（启动、注入、本地代理）按设置项与内置拓展状态生效，多数要重启 Codex，页面侧只登记。
+      // 以下由 Rust 侧（启动、注入、本地代理）按设置项生效，多数要重启 Codex，页面侧只登记。被顶替时 Rust 侧按
+      // 「关」处理（builtin_takeover），顶替它的拓展用 preload（页面最早期脚本）、launch（启动前后）、网关中间件写等价功能。
       { id: "model-whitelist-unlock", name: "模型白名单解锁" },
       { id: "native-fast-unlock", name: "原生 Fast 强制解锁" },
       { id: "native-predictions", name: "原生输入预测" },
@@ -68,13 +66,7 @@
       { id: "force-chinese-locale", name: "强制中文界面" },
       { id: "native-browser-identification", name: "原生 Edge / Chrome 请求标识兼容" },
       { id: "standalone-quota-unlock", name: "官方额度解锁" },
-      { id: "image-overlay", name: "背景图" },
     ];
-  }
-
-  function syncCodexPlusPetKinds() {
-    syncCodexPlusAgentPet();
-    if (typeof syncCodexPlusWhaleWidget === "function") syncCodexPlusWhaleWidget();
   }
 
   /** 下发的停用 / 顶替状态：{ disabled: [id], replacedBy: { id: 拓展 key } }。 */
@@ -190,23 +182,6 @@
     });
   }
 
-  /** Agent 桌宠：经公开的 overlay 插槽拿容器，桌宠挂在里面（拖动、按压的逻辑在 97-agent-pet.js）。 */
-  function codexPlusAgentPetExtension(ctx) {
-    ctx.registerSlot({
-      slot: "overlay",
-      order: 10,
-      render: ({ container }) => {
-        codexPlusAgentPet.host = container;
-        runScanStep(syncCodexPlusAgentPet);
-        return () => {
-          if (codexPlusAgentPet.host === container) codexPlusAgentPet.host = null;
-          runScanStep(syncCodexPlusAgentPet);
-        };
-      },
-    });
-    codexPlusAlignWith(ctx, syncCodexPlusPetKinds, { settings: "heartbeat", scan: "deferred" });
-  }
-
   /** 用量状态栏：经公开的 composer.below 插槽拿每个输入框下方的容器，状态栏放进当前输入框的那个。 */
   function codexPlusUsageStatusLineExtension(ctx) {
     codexPlusUsageState.slotHosts ||= new Set();
@@ -251,15 +226,6 @@
     });
   }
 
-  /** 打字特效：全局输入监听随拓展装卸，模式跟着设置对齐。 */
-  function codexPlusTypingEffectsExtension(ctx) {
-    ctx.effect(() => {
-      installCodexPlusTypingEffects();
-      return () => uninstallCodexPlusTypingEffects();
-    });
-    codexPlusAlignWith(ctx, syncCodexPlusTypingEffects, { settings: "heartbeat" });
-  }
-
   /** 语音听写：输入框 footer 会重建，入口跟着页面扫描补；卸下时撤掉入口并取消进行中的录音。 */
   function codexPlusDictationExtension(ctx) {
     ctx.listen(document, "keydown", codexPlusDictationKeyHandler, true);
@@ -274,11 +240,6 @@
   /** 容量不足自动重试：轮询定时器装上时按设置启动，改设置即启停，卸下时清掉定时器与浮标。 */
   function codexPlusCapacityAutoRetryExtension(ctx) {
     codexPlusAlignWith(ctx, syncCodexPlusCapacityAutoRetry, { settings: "heartbeat" });
-  }
-
-  /** 会话分享：顶栏的「分享会话」按钮。 */
-  function codexPlusSessionShareExtension(ctx) {
-    codexPlusAlignWith(ctx, installSessionShareButton, { settings: true });
   }
 
   /** 模型分组：模型菜单的轮询随拓展装上开始；卸下时扫描一次清理分组、停下轮询。 */

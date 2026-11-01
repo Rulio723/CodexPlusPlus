@@ -60,8 +60,6 @@ function harness(windowState: Record<string, unknown> = {}) {
       handles.push(handle);
       return handle;
     },
-    installCodexPlusTypingEffects: () => calls.push("typing:install"),
-    uninstallCodexPlusTypingEffects: () => calls.push("typing:uninstall"),
     refreshDreamSkin: () => calls.push("dream:refresh"),
     syncCodexPlusCapacityAutoRetry: () => calls.push("capacity:sync"),
     syncWeixinDesktopThreads: async () => { calls.push("weixin:sync"); },
@@ -99,13 +97,12 @@ function harness(windowState: Record<string, unknown> = {}) {
   return { api, calls, services, known, listeners, interceptors, domListeners, emit, chain, stepOwners };
 }
 
-test("内置拓展装上时登记扫描步骤、挂打字特效监听；停用后撤掉", () => {
+test("内置拓展装上时登记扫描步骤；停用后撤掉", () => {
   (globalThis as any).__codexPlusScanSteps = undefined;
   (globalThis as any).__codexPlusBuiltinInactive = undefined;
   const { api, calls, known, stepOwners } = harness();
   api.sync();
-  assert.ok(calls.includes("typing:install"));
-  for (const id of ["dream-skin", "side-chat-save", "agent-pet", "dictation", "plugin-market-unlock", "session-delete", "thread-id-badge", "conversation-view"]) {
+  for (const id of ["dream-skin", "side-chat-save", "dictation", "plugin-market-unlock", "session-delete", "thread-id-badge", "conversation-view"]) {
     assert.ok(stepOwners().has(`builtin:${id}`), `${id} 经 ctx.onScan 登记扫描步骤`);
   }
   assert.deepEqual(stepOwners().get("builtin:turn-rewind"), ["light"], "轮次回退跟着轻量扫描");
@@ -116,11 +113,10 @@ test("内置拓展装上时登记扫描步骤、挂打字特效监听；停用�
   calls.length = 0;
   api.runSteps();
   assert.ok(calls.includes("dream:refresh"), "扫描循环经登记的步骤刷新梦皮");
-  (known.window as any).__codexPlusBuiltinExtensionState = { disabled: ["dream-skin", "typing-effects"], replacedBy: {} };
+  (known.window as any).__codexPlusBuiltinExtensionState = { disabled: ["dream-skin"], replacedBy: {} };
   calls.length = 0;
   api.sync();
   assert.ok(!stepOwners().has("builtin:dream-skin"), "停用后扫描不再点名它");
-  assert.ok(calls.includes("typing:uninstall"), "停用后摘掉打字特效的全局监听");
   calls.length = 0;
   api.runSteps();
   assert.ok(!calls.includes("dream:refresh"));
@@ -215,7 +211,6 @@ test("改了设置（settings/changed）时跟着设置走的内置拓展立即�
   (globalThis as any).__codexPlusScanSteps = undefined;
   (globalThis as any).__codexPlusBuiltinInactive = undefined;
   const { api, calls, known, emit } = harness();
-  known.installSessionShareButton = () => calls.push("share:install");
   known.syncStepwisePanel = () => calls.push("stepwise:sync");
   known.syncCodexPlusTurnRewind = () => calls.push("rewind:sync");
   (known.window as any).__codexStepwisePanel = { loadSettings: async () => { calls.push("stepwise:load"); } };
@@ -223,13 +218,13 @@ test("改了设置（settings/changed）时跟着设置走的内置拓展立即�
   calls.length = 0;
   emit("settings/loaded", { reason: "heartbeat" });
   assert.ok(calls.includes("capacity:sync") && calls.includes("dream:refresh"), "心跳叫醒对齐便宜的功能");
-  assert.ok(!calls.includes("share:install") && !calls.includes("stepwise:sync") && !calls.includes("rewind:sync"), "心跳不叫醒只跟改动走的功能");
+  assert.ok(!calls.includes("stepwise:sync") && !calls.includes("rewind:sync"), "心跳不叫醒只跟改动走的功能");
   calls.length = 0;
   emit("settings/loaded", { reason: "startup" });
-  for (const call of ["share:install", "stepwise:sync", "rewind:sync", "capacity:sync"]) assert.ok(calls.includes(call), call);
+  for (const call of ["stepwise:sync", "rewind:sync", "capacity:sync"]) assert.ok(calls.includes(call), call);
   calls.length = 0;
   emit("settings/changed", { key: "codexAppTurnRewind", value: true, persisted: false });
-  for (const call of ["rewind:sync", "capacity:sync", "share:install"]) assert.ok(calls.includes(call), call);
+  for (const call of ["rewind:sync", "capacity:sync"]) assert.ok(calls.includes(call), call);
   assert.ok(!calls.includes("stepwise:load"), "还没写进后端时不让悬浮球重读设置");
   calls.length = 0;
   emit("settings/changed", { key: "codexAppAnswerOutlineEnabled", value: true, persisted: true });

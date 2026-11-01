@@ -101,7 +101,7 @@ test("启动 Codex 一眼可见：Codex 页面顶栏最右侧一个主按钮，�
   for (const id of ["relay", "multiLaunch", "enhance", "dreamSkin", "userScripts", "pluginMarket", "weixin", "agentSettings"]) {
     assert.ok(codexRoutes.includes(id), `${id} 属于 Codex，顶栏要显示启动按钮`);
   }
-  for (const id of ["hub", "gatewayProviders", "gateway", "gatewayUsage", "sessions", "claude", "settings", "agentPet"]) {
+  for (const id of ["hub", "gatewayProviders", "gateway", "gatewayUsage", "sessions", "claude", "settings"]) {
     assert.ok(!codexRoutes.includes(id), `${id} 不属于 Codex，顶栏不放启动按钮`);
   }
   // 网关总览面向所有 Agent，不放专门的「启动 Codex」按钮。
@@ -244,7 +244,7 @@ test("安装维护并进设置页：设置分组只有一个页面，设置页�
   // 合并后的设置页用左侧分类目录，目录里的每一项都对应一张卡片。
   assert.match(app, /<PageSectionNav label=\{t\("设置分类"\)\} sections=\{codexSettingsSections\(\)\} \/>/);
   const ids = [...text.slice(text.indexOf("function codexSettingsSections"), text.indexOf("const EXPERIMENTAL_TITLE")).matchAll(/id: "([^"]+)"/g)].map((match) => match[1]);
-  assert.ok(ids.length >= 7);
+  assert.ok(ids.length >= 6);
   for (const id of ids) assert.match(text, new RegExp(`<Panel id="${id}">`));
   assert.ok(app.indexOf("<AgentSettingsScreen") < app.indexOf("<MaintenanceScreen"), "设置在上、安装维护在下");
 });

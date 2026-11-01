@@ -311,6 +311,8 @@ Codex 的负载转成 dsh 的事件参数：`tool_name` → `exec.name`（`Bash`
 | `sessionQuery.observeSession` | 会话在本进程的镜像里时给 `source: 'live'` 的切面（带投影的当前值），否则从 Codex 会话记录读 `prepared` 切面；`cursor` 为最后一个事件的 seq | 与 dsh 一样是切面，之后的变化用 `session/event` / `sessionProjections.onChanged` 跟 |
 | `agent/pre-step` 删改用户原话 | UserPromptSubmit 钩子里记下「原话 → 插件给的消息」（落盘），经 Codex++ 代理的请求里每次都把那条用户消息换掉 | 官方直连的请求不经代理，原话照旧 |
 
+第九期之后，Codex++ 自己这一侧也补齐了：Rust 侧生效的内置功能可被拓展顶替（新增 `preload` / `launch` 两个时机），网关的请求转换、鉴权头、官方整理、请求日志都可由拓展接管，管理器页面可由拓展贡献与顶替，见 `2026-10-30-codexpp-extension-system-design.md`「补齐剩余差距」。
+
 判定做不到的（原因）：
 
 - **替换 Codex 的 agent 循环与会话存储、`workflowEngine` / `ptcRuntime`、`setLocale`**：内核不在 Codex++ 手里（任务明确不做）。
@@ -363,3 +365,20 @@ Codex 的负载转成 dsh 的事件参数：`tool_name` → `exec.name`（`Bash`
 - 作者打包问题：依赖没声明或没发布、包里没有构建产物、传递依赖里写着 `link:` / `workspace:`、MCP 行缺 `command`。
 - 只在实测沙箱里失败（9 行）：插件直接写 `~/.dsh/...` 或开调试端口，真实导入时不受影响。
 - 3 个前端插件入口超过 4 MiB（4.8~22 MiB），不加载。
+
+**第二轮（同日，同一批样本）**：按剩下的原因里「替身缺口」那一类再补，整批重跑对比，没有包变差；
+完全没有问题行的包 137 → 143，问题行 104 → 98，导入失败 6 → 5。
+
+- 子路径导出：`@deepseek-ai/dsh-llm/message`、`@deepseek-ai/dsh-token-meter/estimate`（替身表按完整说明符匹配，子路径要单独登记）。
+- 新替身 `@deepseek-ai/dsh-client-connection`：插件只用它的协议常量（`API_PATH`、`RpcId`）与 RPC 信封校验器（`clientRequestSchema` 等，
+  实现 `parse` / `safeParse`）；真包依赖 dsh-llm / dsh-tools 等运行时，不能装。
+- 补导出：dsh-llm 的图片 / 文件占位文字（`offloadedImageText` 等，与 dsh 逐字一致）；dsh-credentials 改成 dsh 现在的写法
+  （引用就是环境变量名字符串、键是 `<scope>/<id>`，加 `isCredentialRefName` 等）；dsh-tools 的 `JsonSchemaError` 与子集检查
+  `assertSupportedJsonSchema` / `assertObjectJsonSchema`；`renderToolsSdk` 只在 PTC 模式用到，Codex 没有，调用时说明原因；
+  dsh-session-title 的 `SessionTitleProviderId`、`normalizeSessionTitle` 等纯函数。
+- 装上的 dsh 包（bundle 行引用的官方模块、纯逻辑库）把工具包写成 peer 时，补装后再装一轮；`dsh-session-title-llm` 当纯逻辑库装真包。
+- 插件调用 `process.exit`（`dsh-plugin-boom` 在模块顶层就退出）：宿主自己的进程（分析、MCP、常驻进程）里换成抛错，
+  这一行报出原因、同包别的行照常；之前整个分析没有报告。
+
+这一轮之后剥出来的下一层都是 dsh 运行时（`sessionPersistence`、`dsh-workspace`、`dsh-sandbox-policy`、`dsh-subagent` 运行时包等）。
+另有 3 个包在 `dependencies` 里写了宿主提供的包（真 dsh-tools 等），装上的是真包、又引用替身没有的旧导出，暂不处理。

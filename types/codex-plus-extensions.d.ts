@@ -15,7 +15,6 @@ type CodexPlusToastType = "info" | "success" | "warn" | "error";
 /** 当前开放给拓展调用的后端路由。新增路由需在接口层显式决定。 */
 type CodexPlusExtensionRoute =
   | "/diagnostics/log"
-  | "/session/export"
   | "/thread-usage-history"
   | "/archived-thread"
   | "/export-markdown"
@@ -673,6 +672,10 @@ interface CodexPlusManagerPanelApi {
   toast(message: string): Promise<null>;
   theme(): Promise<"dark" | "light">;
   onTheme(handler: (theme: "dark" | "light") => void): () => void;
+  /** 读清单 `manager.data` 里声明过的只读管理器数据。 */
+  data(name: "requestFlow" | "requestLogs" | "gatewayUsage" | "localSessions", params?: Record<string, unknown>): Promise<unknown>;
+  /** 跳到管理器的另一个页面：路由 id（如 "hub"），或 "ext:<拓展 key>" 打开另一个拓展页面。 */
+  navigate(target: string): Promise<null>;
 }
 
 interface Window {

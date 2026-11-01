@@ -594,6 +594,15 @@
     }
   }
 
+  /**
+   * Codex++ 后台经 CDP 发给拓展的公开事件（只认 codexpp/ 前缀），例如会话索引修复结束的
+   * `codexpp/session-index-repaired`。拓展用 ctx.on 订阅。
+   */
+  window.__codexPlusEmitHostEvent = (event, payload) => {
+    if (typeof event !== "string" || !event.startsWith("codexpp/")) return false;
+    codexPlusEmitExtensionEvent(event, [payload]);
+    return true;
+  };
   /** 通知所有监听者。逐个隔离：一个处理器抛错不影响其余。 */
   function codexPlusEmitExtensionEvent(event, args = []) {
     const listeners = codexPlusExtensionListeners.get(event);
@@ -653,6 +662,16 @@
       "item/completed",
       "item/agentMessage/delta",
       "error",
+      // 用量与等待用户的通知（Agent 桌宠拓展的大肥鱼用它显示本轮用量、等待审批 / 提问）。
+      "thread/tokenUsage/updated",
+      "item/tool/requestUserInput",
+      "item/commandExecution/requestApproval",
+      "item/fileChange/requestApproval",
+      "item/permissions/requestApproval",
+      "mcpServer/elicitation/request",
+      "serverRequest/resolved",
+      "item/tool/userInputAnswered",
+      "item/approval/responded",
     ];
     try {
       const current = window.__codexPlusExtensionEventBridge;
@@ -1134,6 +1153,9 @@
       },
       registerFloatingTab(definition, itemOptions) {
         return track(codexPlusRegisterFloatingTab(definition, registerOptions(itemOptions)));
+      },
+      registerSettingsPanel(definition, itemOptions) {
+        return track(codexPlusRegisterSettingsPanel(definition, registerOptions(itemOptions)));
       },
       registerToolView(definition, itemOptions) {
         const view = codexPlusRegisterToolView(definition, registerOptions(itemOptions));

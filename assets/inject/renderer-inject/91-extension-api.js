@@ -39,7 +39,6 @@
    */
   const codexPlusExtensionRoutes = new Set([
     "/diagnostics/log",
-    "/session/export",
     "/thread-usage-history",
     "/archived-thread",
     "/export-markdown",
@@ -47,6 +46,22 @@
     // 显式开放：给拓展注入 overlay 等独立 Codex 页面，不暴露任意 CDP 方法。
     "/cdp/targets",
     "/cdp/evaluate",
+    // 只读：系统鼠标位置，写「桌宠跟随鼠标」这类功能用。
+    "/system/cursor-position",
+    // 只读：最近已完成的模型请求（模型、耗时、供应商、token、成败），写「请求提示」这类功能用。
+    "/request-log/recent",
+    // Agent 桌宠（官方拓展包）的数据服务：图片 / 音效下载、大肥鱼的素材、挂件数据、本机用量。
+    // 只有启用中的拓展在清单里声明了才干活；供应商 Key 只在 Codex++ 里用。
+    "/agent-pet/catalog",
+    "/agent-pet/image",
+    "/agent-pet/sound",
+    "/agent-pet/import-sound",
+    "/whale/media",
+    "/whale/full",
+    "/whale/history",
+    "/whale/session",
+    // 背景图（官方拓展包）的读图路由：只读这个拓展配置里的那张本机图片。
+    "/image-overlay/image",
   ]);
 
   /** 单次调用的默认超时，略短于桥接自身的 26s，让拓展先拿到可读的错误。 */
@@ -266,6 +281,15 @@
       currentSessionId() {
         return codexPlusCurrentSessionId();
       },
+      /**
+       * 当前打开的 Codex 会话：{ id, title, hostId, remote }。hostId 是会话所在的主机（本机为 "local"），
+       * remote 表示远程 / SSH 会话（本机会话日志里没有它的用量）。没有会话时 id 为空串。
+       */
+      currentSession() {
+        const ref = typeof currentSessionRef === "function" ? currentSessionRef() || {} : {};
+        const hostId = String(ref.host_id || "local");
+        return Object.freeze({ id: String(ref.session_id || ""), title: String(ref.title || ""), hostId, remote: hostId !== "local" });
+      },
 
       /** 内置拓展的现状：[{ id, name, active, disabled, replacedBy }]。见 96-builtin-extensions.js。 */
       builtins() {
@@ -357,6 +381,14 @@
       /** Codex 设置页左侧导航末尾加一项，点开是 render({ container, close }) 画的页面。 */
       registerSettingsSection(definition, options = {}) {
         return codexPlusRegisterSettingsSection(definition, options);
+      },
+
+      /**
+       * 「拓展」页面里本拓展详情下方的设置面板（每个拓展一个）：render({ container, config, saveConfig }) 每次打开详情都调用，
+       * 可返回清理函数。saveConfig(values) 只存本拓展清单 config 里声明过的项，回生效配置。
+       */
+      registerSettingsPanel(definition, options = {}) {
+        return codexPlusRegisterSettingsPanel(definition, options);
       },
 
       /** 在会话行「更多操作」里加一项。 */

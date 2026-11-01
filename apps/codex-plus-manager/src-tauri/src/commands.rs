@@ -6264,20 +6264,34 @@ pub fn set_user_scripts_skip_next_start(skip: bool) -> CommandResult<SettingsPay
     }
 }
 
-/// 拓展的管理器面板（codexpp.json 的 `manager.page`）：标题与 HTML，由前端放进沙箱 iframe。
+/// 拓展的管理器面板（codexpp.json 的 `manager.page`）或设置页（`settings.page`，`kind` 为 "settings"）：
+/// 标题与 HTML，由前端放进沙箱 iframe。设置页在拓展停用时也能打开。
 #[tauri::command]
-pub fn extension_manager_page(key: String) -> Result<Value, String> {
-    default_user_script_manager()
-        .extension_manager_page(key.trim())
+pub fn extension_manager_page(key: String, kind: Option<String>) -> Result<Value, String> {
+    let manager = default_user_script_manager();
+    let page = if kind.as_deref() == Some("settings") {
+        manager.extension_settings_page(key.trim())
+    } else {
+        manager.extension_manager_page(key.trim())
+    };
+    page
         .map(|(title, html)| serde_json::json!({ "title": title, "html": html }))
         .map_err(|error| format!("{error:#}"))
 }
 
-/// 管理器面板的 `codexPlusManager.asset(path)`：只读本拓展包 assets/ 里的资源。
+/// 管理器面板的 `codexPlusManager.asset(path)`：只读本拓展包 assets/ 里的资源（设置页在拓展停用时也能取）。
 #[tauri::command]
-pub fn extension_manager_asset(key: String, path: String) -> Result<String, String> {
+pub fn extension_manager_asset(key: String, path: String, kind: Option<String>) -> Result<String, String> {
     default_user_script_manager()
-        .extension_asset(key.trim(), &path)
+        .extension_asset_for(key.trim(), &path, kind.as_deref() != Some("settings"))
+        .map_err(|error| format!("{error:#}"))
+}
+/// 设置页 / 管理器面板的 `codexPlusManager.call(route, payload)`：只认开放给拓展页面、且本拓展清单声明过的数据路由。
+#[tauri::command]
+pub async fn extension_page_call(key: String, route: String, payload: Value) -> Result<Value, String> {
+    default_user_script_manager()
+        .extension_page_route(key.trim(), route.trim(), &payload)
+        .await
         .map_err(|error| format!("{error:#}"))
 }
 
@@ -7672,32 +7686,6 @@ pub fn reset_settings() -> CommandResult<SettingsPayload> {
         Ok(()) => settings_payload("设置已重置为默认值。", "设置重置后重新读取失败"),
         Err(error) => failed(
             &format!("重置设置失败：{error}"),
-            SettingsPayload {
-                revision: settings.settings_revision.clone(),
-                settings,
-                settings_path: codex_plus_core::paths::default_settings_path()
-                    .to_string_lossy()
-                    .to_string(),
-                user_scripts: user_script_inventory(),
-            },
-        ),
-    }
-}
-
-#[tauri::command]
-pub fn reset_image_overlay_settings() -> CommandResult<SettingsPayload> {
-    let store = SettingsStore::default();
-    let mut settings = store.load().unwrap_or_default();
-    let defaults = BackendSettings::default();
-    settings.codex_app_image_overlay_enabled = defaults.codex_app_image_overlay_enabled;
-    settings.codex_app_image_overlay_path = defaults.codex_app_image_overlay_path;
-    settings.codex_app_image_overlay_opacity = defaults.codex_app_image_overlay_opacity;
-    settings.codex_app_image_overlay_fit_mode = defaults.codex_app_image_overlay_fit_mode;
-    let settings = normalize_settings_before_save(settings);
-    match store.save(&settings) {
-        Ok(()) => settings_payload("图片覆盖层设置已重置。", "图片覆盖层重置后重新读取失败"),
-        Err(error) => failed(
-            &format!("重置图片覆盖层失败：{error}"),
             SettingsPayload {
                 revision: settings.settings_revision.clone(),
                 settings,
@@ -12157,47 +12145,6 @@ enabled = true
         assert!(claude.switchable);
         assert!(!claude.active);
         assert!(claude.home_dir.ends_with(".claude"));
-    }
-
-    #[test]
-    fn reset_image_overlay_settings_preserves_supplier_settings() {
-        let _guard = lock_codex_home_for_test();
-        let temp = tempfile::tempdir().unwrap();
-        let settings_path = temp.path().join("settings.json");
-        let previous = codex_plus_core::paths::set_settings_path_for_tests(Some(settings_path));
-
-        let settings = BackendSettings {
-            codex_app_image_overlay_enabled: true,
-            codex_app_image_overlay_path: "C:\\Users\\me\\Pictures\\overlay.png".to_string(),
-            codex_app_image_overlay_opacity: 42,
-            codex_app_image_overlay_fit_mode: "fill".to_string(),
-            active_relay_id: "supplier-a".to_string(),
-            relay_profiles: vec![RelayProfile {
-                id: "supplier-a".to_string(),
-                name: "供应商 A".to_string(),
-                relay_mode: codex_plus_core::settings::RelayMode::PureApi,
-                api_key: "sk-test".to_string(),
-                ..RelayProfile::default()
-            }],
-            ..BackendSettings::default()
-        };
-        SettingsStore::default().save(&settings).unwrap();
-
-        let result = reset_image_overlay_settings();
-        codex_plus_core::paths::set_settings_path_for_tests(previous);
-
-        assert_eq!(result.status, "ok");
-        assert!(!result.payload.settings.codex_app_image_overlay_enabled);
-        assert_eq!(result.payload.settings.codex_app_image_overlay_path, "");
-        assert_eq!(result.payload.settings.codex_app_image_overlay_opacity, 35);
-        assert_eq!(
-            result.payload.settings.codex_app_image_overlay_fit_mode,
-            "fit"
-        );
-        assert_eq!(result.payload.settings.active_relay_id, "supplier-a");
-        assert_eq!(result.payload.settings.relay_profiles.len(), 1);
-        assert_eq!(result.payload.settings.relay_profiles[0].id, "supplier-a");
-        assert_eq!(result.payload.settings.relay_profiles[0].api_key, "sk-test");
     }
 
     #[test]
