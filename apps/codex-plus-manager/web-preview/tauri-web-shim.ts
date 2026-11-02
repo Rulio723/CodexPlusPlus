@@ -264,7 +264,7 @@ const overview = ok({
     debugger: { status: "disconnected", address: null, message: "等待 Codex 连接" },
     protocol_conversion_enabled: true,
   },
-  current_version: "2.1.4",
+  current_version: "2.2.0",
   update_status: "up_to_date",
   settings_path: "演示模式",
   logs_path: "演示模式",
@@ -611,10 +611,10 @@ const demoClaudeEnhance = {
 
 // 本地拓展演示数据：一个单文件脚本、一个已加载的拓展包、一个清单有误的拓展包。
 const demoBuiltins = [
-  ["agent-pet", "Agent 桌宠", true, null], ["usage-statusline", "用量状态栏", true, null], ["dictation", "语音听写", false, null],
+  ["agent-pet", "Agent 桌宠", true, null], ["dictation", "语音听写", false, null],
   ["turn-rewind", "轮次回退", true, "user:pomodoro_timer"],
   ["side-chat-save", "侧聊保存", true, null], ["history-turn-recovery", "历史轮次补全", true, null],
-  ["capacity-auto-retry", "容量不足自动重试", true, null], ["proxy-request-status", "请求状态条", true, null],
+  ["capacity-auto-retry", "容量不足自动重试", true, null],
   ["model-picker-groups", "模型分组", true, null],
   ["dream-skin", "梦皮主题", true, null], ["plugin-market-unlock", "插件市场解锁", true, null],
   ["instance-identity", "多开身份提示", true, null], ["session-title-hook", "会话标题中间件", true, null],
@@ -709,7 +709,7 @@ export async function invoke<T = unknown>(command: string, args: Record<string, 
     case "load_pending_dream_skin_community": return ok({ versionId: "" }) as T;
     case "load_watcher_state": return ok({ enabled: false, running: false, status: "disabled", message: "演示模式" }) as T;
     case "load_auto_takeover_state": return ok({ running: false, enabled: false, message: "演示模式" }) as T;
-    case "update_check": return ok({ currentVersion: "2.1.4", latestVersion: "2.1.4", updateAvailable: false }) as T;
+    case "update_check": return ok({ currentVersion: "2.2.0", latestVersion: "2.2.0", updateAvailable: false }) as T;
     case "refresh_script_market": return ok({ market: { status: "ok", message: "演示模式", updatedAt: "2026-10-26T12:51:00Z", scripts: [
       { id: "relay-balance", name: "Codex Relay Balance", description: "通用中转站余额与模型用量监控，支持自动读取或手动填写接口、日期范围、Token 明细和实际扣费倍率。", version: "0.3.7", author: "Codex++ Community", tags: ["codex", "relay", "balance", "usage", "quota"], homepage: "https://github.com/demo/relay-balance", script_url: "", installed: false, installedVersion: "", updateAvailable: false },
       { id: "model-matrix", name: "Codex Model Matrix", description: "紧凑且适配主题的 Codex 模型选择器，配备可拖动吸附的推理强度滑块。", version: "1.0.0", author: "lx", tags: ["codex", "models", "reasoning"], homepage: "https://github.com/demo/model-matrix", script_url: "", installed: true, installedVersion: "1.0.0", updateAvailable: false },

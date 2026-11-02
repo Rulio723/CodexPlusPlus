@@ -111,6 +111,30 @@ const HOST_FILES: &[(&str, &str)] = &[
         "shims/dsh-client-connection.mjs",
         include_str!("../../../assets/dsh-host/shims/dsh-client-connection.mjs"),
     ),
+    (
+        "shims/dsh-settings.mjs",
+        include_str!("../../../assets/dsh-host/shims/dsh-settings.mjs"),
+    ),
+    (
+        "shims/dsh-skill-filesystem.mjs",
+        include_str!("../../../assets/dsh-host/shims/dsh-skill-filesystem.mjs"),
+    ),
+    (
+        "settings-services.mjs",
+        include_str!("../../../assets/dsh-host/settings-services.mjs"),
+    ),
+    (
+        "shims/dsh-session-surface.mjs",
+        include_str!("../../../assets/dsh-host/shims/dsh-session-surface.mjs"),
+    ),
+    (
+        "shims/dsh-agent.mjs",
+        include_str!("../../../assets/dsh-host/shims/dsh-agent.mjs"),
+    ),
+    (
+        "shims/dsh-subagent.mjs",
+        include_str!("../../../assets/dsh-host/shims/dsh-subagent.mjs"),
+    ),
 ];
 
 const REGISTRY_VERSION: u32 = 1;
@@ -189,6 +213,9 @@ pub const HOST_PROVIDED_PACKAGES: &[&str] = &[
     "@deepseek-ai/dsh-host-webserver",
     "@deepseek-ai/dsh-mcp-resources",
     "@deepseek-ai/dsh-client-connection",
+    "@deepseek-ai/dsh-settings",
+    "@deepseek-ai/dsh-skill-filesystem",
+    "@deepseek-ai/dsh-agent",
 ];
 
 /// 插件来源。
@@ -567,6 +594,20 @@ pub fn locate_program(name: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
+/// 去掉 Windows canonicalize 带上的 `\\?\` verbatim 前缀（`\\?\UNC\` 换回 `\\`）。
+/// 交给 Node 的插件根目录使用普通路径，避免与依赖扫描得到的路径混用两种表示。
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    match text.strip_prefix(r"\\?\") {
+        // 只处理盘符路径；`\\?\Volume{...}` 之类去掉前缀就不是合法路径了。
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
 /// 子进程的 PATH：npm 是 Node 脚本，需要能找到 node。
 fn child_path(toolchain: &Toolchain) -> OsString {
     let mut dirs = Vec::new();
@@ -789,6 +830,7 @@ impl DshPlugins {
             PluginSource::Local { path } => {
                 let directory = Path::new(path)
                     .canonicalize()
+                    .map(|directory| strip_verbatim_prefix(&directory))
                     .with_context(|| format!("目录不存在：{path}"))?;
                 if !directory.join("package.json").is_file() {
                     bail!("{} 下没有 package.json，不是 dsh 插件包", directory.display());
@@ -1978,12 +2020,14 @@ impl DshPlugins {
         let mut errors = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         for (key, extension_id, root, enabled, version) in declared {
+            // 包边界已由清单解析验证；比较时沿用导入记录交给 Node 的路径表示。
+            let root = strip_verbatim_prefix(&root);
             let id = extension_plugin_id(&extension_id);
             seen.insert(id.clone());
             let fingerprint = dsh_fingerprint(&root, &version);
             let existing = registry.plugins.iter().find(|plugin| plugin.id == id);
             let outcome = (|| -> anyhow::Result<bool> {
-                if enabled && existing.is_none_or(|plugin| plugin.owner_fingerprint.as_deref() != Some(fingerprint.as_str()) || plugin.root != root.to_string_lossy()) {
+                if enabled && existing.is_none_or(|plugin| plugin.owner_fingerprint.as_deref() != Some(fingerprint.as_str()) || strip_verbatim_prefix(Path::new(&plugin.root)) != root) {
                     self.import_local_as(&root, &id, toolchain)?;
                     self.update(&id, |record| {
                         record.owner = Some(key.clone());
@@ -2069,4 +2113,18 @@ pub fn run_mcp(args: &[OsString]) -> anyhow::Result<i32> {
     }
     let status = command.status().context("无法启动 dsh 插件宿主")?;
     Ok(status.code().unwrap_or(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verbatim_prefix_is_stripped_for_drive_and_unc_paths() {
+        assert_eq!(strip_verbatim_prefix(Path::new(r"\\?\D:\a\plugin")), PathBuf::from(r"D:\a\plugin"));
+        assert_eq!(strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share\p")), PathBuf::from(r"\\server\share\p"));
+        // 非盘符的 verbatim 路径与普通路径原样保留。
+        assert_eq!(strip_verbatim_prefix(Path::new(r"\\?\Volume{x}\p")), PathBuf::from(r"\\?\Volume{x}\p"));
+        assert_eq!(strip_verbatim_prefix(Path::new("/tmp/plugin")), PathBuf::from("/tmp/plugin"));
+    }
 }

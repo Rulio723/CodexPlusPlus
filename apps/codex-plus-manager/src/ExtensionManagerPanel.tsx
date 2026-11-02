@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { t } from "./i18n";
-import { MANAGER_DATA_SOURCES } from "./extension-manager-pages";
+import { managerDataRequest } from "./extension-manager-pages";
 import {
   handleManagerRequest,
   isManagerRequest,
@@ -78,9 +78,8 @@ export function ExtensionManagerPanel({ scriptKey, config, onSaveConfig, onToast
         resize: (next) => setHeight(next),
         theme: () => latest.current.theme,
         data: async (name, params) => {
-          const source = MANAGER_DATA_SOURCES[name];
-          if (!source || !latest.current.dataSources.includes(name)) throw new Error(`清单 manager.data 没有声明 ${name}`);
-          return invoke(source.command, source.args(params));
+          const request = managerDataRequest(name, params, latest.current.dataSources, scriptKey);
+          return invoke(request.command, request.args);
         },
         navigate: (next) => latest.current.onNavigate?.(next) ?? false,
         call: (route, payload) => invoke("extension_page_call", { key: scriptKey, route, payload }),
@@ -100,7 +99,7 @@ export function ExtensionManagerPanel({ scriptKey, config, onSaveConfig, onToast
       <iframe
         ref={frame}
         title={page.title}
-        // 只给脚本：没有 allow-same-origin，页面拿不到 Tauri 接口与宿主页面；没有弹窗、顶层跳转。
+        // 允许脚本和表单交互，外发由 CSP 限制；没有同源、弹窗、顶层跳转权限。iframe 自导航仍须信任作者。
         sandbox="allow-scripts allow-forms"
         srcDoc={srcdoc}
         style={{ width: "100%", height: Math.max(fullPage ? 480 : MANAGER_PANEL_MIN_HEIGHT, height), border: 0, display: "block" }}
