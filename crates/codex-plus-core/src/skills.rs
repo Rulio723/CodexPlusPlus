@@ -16,9 +16,10 @@
 //! Windows 上建软链需要开发者模式或管理员权限，失败时自动回退成复制。
 
 use std::collections::BTreeMap;
-use std::io::{Cursor, Read};
+use std::io::{BufRead, BufReader, Cursor, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -27,10 +28,15 @@ use sha2::{Digest, Sha256};
 
 const SKILL_MANIFEST_FILE: &str = "SKILL.md";
 const BUNDLED_SKILLS_DIR: &str = ".system";
+/// 本地清单只需要 frontmatter，避免将整个 Skill 正文读入内存。
+const SKILL_FRONTMATTER_LIMIT_BYTES: usize = 256 * 1024;
 /// 从本地目录导入的 Skill 的来源标记（#511），前端按它显示「本地导入」分组。
 pub const LOCAL_IMPORT_REPO_KEY: &str = "local";
 /// 单个仓库 zip 的下载上限。skill 仓库都是纯文本，64 MiB 足够宽松了。
 const REPO_ZIP_DOWNLOAD_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+const REPO_ZIP_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+const REPO_ZIP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const REPO_ZIP_BODY_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// 一个 skill 仓库源。`subdir` 为空表示 skill 目录直接放在仓库根下。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1125,6 +1131,16 @@ pub fn parse_skills_from_tree(repo: &SkillRepo, tree: &Value) -> Vec<RemoteSkill
         .collect()
 }
 
+fn repo_zip_request(
+    client: &reqwest::Client,
+    zip_url: &str,
+    authorize: GithubAuth,
+) -> reqwest::RequestBuilder {
+    authorize(client.get(zip_url))
+        .header(reqwest::header::ACCEPT, "application/zip")
+        .timeout(REPO_ZIP_HEADER_TIMEOUT + REPO_ZIP_BODY_TIMEOUT)
+}
+
 /// GitHub API 限流时，从公开仓库的 codeload 压缩包构造同样的文件树。
 /// codeload 不占 GitHub API 配额，且能同时读取 SKILL.md 的元数据。
 async fn fetch_repo_skills_from_zip(
@@ -1134,27 +1150,31 @@ async fn fetch_repo_skills_from_zip(
     zip_url: &str,
     authorize: GithubAuth,
 ) -> anyhow::Result<Vec<RemoteSkill>> {
-    let response = authorize(client.get(zip_url))
-        .header(reqwest::header::ACCEPT, "application/zip")
-        .send()
+    let request = repo_zip_request(client, zip_url, authorize).send();
+    let response = tokio::time::timeout(REPO_ZIP_HEADER_TIMEOUT, request)
         .await
+        .context("等待仓库压缩包响应头超过 30 秒")?
         .with_context(|| format!("下载 {}/{} 的仓库压缩包失败", repo.owner, repo.name))?;
     let status = response.status();
     if !status.is_success() {
-        anyhow::bail!(
-            "下载 {}/{} 的仓库压缩包失败：HTTP {}{}",
-            repo.owner,
-            repo.name,
-            status.as_u16(),
-            github_status_hint(status.as_u16())
-        );
+        return Err(RepoArchiveHttpError {
+            status: status.as_u16(),
+            message: format!(
+                "下载 {}/{} 的仓库压缩包失败：HTTP {}{}",
+                repo.owner,
+                repo.name,
+                status.as_u16(),
+                github_status_hint(status.as_u16())
+            ),
+        }
+        .into());
     }
-    let bytes = response.bytes().await.context("读取仓库压缩包内容失败")?;
-    if bytes.len() > REPO_ZIP_DOWNLOAD_LIMIT_BYTES {
-        anyhow::bail!("仓库压缩包太大：{} 字节", bytes.len());
-    }
-
-    parse_skills_from_zip(repo, &bytes, cached)
+    let bytes = read_repo_zip_response(response).await?;
+    let repo = repo.clone();
+    let cached = cached.clone();
+    tokio::task::spawn_blocking(move || parse_skills_from_zip(&repo, &bytes, &cached))
+        .await
+        .context("解析仓库压缩包时发生异常")?
 }
 
 fn parse_skills_from_zip(
@@ -1307,9 +1327,47 @@ fn unquote_scalar(value: &str) -> String {
 }
 
 fn read_skill_manifest(manifest: &Path, fallback_id: &str) -> (String, String) {
-    match std::fs::read_to_string(manifest) {
-        Ok(text) => parse_skill_frontmatter(&text, fallback_id),
-        Err(_) => (fallback_id.to_string(), String::new()),
+    let text = (|| -> Option<String> {
+        if !std::fs::metadata(manifest).ok()?.is_file() {
+            return None;
+        }
+        let file = std::fs::File::open(manifest).ok()?;
+        if !file.metadata().ok()?.is_file() {
+            return None;
+        }
+        read_bounded_skill_manifest(file)
+    })();
+    text.map(|text| parse_skill_frontmatter(&text, fallback_id))
+        .unwrap_or_else(|| (fallback_id.to_string(), String::new()))
+}
+
+fn read_bounded_skill_manifest(reader: impl Read) -> Option<String> {
+    let mut bytes = Vec::new();
+    reader
+        .take((SKILL_FRONTMATTER_LIMIT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() <= SKILL_FRONTMATTER_LIMIT_BYTES {
+        return String::from_utf8(bytes).ok();
+    }
+
+    let mut reader = BufReader::new(bytes.as_slice());
+    let mut text = String::new();
+    let mut first = true;
+    loop {
+        let start = text.len();
+        if reader.read_line(&mut text).ok()? == 0 || text.len() > SKILL_FRONTMATTER_LIMIT_BYTES {
+            return None;
+        }
+        let delimiter = text[start..].trim() == "---";
+        if first {
+            if !delimiter {
+                return None;
+            }
+            first = false;
+        } else if delimiter {
+            return Some(text);
+        }
     }
 }
 
@@ -1438,42 +1496,179 @@ fn raw_file_url(repo: &SkillRepo, path: &str) -> String {
     )
 }
 
+fn github_https_proxy_from_env(
+    get_env: &mut impl FnMut(&str) -> Option<String>,
+    linux: bool,
+) -> Option<String> {
+    let keys = if linux {
+        ["https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"]
+    } else {
+        ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+    };
+    keys.into_iter().find_map(|key| {
+        get_env(key)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn build_github_client(
+    agent: &str,
+    mut get_env: impl FnMut(&str) -> Option<String>,
+    linux: bool,
+    mut system_proxy: impl FnMut(Option<&str>) -> Option<String>,
+    builder: reqwest::ClientBuilder,
+) -> anyhow::Result<reqwest::Client> {
+    let environment_proxy = github_https_proxy_from_env(&mut get_env, linux);
+    let http_proxy = ["http_proxy", "HTTP_PROXY"].into_iter().find_map(|key| {
+        get_env(key)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    });
+    let no_proxy = get_env("NO_PROXY").or_else(|| get_env("no_proxy"));
+    let builder = builder.user_agent(agent);
+    if environment_proxy.is_some() || http_proxy.is_some() {
+        let proxy = if linux {
+            environment_proxy
+        } else {
+            system_proxy(None).or(environment_proxy)
+        };
+        let bypass = || {
+            no_proxy
+                .as_deref()
+                .and_then(reqwest::NoProxy::from_string)
+                .or_else(|| reqwest::NoProxy::from_string("localhost,127.0.0.1,::1"))
+        };
+        let builder = if let Some(proxy) = proxy {
+            builder.proxy(reqwest::Proxy::all(&proxy)?.no_proxy(bypass()))
+        } else if linux {
+            // HTTP 代理不能用于 HTTPS，也不能在降级重定向时明文发送凭据。
+            builder.no_proxy().https_only(true)
+        } else {
+            builder
+        };
+        return Ok(crate::http_client::apply_configured_ca_certificate(builder)?.build()?);
+    }
+
+    let builder = builder
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(90));
+    let mut proxies = BTreeMap::new();
+    for host in [
+        "api.github.com",
+        "codeload.github.com",
+        "raw.githubusercontent.com",
+    ] {
+        // Linux 的系统代理检测本身读取环境变量，不能让 HTTP-only 设置回流到 HTTPS。
+        if !linux && let Some(proxy) = system_proxy(Some(&format!("https://{host}/"))) {
+            proxies.insert(host.to_string(), proxy);
+        }
+    }
+    let builder = builder.proxy(reqwest::Proxy::custom(move |url| {
+        url.host_str().and_then(|host| proxies.get(host).cloned())
+    }));
+    Ok(builder.build()?)
+}
+
+fn github_system_proxy(url: Option<&str>) -> Option<String> {
+    match url {
+        Some(url) => crate::proxy::detect_system_proxy_for_url(url),
+        None => crate::proxy::detect_system_proxy(),
+    }
+}
+
 async fn github_client() -> anyhow::Result<reqwest::Client> {
     tokio::task::spawn_blocking(|| {
         let agent = format!("Codex++/{}", crate::version::VERSION);
-        if ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"]
-            .iter().any(|key| std::env::var(key).is_ok_and(|v| !v.trim().is_empty()))
+        if !cfg!(target_os = "linux")
+            && [
+                "HTTPS_PROXY",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+                "HTTP_PROXY",
+                "http_proxy",
+            ]
+            .iter()
+            .any(|key| std::env::var(key).is_ok_and(|value| !value.trim().is_empty()))
         {
             return crate::http_client::proxied_client(&agent);
         }
-        let mut proxies = BTreeMap::new();
-        for host in ["api.github.com", "codeload.github.com", "raw.githubusercontent.com"] {
-            if let Some(proxy) = crate::proxy::detect_system_proxy_for_url(&format!("https://{host}/")) {
-                proxies.insert(host.to_string(), proxy);
-            }
-        }
-        Ok(reqwest::Client::builder().user_agent(agent)
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(90))
-            .proxy(reqwest::Proxy::custom(move |url| {
-                url.host_str().and_then(|host| proxies.get(host).cloned())
-            })).build()?)
-    }).await?
+        build_github_client(
+            &agent,
+            |key| std::env::var(key).ok(),
+            cfg!(target_os = "linux"),
+            github_system_proxy,
+            reqwest::Client::builder(),
+        )
+    })
+    .await?
+}
+
+#[cfg(test)]
+#[path = "skills_github_proxy_tests.rs"]
+mod github_proxy_tests;
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct RepoTreeHttpError {
+    status: u16,
+    message: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct RepoArchiveHttpError {
+    status: u16,
+    message: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct RepoTreeFallbackError {
+    archive_missing: bool,
+    message: String,
+}
+
+fn should_try_alternative_branch(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<RepoTreeHttpError>()
+        .is_some_and(|error| error.status == 404)
+        || error
+            .downcast_ref::<RepoTreeFallbackError>()
+            .is_some_and(|error| error.archive_missing)
 }
 
 pub async fn resolve_repo_skills(
     repo: SkillRepo,
     cached: &BTreeMap<String, RemoteSkill>,
 ) -> anyhow::Result<(SkillRepo, Vec<RemoteSkill>)> {
+    resolve_repo_skills_with(repo, cached, |repo, cached| {
+        Box::pin(fetch_repo_skills(repo, cached))
+    })
+    .await
+}
+
+async fn resolve_repo_skills_with<F>(
+    repo: SkillRepo,
+    cached: &BTreeMap<String, RemoteSkill>,
+    fetch: F,
+) -> anyhow::Result<(SkillRepo, Vec<RemoteSkill>)>
+where
+    F: for<'a> Fn(
+        &'a SkillRepo,
+        &'a BTreeMap<String, RemoteSkill>,
+    ) -> futures_util::future::BoxFuture<'a, anyhow::Result<Vec<RemoteSkill>>>,
+{
     let repo = normalize_repo(repo)?;
-    match fetch_repo_skills(&repo, cached).await {
+    match fetch(&repo, cached).await {
         Ok(skills) => Ok((repo, skills)),
-        Err(error) if format!("{error:#}").contains("HTTP 404")
+        Err(error) if should_try_alternative_branch(&error)
             && matches!(repo.branch.as_str(), "main" | "master") =>
         {
             let mut alternative = repo.clone();
             alternative.branch = if repo.branch == "main" { "master" } else { "main" }.into();
-            match fetch_repo_skills(&alternative, &BTreeMap::new()).await {
+            match fetch(&alternative, &BTreeMap::new()).await {
                 Ok(skills) => Ok((alternative, skills)),
                 Err(_) => Err(error),
             }
@@ -1527,9 +1722,30 @@ async fn fetch_repo_skills_with_client(
     zip_url: &str,
     authorize: GithubAuth,
 ) -> anyhow::Result<Vec<RemoteSkill>> {
+    fetch_repo_skills_with_client_timeout(
+        repo,
+        cached,
+        client,
+        tree_url,
+        zip_url,
+        authorize,
+        std::time::Duration::from_secs(20),
+    )
+    .await
+}
+
+async fn fetch_repo_skills_with_client_timeout(
+    repo: &SkillRepo,
+    cached: &BTreeMap<String, RemoteSkill>,
+    client: &reqwest::Client,
+    tree_url: &str,
+    zip_url: &str,
+    authorize: GithubAuth,
+    tree_timeout: std::time::Duration,
+) -> anyhow::Result<Vec<RemoteSkill>> {
     let response = authorize(client.get(tree_url))
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .timeout(std::time::Duration::from_secs(20))
+        .timeout(tree_timeout)
         .send()
         .await;
     let response = match response {
@@ -1537,7 +1753,15 @@ async fn fetch_repo_skills_with_client(
         Err(error) => {
             return fetch_repo_skills_from_zip(repo, cached, client, zip_url, authorize)
                 .await
-                .with_context(|| format!("文件树请求失败（{error}），压缩包回退也失败"));
+                .map_err(|zip_error| {
+                    let archive_missing = zip_error
+                        .downcast_ref::<RepoArchiveHttpError>()
+                        .is_some_and(|error| error.status == 404);
+                    zip_error.context(RepoTreeFallbackError {
+                        archive_missing,
+                        message: format!("文件树请求失败（{error}），压缩包回退也失败"),
+                    })
+                });
         }
     };
     // 不要用 error_for_status() 一把带过：403 限流、404 仓库/分支不存在、401 令牌
@@ -1547,28 +1771,84 @@ async fn fetch_repo_skills_with_client(
     if !status.is_success() && (matches!(status.as_u16(), 403 | 429) || status.is_server_error()) {
         return fetch_repo_skills_from_zip(repo, cached, client, zip_url, authorize)
             .await
-            .with_context(|| {
-                format!("文件树请求失败：HTTP {}，压缩包回退也失败", status.as_u16())
+            .map_err(|zip_error| {
+                let archive_missing = zip_error
+                    .downcast_ref::<RepoArchiveHttpError>()
+                    .is_some_and(|error| error.status == 404);
+                zip_error.context(RepoTreeFallbackError {
+                    archive_missing,
+                    message: format!("文件树请求失败：HTTP {}，压缩包回退也失败", status.as_u16()),
+                })
             });
     }
     if !status.is_success() {
-        anyhow::bail!(
-            "{}/{} 的文件树请求失败：HTTP {}{}",
-            repo.owner,
-            repo.name,
-            status.as_u16(),
-            github_status_hint(status.as_u16())
-        );
-    }
-    let tree = response
-        .json::<Value>()
-        .await
-        .context("解析 GitHub 文件树响应失败")?;
-    if tree.get("truncated").and_then(Value::as_bool) == Some(true) {
-        return fetch_repo_skills_from_zip(repo, cached, client, zip_url, authorize).await;
+        return Err(RepoTreeHttpError {
+            status: status.as_u16(),
+            message: format!(
+                "{}/{} 的文件树请求失败：HTTP {}{}",
+                repo.owner,
+                repo.name,
+                status.as_u16(),
+                github_status_hint(status.as_u16())
+            ),
+        }
+        .into());
     }
 
-    let skills = parse_skills_from_tree(repo, &tree);
+    let tree = match response.bytes().await {
+        Ok(bytes) => {
+            let repo = repo.clone();
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<RemoteSkill>>> {
+                let tree: Value = serde_json::from_slice(&bytes)?;
+                if tree.get("truncated").and_then(Value::as_bool) == Some(true) {
+                    return Ok(None);
+                }
+                anyhow::ensure!(
+                    tree.get("tree").is_some_and(Value::is_array),
+                    "文件树响应缺少有效的 tree 数组"
+                );
+                Ok(Some(parse_skills_from_tree(&repo, &tree)))
+            })
+            .await
+            .context("解析 GitHub 文件树后台任务失败")?
+        }
+        Err(error) if error.is_timeout() => {
+            let error = error.without_url();
+            return fetch_repo_skills_from_zip(repo, cached, client, zip_url, authorize)
+                .await
+                .map_err(|zip_error| {
+                    let archive_missing = zip_error
+                        .downcast_ref::<RepoArchiveHttpError>()
+                        .is_some_and(|error| error.status == 404);
+                    zip_error.context(RepoTreeFallbackError {
+                        archive_missing,
+                        message: format!("读取 GitHub 文件树响应超时（{error:#}），压缩包回退也失败"),
+                    })
+                });
+        }
+        Err(error) => Err(anyhow::Error::new(error.without_url())),
+    };
+    let skills = match tree {
+        Ok(Some(skills)) => skills,
+        Ok(None) => {
+            return fetch_repo_skills_from_zip(repo, cached, client, zip_url, authorize)
+                .await
+                .map_err(|zip_error| {
+                    let archive_missing = zip_error
+                        .downcast_ref::<RepoArchiveHttpError>()
+                        .is_some_and(|error| error.status == 404);
+                    zip_error.context(RepoTreeFallbackError {
+                        archive_missing,
+                        message: "文件树不完整，压缩包回退也失败".into(),
+                    })
+                });
+        }
+        Err(error) => {
+            return fetch_repo_skills_from_zip(repo, cached, client, zip_url, authorize)
+                .await
+                .with_context(|| format!("解析 GitHub 文件树响应失败（{error:#}），压缩包回退也失败"));
+        }
+    };
     use futures_util::{StreamExt, stream};
     let skills = stream::iter(skills.into_iter().map(|mut skill| {
         let client = &client;
@@ -1616,10 +1896,10 @@ fn github_status_hint(status: u16) -> &'static str {
 
 pub async fn download_repo_zip(repo: &SkillRepo) -> anyhow::Result<Vec<u8>> {
     let client = github_client().await?;
-    let response = with_github_auth(client.get(repo_zip_url(repo)))
-        .header(reqwest::header::ACCEPT, "application/zip")
-        .send()
+    let request = repo_zip_request(&client, &repo_zip_url(repo), with_github_auth).send();
+    let response = tokio::time::timeout(REPO_ZIP_HEADER_TIMEOUT, request)
         .await
+        .context("等待仓库压缩包响应头超过 30 秒")?
         .with_context(|| format!("下载 {}/{} 失败", repo.owner, repo.name))?;
     let status = response.status();
     if !status.is_success() {
@@ -1631,11 +1911,41 @@ pub async fn download_repo_zip(repo: &SkillRepo) -> anyhow::Result<Vec<u8>> {
             github_status_hint(status.as_u16())
         );
     }
-    let bytes = response.bytes().await.context("读取仓库压缩包内容失败")?;
-    if bytes.len() > REPO_ZIP_DOWNLOAD_LIMIT_BYTES {
-        anyhow::bail!("仓库压缩包太大：{} 字节", bytes.len());
-    }
-    Ok(bytes.to_vec())
+    read_repo_zip_response(response).await
+}
+
+async fn read_repo_zip_response(response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
+    read_repo_zip_response_with_timeout(response, REPO_ZIP_IDLE_TIMEOUT, REPO_ZIP_BODY_TIMEOUT).await
+}
+
+async fn read_repo_zip_response_with_timeout(
+    mut response: reqwest::Response,
+    idle_timeout: Duration,
+    total_timeout: Duration,
+) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        response
+            .content_length()
+            .is_none_or(|length| length <= REPO_ZIP_DOWNLOAD_LIMIT_BYTES as u64),
+        "仓库压缩包超过 64 MiB，未下载"
+    );
+    tokio::time::timeout(total_timeout, async move {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = tokio::time::timeout(idle_timeout, response.chunk())
+            .await
+            .context("等待仓库压缩包数据超时")?
+            .context("读取仓库压缩包内容失败")?
+        {
+            anyhow::ensure!(
+                chunk.len() <= REPO_ZIP_DOWNLOAD_LIMIT_BYTES.saturating_sub(bytes.len()),
+                "仓库压缩包超过 64 MiB，已停止下载"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
+    })
+    .await
+    .context("仓库压缩包下载总时间超限")?
 }
 
 /// 复制回退时放进副本的标记：有它说明这份副本是 Codex++ 建的，停用时可以删。
@@ -2110,6 +2420,637 @@ mod tests {
 
     fn with_fixture_github_auth(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         request.header(reqwest::header::AUTHORIZATION, FIXTURE_GITHUB_AUTH)
+    }
+
+    #[tokio::test]
+    async fn github_tree_body_timeout_falls_back_to_zip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let stalled = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"tree\":")
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        });
+        let server = MockServer::builder().disable_request_recording().start().await;
+        Mock::given(method("GET"))
+            .and(path("/zip"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(repo_zip(&[(
+                "kit-main/alpha/SKILL.md",
+                "---\nname: Alpha\n---\n",
+            )])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let repo = parse_repo_key("acme/kit@main").unwrap();
+        let skills = fetch_repo_skills_with_client_timeout(
+            &repo,
+            &BTreeMap::new(),
+            &client,
+            &format!("http://{address}/tree"),
+            &format!("{}/zip", server.uri()),
+            without_github_auth,
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .unwrap();
+        stalled.await.unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "Alpha");
+    }
+
+    #[tokio::test]
+    async fn github_tree_body_timeout_and_missing_zip_try_alternative_branch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        for zip_status in [404, 502] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let stalled = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 2048];
+                socket.read(&mut request).await.unwrap();
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"tree\":")
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(800)).await;
+            });
+            let server = MockServer::builder().disable_request_recording().start().await;
+            Mock::given(method("GET"))
+                .and(path("/tree-master"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"truncated": true})))
+                .expect(u64::from(zip_status == 404))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/main"))
+                .respond_with(ResponseTemplate::new(zip_status))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/master"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(repo_zip(&[(
+                    "kit-master/alpha/SKILL.md",
+                    "---\nname: Alpha\n---\n",
+                )])))
+                .expect(u64::from(zip_status == 404))
+                .mount(&server)
+                .await;
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let base = server.uri();
+            let attempts = AtomicUsize::new(0);
+            let repo = parse_repo_key("acme/kit@main").unwrap();
+            let result = resolve_repo_skills_with(repo, &BTreeMap::new(), |repo, cached| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                let client = client.clone();
+                let base = base.clone();
+                Box::pin(async move {
+                    let tree_url = if repo.branch == "main" {
+                        format!("http://{address}/tree?fixture=tree-secret")
+                    } else {
+                        format!("{base}/tree-master")
+                    };
+                    fetch_repo_skills_with_client_timeout(
+                        repo,
+                        cached,
+                        &client,
+                        &tree_url,
+                        &format!("{base}/{}", repo.branch),
+                        without_github_auth,
+                        Duration::from_millis(200),
+                    )
+                    .await
+                })
+            })
+            .await;
+            if zip_status == 404 {
+                let (resolved, skills) = result.unwrap();
+                assert_eq!(resolved.branch, "master");
+                assert_eq!(skills.len(), 1);
+                assert_eq!(skills[0].name, "Alpha");
+                assert_eq!(attempts.load(Ordering::SeqCst), 2);
+            } else {
+                let error = result.unwrap_err();
+                let message = format!("{error:#}");
+                assert!(message.contains("文件树响应超时"));
+                assert!(message.contains("HTTP 502"));
+                assert!(!message.contains("tree-secret"));
+                assert!(!message.contains(&address.to_string()));
+                assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            }
+            stalled.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn github_tree_body_interruption_and_missing_zip_do_not_change_branch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let interrupted = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"tree\":")
+                .await
+                .unwrap();
+        });
+        let server = MockServer::builder().disable_request_recording().start().await;
+        Mock::given(method("GET"))
+            .and(path("/zip"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = server.uri();
+        let attempts = AtomicUsize::new(0);
+        let repo = parse_repo_key("acme/kit@main").unwrap();
+        let error = resolve_repo_skills_with(repo, &BTreeMap::new(), |repo, cached| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            let client = client.clone();
+            let base = base.clone();
+            Box::pin(async move {
+                fetch_repo_skills_with_client(
+                    repo,
+                    cached,
+                    &client,
+                    &format!("http://{address}/tree"),
+                    &format!("{base}/zip"),
+                    without_github_auth,
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap_err();
+        interrupted.await.unwrap();
+        assert!(format!("{error:#}").contains("解析 GitHub 文件树响应失败"));
+        assert!(format!("{error:#}").contains("HTTP 404"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn github_tree_invalid_response_falls_back_but_empty_tree_is_valid() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        for body in ["{", "{}", r#"{"tree":null}"#] {
+            let server = MockServer::builder().disable_request_recording().start().await;
+            Mock::given(method("GET"))
+                .and(path("/tree"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/zip"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(repo_zip(&[(
+                    "kit-main/alpha/SKILL.md",
+                    "---\nname: Alpha\n---\n",
+                )])))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let repo = parse_repo_key("acme/kit@main").unwrap();
+            let skills = fetch_repo_skills_with_client(
+                &repo,
+                &BTreeMap::new(),
+                &client,
+                &format!("{}/tree", server.uri()),
+                &format!("{}/zip", server.uri()),
+                without_github_auth,
+            )
+            .await
+            .unwrap();
+            assert_eq!(skills.len(), 1);
+            assert_eq!(skills[0].name, "Alpha");
+        }
+
+        let server = MockServer::builder().disable_request_recording().start().await;
+        Mock::given(method("GET"))
+            .and(path("/tree"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"tree": []})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/zip"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let repo = parse_repo_key("acme/kit@main").unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        assert!(
+            fetch_repo_skills_with_client(
+                &repo,
+                &BTreeMap::new(),
+                &client,
+                &format!("{}/tree", server.uri()),
+                &format!("{}/zip", server.uri()),
+                without_github_auth,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn github_rate_limit_and_missing_main_zip_try_master() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        for status in [403, 429] {
+            let server = MockServer::builder().disable_request_recording().start().await;
+            Mock::given(method("GET"))
+                .and(path("/tree"))
+                .respond_with(ResponseTemplate::new(status))
+                .expect(2)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/main"))
+                .respond_with(ResponseTemplate::new(404))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/master"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(repo_zip(&[(
+                    "kit-master/alpha/SKILL.md",
+                    "---\nname: Alpha\n---\n",
+                )])))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let base = server.uri();
+            let repo = parse_repo_key("acme/kit@main").unwrap();
+            let (resolved, skills) = resolve_repo_skills_with(repo, &BTreeMap::new(), |repo, cached| {
+                let client = client.clone();
+                let base = base.clone();
+                Box::pin(async move {
+                    fetch_repo_skills_with_client(
+                        repo,
+                        cached,
+                        &client,
+                        &format!("{base}/tree"),
+                        &format!("{base}/{}", repo.branch),
+                        without_github_auth,
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+            assert_eq!(resolved.branch, "master");
+            assert_eq!(skills.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn github_truncated_tree_and_missing_main_zip_try_master() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::builder().disable_request_recording().start().await;
+        Mock::given(method("GET"))
+            .and(path("/tree"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"truncated": true})))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/main"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/master"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(repo_zip(&[(
+                "kit-master/alpha/SKILL.md",
+                "---\nname: Alpha\n---\n",
+            )])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = server.uri();
+        let repo = parse_repo_key("acme/kit@main").unwrap();
+        let (resolved, skills) = resolve_repo_skills_with(repo, &BTreeMap::new(), |repo, cached| {
+            let client = client.clone();
+            let base = base.clone();
+            Box::pin(async move {
+                fetch_repo_skills_with_client(
+                    repo,
+                    cached,
+                    &client,
+                    &format!("{base}/tree"),
+                    &format!("{base}/{}", repo.branch),
+                    without_github_auth,
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(resolved.branch, "master");
+        assert_eq!(skills.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn github_zip_body_idle_timeout_is_bounded() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nz")
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = client.get(format!("http://{address}/zip")).send().await.unwrap();
+        let error = read_repo_zip_response_with_timeout(
+            response,
+            std::time::Duration::from_millis(200),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("等待仓库压缩包数据超时"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn github_zip_body_total_timeout_bounds_continuous_transfer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let chunks_sent = Arc::new(AtomicUsize::new(0));
+        let server_chunks_sent = Arc::clone(&chunks_sent);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nz")
+                .await
+                .unwrap();
+            server_chunks_sent.fetch_add(1, Ordering::SeqCst);
+            for _ in 0..30 {
+                tokio::time::sleep(Duration::from_millis(70)).await;
+                if socket.write_all(b"z").await.is_err() {
+                    break;
+                }
+                server_chunks_sent.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = client.get(format!("http://{address}/zip")).send().await.unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            read_repo_zip_response_with_timeout(
+                response,
+                Duration::from_millis(400),
+                Duration::from_millis(900),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("仓库压缩包下载总时间超限"));
+        assert!(chunks_sent.load(Ordering::SeqCst) >= 4);
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn github_zip_response_retains_declared_and_streaming_size_limits() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for chunked in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 2048];
+                socket.read(&mut request).await.unwrap();
+                if chunked {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                        .await
+                        .unwrap();
+                    let chunk = vec![0u8; 1024 * 1024];
+                    for _ in 0..65 {
+                        if socket.write_all(b"100000\r\n").await.is_err()
+                            || socket.write_all(&chunk).await.is_err()
+                            || socket.write_all(b"\r\n").await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                } else {
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                        REPO_ZIP_DOWNLOAD_LIMIT_BYTES + 1
+                    );
+                    socket.write_all(header.as_bytes()).await.unwrap();
+                }
+            });
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let response = client.get(format!("http://{address}/zip")).send().await.unwrap();
+            let error = read_repo_zip_response_with_timeout(
+                response,
+                Duration::from_secs(5),
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("仓库压缩包超过 64 MiB"));
+            assert_eq!(message.contains("已停止下载"), chunked);
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn github_zip_request_overrides_short_client_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let archive = repo_zip(&[("kit-main/alpha/SKILL.md", "---\nname: Alpha\n---\n")]);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            socket.read(&mut request).await.unwrap();
+            let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", archive.len());
+            socket.write_all(header.as_bytes()).await.unwrap();
+            let middle = archive.len() / 2;
+            socket.write_all(&archive[..middle]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            socket.write_all(&archive[middle..]).await.unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let repo = parse_repo_key("acme/kit@main").unwrap();
+        let skills = fetch_repo_skills_from_zip(
+            &repo,
+            &BTreeMap::new(),
+            &client,
+            &format!("http://{address}/zip"),
+            without_github_auth,
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "Alpha");
+    }
+
+    #[tokio::test]
+    async fn github_missing_tree_tries_alternative_branch() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::builder().disable_request_recording().start().await;
+        Mock::given(method("GET"))
+            .and(path("/main"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/master"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"tree": []})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = server.uri();
+        let repo = parse_repo_key("acme/kit@main").unwrap();
+        let (resolved, skills) = resolve_repo_skills_with(repo, &BTreeMap::new(), |repo, cached| {
+            let client = client.clone();
+            let base = base.clone();
+            Box::pin(async move {
+                fetch_repo_skills_with_client(
+                    repo,
+                    cached,
+                    &client,
+                    &format!("{base}/{}", repo.branch),
+                    &format!("{base}/zip"),
+                    without_github_auth,
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(resolved.branch, "master");
+        assert!(skills.is_empty());
+    }
+
+    #[tokio::test]
+    async fn github_invalid_tree_and_missing_zip_do_not_change_branch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        for body in ["{", "{}", r#"{"tree":null}"#] {
+            let server = MockServer::builder().disable_request_recording().start().await;
+            Mock::given(method("GET"))
+                .and(path("/tree"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/zip"))
+                .respond_with(ResponseTemplate::new(404))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let base = server.uri();
+            let attempts = AtomicUsize::new(0);
+            let repo = parse_repo_key("acme/kit@main").unwrap();
+            let error = resolve_repo_skills_with(repo, &BTreeMap::new(), |repo, cached| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                let client = client.clone();
+                let base = base.clone();
+                Box::pin(async move {
+                    fetch_repo_skills_with_client(
+                        repo,
+                        cached,
+                        &client,
+                        &format!("{base}/tree"),
+                        &format!("{base}/zip"),
+                        without_github_auth,
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("解析 GitHub 文件树响应失败"));
+            assert!(format!("{error:#}").contains("HTTP 404"));
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[tokio::test]
@@ -2745,6 +3686,223 @@ mod tests {
         assert_eq!(folded, "First line. Second line.");
         let (_, literal) = parse_skill_frontmatter("---\ndescription: |\n  First\n  Second\n---\n", "example");
         assert_eq!(literal, "First\nSecond");
+    }
+
+    #[test]
+    fn local_manifest_does_not_decode_large_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = temp.path().join("SKILL.md");
+        let mut file = std::fs::File::create(&manifest).unwrap();
+        file.write_all(b"---\nname: Sample\ndescription: Metadata\n---\n")
+            .unwrap();
+        file.write_all(&[0xff]).unwrap();
+        file.write_all(&vec![b'x'; 512 * 1024]).unwrap();
+        drop(file);
+
+        assert_eq!(
+            read_skill_manifest(&manifest, "fallback"),
+            ("Sample".into(), "Metadata".into())
+        );
+    }
+
+    #[test]
+    fn local_manifest_preserves_invalid_utf8_fallback_for_short_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = temp.path().join("SKILL.md");
+        let mut file = std::fs::File::create(&manifest).unwrap();
+        file.write_all(b"---\nname: Sample\n---\ninvalid: ")
+            .unwrap();
+        file.write_all(&[0xff]).unwrap();
+        drop(file);
+
+        assert_eq!(
+            read_skill_manifest(&manifest, "fallback"),
+            ("fallback".into(), String::new())
+        );
+    }
+
+    #[test]
+    fn local_manifest_reads_at_most_budget_plus_probe_byte() {
+        struct CountingReader<'a> {
+            bytes: &'a [u8],
+            count: &'a mut usize,
+        }
+
+        impl Read for CountingReader<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.bytes.read(buffer)?;
+                *self.count += count;
+                Ok(count)
+            }
+        }
+
+        let mut bytes = b"---\nname: Sample\n---\n".to_vec();
+        bytes.resize(SKILL_FRONTMATTER_LIMIT_BYTES * 2, b'x');
+        let mut count = 0;
+        let text = read_bounded_skill_manifest(CountingReader {
+            bytes: &bytes,
+            count: &mut count,
+        })
+        .unwrap();
+
+        assert_eq!(count, SKILL_FRONTMATTER_LIMIT_BYTES + 1);
+        assert_eq!(parse_skill_frontmatter(&text, "fallback").0, "Sample");
+    }
+
+    #[test]
+    fn local_manifest_preserves_crlf_and_multibyte_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = temp.path().join("SKILL.md");
+        std::fs::write(&manifest, "---\r\nname: Caf\u{e9}\r\ndescription: Example\r\n---\r\nbody")
+            .unwrap();
+
+        assert_eq!(
+            read_skill_manifest(&manifest, "fallback"),
+            ("Caf\u{e9}".into(), "Example".into())
+        );
+    }
+
+    #[test]
+    fn local_manifest_falls_back_when_frontmatter_exceeds_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = temp.path().join("SKILL.md");
+        let mut file = std::fs::File::create(&manifest).unwrap();
+        file.write_all(b"---\nname: Partial\nother: ").unwrap();
+        file.write_all(&vec![b'x'; 256 * 1024]).unwrap();
+        file.write_all(b"\n---\n").unwrap();
+        drop(file);
+
+        assert_eq!(
+            read_skill_manifest(&manifest, "fallback"),
+            ("fallback".into(), String::new())
+        );
+    }
+
+    #[test]
+    fn local_manifest_preserves_short_unclosed_frontmatter() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = temp.path().join("SKILL.md");
+        std::fs::write(&manifest, "---\nname: Incomplete\n").unwrap();
+
+        assert_eq!(
+            read_skill_manifest(&manifest, "fallback"),
+            ("Incomplete".into(), String::new())
+        );
+    }
+
+    #[test]
+    fn local_manifest_accepts_frontmatter_at_budget_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = temp.path().join("SKILL.md");
+        let prefix = b"---\nname: Boundary\nother: ";
+        let suffix = b"\n---\n";
+        let mut file = std::fs::File::create(&manifest).unwrap();
+        file.write_all(prefix).unwrap();
+        file.write_all(&vec![b'x'; SKILL_FRONTMATTER_LIMIT_BYTES - prefix.len() - suffix.len()])
+            .unwrap();
+        file.write_all(suffix).unwrap();
+        file.write_all(b"body after boundary").unwrap();
+        drop(file);
+
+        assert_eq!(
+            read_skill_manifest(&manifest, "fallback"),
+            ("Boundary".into(), String::new())
+        );
+    }
+
+    #[test]
+    fn local_manifest_falls_back_on_utf8_split_at_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = temp.path().join("SKILL.md");
+        let prefix = b"---\nname: Partial\nother: ";
+        let mut file = std::fs::File::create(&manifest).unwrap();
+        file.write_all(prefix).unwrap();
+        file.write_all(&vec![b'x'; SKILL_FRONTMATTER_LIMIT_BYTES - prefix.len()])
+            .unwrap();
+        file.write_all(&[0xc3, 0xa9]).unwrap();
+        file.write_all(b"\n---\n").unwrap();
+        drop(file);
+
+        assert_eq!(
+            read_skill_manifest(&manifest, "fallback"),
+            ("fallback".into(), String::new())
+        );
+    }
+
+    #[test]
+    fn local_manifest_accepts_large_crlf_body_with_utf8_split_at_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = temp.path().join("SKILL.md");
+        let prefix = "---\r\nname: Caf\u{e9}\r\n---\r\n".as_bytes();
+        let mut file = std::fs::File::create(&manifest).unwrap();
+        file.write_all(prefix).unwrap();
+        file.write_all(&vec![b'x'; SKILL_FRONTMATTER_LIMIT_BYTES - 1 - prefix.len()])
+            .unwrap();
+        file.write_all(&[0xc3, 0xa9]).unwrap();
+        drop(file);
+
+        assert_eq!(
+            read_skill_manifest(&manifest, "fallback"),
+            ("Caf\u{e9}".into(), String::new())
+        );
+    }
+
+    #[test]
+    fn local_manifest_rejects_truncated_delimiter_at_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = temp.path().join("SKILL.md");
+        let prefix = b"---\nname: Partial\nother: ";
+        let suffix = b"\n---";
+        let mut file = std::fs::File::create(&manifest).unwrap();
+        file.write_all(prefix).unwrap();
+        file.write_all(&vec![b'x'; SKILL_FRONTMATTER_LIMIT_BYTES - prefix.len() - suffix.len()])
+            .unwrap();
+        file.write_all(suffix).unwrap();
+        file.write_all(b"x\n").unwrap();
+        drop(file);
+
+        assert_eq!(
+            read_skill_manifest(&manifest, "fallback"),
+            ("fallback".into(), String::new())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_inventory_reads_manifest_through_directory_junction() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        write_skill(&source, "---\nname: Shared\ndescription: Linked\n---\nbody");
+        let skills = temp.path().join("codex-home").join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        let link = skills.join("shared");
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "could not create directory junction: {:?}", output);
+
+        let entries = manager(&temp).local_inventory();
+        assert_eq!(entry(&entries, "shared").name, "Shared");
+        assert_eq!(entry(&entries, "shared").description, "Linked");
+        std::fs::remove_dir(link).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_manifest_reads_through_shared_directory_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        write_skill(&source, "---\nname: Shared\ndescription: Linked\n---\nbody");
+        let link = temp.path().join("linked");
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+
+        assert_eq!(
+            read_skill_manifest(&link.join("SKILL.md"), "fallback"),
+            ("Shared".into(), "Linked".into())
+        );
     }
 
     #[test]

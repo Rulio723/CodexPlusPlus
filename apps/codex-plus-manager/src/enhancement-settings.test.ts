@@ -131,7 +131,7 @@ test("unified enhancements use the master switch and Chinese suggestion labels",
   assert.equal(settingControls(component("StepwiseSettingsPanel")).length, 0);
   for (const item of enhancementCatalog.items) {
     const standalone = enhancementGroup(item.group).standalone === true;
-    const unmanaged = ["enhancementsEnabled", "providerSyncEnabled"].includes(item.key);
+    const unmanaged = ["enhancementsEnabled", "providerSyncEnabled", "sessionIndexRepairEnabled"].includes(item.key);
     assert.equal(item.masterGated !== false, !standalone && !unmanaged, `${item.key} master gating`);
   }
 
@@ -192,6 +192,7 @@ test("every manager-visible catalog item has exactly one place in the manager", 
       ...cards.flatMap((card) => [...(card.item ? [card.item.key] : []), ...card.params.map((param) => param.key)]),
       "enhancementsEnabled",
       "providerSyncEnabled",
+      "sessionIndexRepairEnabled",
     ];
     const expected = enhancementCatalog.items
       .filter((item) => item.surfaces.includes("manager") && (!item.platforms || item.platforms.includes(platform)))
@@ -370,7 +371,7 @@ test("standalone quota unlock lives in its own group inside the general tab and 
   assert.equal(standalone.masterGated, false, "独立模式补丁不能被增强总开关禁用");
   // 开关说明要区分增强开启/关闭两种状态。
   assert.equal(standalone.descriptionWhenEnhancementsOn, "增强开启时此能力已自动生效；此开关只在关闭增强后生效。");
-  assert.match(standalone.description, /官方登录 \+ API 供应商在官方订阅额度耗尽后仍可发送；只改客户端发送状态，不改变真实用量与计费。/);
+  assert.match(standalone.description, /官方订阅额度耗尽后仍可发送，不区分供应商模式/);
   const control = component("EnhancementSettingControl");
   assert.match(control.getText(app), /masterEnabled && item\.descriptionWhenEnhancementsOn \? item\.descriptionWhenEnhancementsOn : item\.description/);
   assert.match(control.getText(app), /onToggle \?\? \(\(value\) => onFormChange\(\{ \.\.\.form, \[key\]: value \}\)\)/);

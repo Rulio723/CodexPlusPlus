@@ -89,6 +89,10 @@ export type GatewayPoolEntry = {
   keyConcurrency?: number | null;
   /** 转发前移除托管生图工具（image_generation，#228）。旧版后端没有。 */
   stripImageGenerationTool?: boolean;
+  /** 转发前移除 Responses 图片 `detail`（#2870）。旧版后端没有。 */
+  stripResponsesImageDetail?: boolean;
+  /** 不向该上游发送 `tool_search`（#2868）。旧版后端没有。 */
+  disableToolSearch?: boolean;
   /** 登录得到的账号：chatgpt / copilot / grok；普通供应商为空。 */
   account?: string;
   /** 订阅账号的套餐，如「ChatGPT Pro」「Copilot Pro+」。 */
@@ -1190,9 +1194,13 @@ export type ProviderDraft = {
   modelPrices?: Record<string, ProviderPrice> | null;
   /** 转发前移除托管生图工具（image_generation）：不支持生图的 Responses 中转用（#228）。 */
   stripImageGenerationTool?: boolean;
+  /** 转发前移除 Responses 图片 `detail`：不认 OpenAI detail 扩展的上游用（#2870）。 */
+  stripResponsesImageDetail?: boolean;
+  /** 不向上游发送 `tool_search`：上游 400 时开启（#2868）。 */
+  disableToolSearch?: boolean;
 };
 
-const NO_PRICE = { priceCurrency: "CNY", priceInput: "", priceCached: "", priceOutput: "", proxy: "", stripImageGenerationTool: false };
+const NO_PRICE = { priceCurrency: "CNY", priceInput: "", priceCached: "", priceOutput: "", proxy: "", stripImageGenerationTool: false, stripResponsesImageDetail: false, disableToolSearch: false };
 
 export function providerDraftFromPreset(preset: GatewayPreset | null): ProviderDraft {
   if (!preset) return { name: "", baseUrl: "", keys: "", protocol: "chatCompletions", model: "", modelList: "", ...NO_PRICE };
@@ -1222,6 +1230,8 @@ export function providerDraftFromEntry(entry: GatewayPoolEntry): ProviderDraft {
     priceOutput: entry.price ? String(entry.price.output) : "",
     proxy: entry.proxy ?? "",
     stripImageGenerationTool: entry.stripImageGenerationTool === true,
+    stripResponsesImageDetail: entry.stripResponsesImageDetail === true,
+    disableToolSearch: entry.disableToolSearch === true,
   };
 }
 
@@ -1238,6 +1248,8 @@ export function providerInput(draft: ProviderDraft) {
     modelPrices: draft.modelPrices ?? null,
     proxy: draft.proxy.trim(),
     stripImageGenerationTool: draft.stripImageGenerationTool === true,
+    stripResponsesImageDetail: draft.stripResponsesImageDetail === true,
+    disableToolSearch: draft.disableToolSearch === true,
   };
 }
 
