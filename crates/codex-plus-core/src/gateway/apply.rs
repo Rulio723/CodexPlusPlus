@@ -473,7 +473,10 @@ fn codex_model_metadata(gateway: &GatewaySettings, binding: &AgentBinding) -> St
                 fields.insert("additional_speed_tiers".into(), json!([]));
             }
             fields.insert("display_name".into(), json!(group.name));
-            fields.insert("description".into(), json!(format!("{model} · 模型组")));
+            fields.insert(
+                "description".into(),
+                json!(format!("{} · 模型组", group.name)),
+            );
             fields.insert("codex_plus_group".into(), json!("模型组"));
             fields.insert("codex_plus_group_id".into(), json!(CODEX_GROUPS_GROUP_ID));
             if codex_favorite(gateway, &relays, &model) {
@@ -809,13 +812,15 @@ fn with_openai_session_identity(contents: &str) -> anyhow::Result<String> {
 /// 池里能借给 Codex 登录的账号：打开着的、网关自己登录的 ChatGPT 账号（按池里的顺序取第一个）。
 fn lendable_login(gateway: &GatewaySettings) -> Option<&GatewayProvider> {
     gateway.providers.iter().find(|provider| {
-        provider.enabled && crate::official_login::is_gateway_owned_login(&provider.relay)
+        provider.enabled && provider.source != "native:external"
+            && crate::official_login::is_gateway_owned_login(&provider.relay)
     })
 }
 
 /// 把网关的 ChatGPT 账号借给 Codex 登录：token 写进 Codex 的 auth.json（其余字段不动），
 /// 网关里标记「借出」——之后这个账号以 Codex 那份为准，网关刷新也写回那里，两边始终同一代。
 fn lend_login_to_codex(ctx: &ApplyContext, provider_id: &str) -> anyhow::Result<()> {
+    let _guard = crate::official_login::native_auth_write_guard(&ctx.codex_home)?;
     // 带锁读改写：借出用的是锁内读到的最新一代 token，也不会把同时刷新写回的 token 盖掉。
     ctx.gateway.update(|gateway| {
         let Some(provider) = gateway
@@ -845,32 +850,40 @@ fn lend_login_to_codex(ctx: &ApplyContext, provider_id: &str) -> anyhow::Result<
 /// 收回借给 Codex 的账号：Codex 那份是最新一代，token 写回网关、去掉「借出」标记，
 /// 再从 Codex 的 auth.json 里拿掉这个登录（借之前 Codex 本来就没登录）。
 pub fn return_lent_login(store: &GatewayStore, codex_home: &std::path::Path) -> anyhow::Result<()> {
+    let _guard = crate::official_login::native_auth_write_guard(codex_home)?;
     let path = codex_home.join("auth.json");
-    let live = std::fs::read_to_string(&path).unwrap_or_default();
-    let live_login = crate::official_login::official_login_from_auth_contents(&live);
+    let live = stash::read_optional(&path)?.unwrap_or_default();
+    let expected = store.load()?;
+    let explicit_selection = if codex_home == crate::codex_home::default_codex_home_dir() {
+        SettingsStore::default().load()?.native_auth_selection.is_some()
+    } else {
+        false
+    };
     // 带锁读改写：只动借出的那几个供应商，不拿旧状态覆盖同时写进来的改动（没有借出的就不写盘）。
     let (_, strip_live) = store.update(|gateway| {
         let mut strip_live = false;
+        if stash::read_optional(&path)?.unwrap_or_default() != live {
+            bail!("原生登录已更新，已停止收回借用账号，请重试");
+        }
         for provider in gateway
             .providers
             .iter_mut()
             .filter(|provider| crate::official_login::is_lent_to_codex(&provider.relay))
         {
+            let previous = expected.provider(&provider.relay.id)
+                .context("借用账号已被其他进程更新，请重试")?;
+            if !crate::native_auth::same_credential_generation(
+                &provider.relay.auth_contents, &previous.relay.auth_contents,
+            ) {
+                bail!("借用账号凭据已刷新，已停止旧凭据回写，请重试");
+            }
             let mut auth: Value = serde_json::from_str(&provider.relay.auth_contents)?;
-            let account = auth
-                .pointer("/tokens/account_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            if let Some(login) = live_login
-                .as_ref()
-                .filter(|login| !account.is_empty() && login.account_id == account)
-            {
-                auth["tokens"]["access_token"] = json!(login.access_token);
-                if !login.refresh_token.is_empty() {
-                    auth["tokens"]["refresh_token"] = json!(login.refresh_token);
-                }
-                strip_live = true;
+            if crate::native_auth::same_account(&provider.relay.auth_contents, &live) {
+                auth = serde_json::from_str(&crate::native_auth::merge_selected_auth(
+                    &provider.relay.auth_contents,
+                    Some(&live),
+                )?)?;
+                strip_live = !explicit_selection;
             }
             if let Some(object) = auth.as_object_mut() {
                 object.remove(crate::official_login::LENT_TO_CODEX_MARKER);
@@ -880,6 +893,9 @@ pub fn return_lent_login(store: &GatewayStore, codex_home: &std::path::Path) -> 
         Ok(strip_live)
     })?;
     if strip_live && let Ok(Value::Object(mut object)) = serde_json::from_str::<Value>(&live) {
+        if stash::read_optional(&path)?.unwrap_or_default() != live {
+            bail!("原生登录已更新，已保留当前登录，请重试");
+        }
         for key in ["tokens", "auth_mode", "last_refresh"] {
             object.remove(key);
         }
@@ -905,6 +921,57 @@ fn codex_signed_in(codex_home: &std::path::Path) -> bool {
                 .and_then(Value::as_str)
                 .is_some_and(|token| !token.trim().is_empty())
         })
+}
+
+/// 接入前对账 auth.json 里的 ChatGPT 登录：若它属于池里某个已停用的网关自有账号，
+/// 那份 token 多半是过期代际——留着它启动 Codex 只会弹官方登录门，而用户要的其实是
+/// 纯 API Key 模式。把这种登录从 auth.json 里拿掉（OPENAI_API_KEY 等其余字段不动）。
+/// 不属于池里任何账号的登录视为用户自己登的，不碰。
+fn reconcile_codex_sign_in(ctx: &ApplyContext, gateway: &GatewaySettings) -> bool {
+    let path = ctx.codex_home.join("auth.json");
+    let live = std::fs::read_to_string(&path).unwrap_or_default();
+    let account = serde_json::from_str::<Value>(&live)
+        .ok()
+        .and_then(|auth| {
+            auth.pointer("/tokens/account_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    let owner = (!account.is_empty()).then(|| {
+        gateway.providers.iter().find(|provider| {
+            crate::official_login::is_gateway_owned_login(&provider.relay)
+                && crate::official_login::chatgpt_account_id_from_auth_contents(
+                    &provider.relay.auth_contents,
+                ) == account
+        })
+    });
+    if let Some(Some(provider)) = owner.filter(|entry| entry.is_some_and(|p| !p.enabled))
+        && let Ok(Value::Object(mut object)) = serde_json::from_str::<Value>(&live)
+    {
+        let removed = object.remove("tokens").is_some()
+            | object.remove("auth_mode").is_some()
+            | object.remove("last_refresh").is_some();
+        if removed {
+            let result = crate::settings::atomic_write(
+                &path,
+                format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&Value::Object(object)).unwrap_or_default()
+                )
+                .as_bytes(),
+            );
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                if result.is_ok() {
+                    "gateway.stale_lent_login_stripped"
+                } else {
+                    "gateway.stale_lent_login_strip_failed"
+                },
+                serde_json::json!({ "provider": provider.relay.id }),
+            );
+        }
+    }
+    codex_signed_in(&ctx.codex_home)
 }
 
 /// 接入网关前 Codex 实时配置的副本。只在实时配置与直连模式的记录对不上时才存：
@@ -1116,9 +1183,19 @@ fn restore_codex_files(
     saved: &CodexLiveStash,
     live: &CodexLiveStash,
 ) -> anyhow::Result<()> {
+    let _guard = crate::official_login::native_auth_write_guard(&ctx.codex_home)?;
     let config = restored_codex_config(saved, live)?;
     stash::write_or_remove(&ctx.codex_home.join(CODEX_LIVE_FILES[0]), config.as_deref())?;
     let auth = restored_codex_auth(saved, live)?;
+    let projected = crate::native_auth::project_native_auth(
+        &ctx.codex_home,
+        auth.as_deref().unwrap_or("{}"),
+    )?;
+    let auth = if auth.is_some() || projected.trim() != "{}" {
+        Some(projected)
+    } else {
+        None
+    };
     stash::write_or_remove(&ctx.codex_home.join(CODEX_LIVE_FILES[1]), auth.as_deref())?;
     Ok(())
 }
@@ -1227,6 +1304,23 @@ pub(crate) fn preview_codex_stashed_restore(
     ]))
 }
 
+/// 存档投影给不出逐项结果时（没存档、或要切回聚合供应商）：在隔离副本里跑真实的
+/// [`restore_codex`]，把断开后的实时文件读回来。预览与真实断开走同一份逻辑，
+/// 看到什么就是断开会写什么；只在 `ctx` 指向隔离副本时使用。
+pub(crate) fn preview_codex_disconnect_apply(
+    ctx: &ApplyContext,
+    binding: &AgentBinding,
+) -> anyhow::Result<Vec<(PathBuf, Option<String>)>> {
+    restore_codex(ctx, binding)?;
+    CODEX_LIVE_FILES
+        .iter()
+        .map(|name| {
+            let path = ctx.codex_home.join(name);
+            stash::read_optional(&path).map(|text| (path, text))
+        })
+        .collect()
+}
+
 /// 把托管供应商放进直连模式的列表并切过去（已经在用时只刷新它的配置）。
 ///
 /// 实时配置被别的工具改过、与直连模式的记录对不上（直连模式里切换会弹「实时配置冲突」）时，
@@ -1244,8 +1338,10 @@ fn write_codex(
     let wsl_host = crate::wsl_network::codex_gateway_wsl_host(&ctx.codex_home, ctx.port).address();
     // Codex 自己没登录、池里有网关登录的 ChatGPT 账号：借给 Codex，让它以官方身份接入。
     // WSL 模式下不用官方身份（见 [`codex_gateway_profile_on`]），也就不借。
-    let signed_in = codex_signed_in(&ctx.codex_home);
-    let lend = (!signed_in && wsl_host.is_none())
+    let signed_in = reconcile_codex_sign_in(ctx, gateway);
+    let lend = (!signed_in
+        && wsl_host.is_none()
+        && crate::native_auth::selection_allows_auto_lend(&settings))
         .then(|| lendable_login(gateway).map(|provider| provider.relay.id.clone()))
         .flatten();
     let mut profile = codex_gateway_profile_on(
@@ -1936,7 +2032,9 @@ pub fn sync_codex_identity(ctx: &ApplyContext) -> anyhow::Result<bool> {
     }
     let keeps_login =
         settings.active_relay_session_provider() == crate::settings::RelaySessionProvider::Openai;
-    let can_sign_in = codex_signed_in(&ctx.codex_home) || lendable_login(&gateway).is_some();
+    let can_sign_in = codex_signed_in(&ctx.codex_home)
+        || (crate::native_auth::selection_allows_auto_lend(&settings)
+            && lendable_login(&gateway).is_some());
     if keeps_login == can_sign_in {
         return Ok(false);
     }
@@ -2261,6 +2359,7 @@ pub fn copy_claude_provider(provider: &ClaudeProvider) -> anyhow::Result<RelayPr
         model_prices: None,
         proxy: None,
         strip_image_generation_tool: None,
+        subscription_policy: None,
         strip_responses_image_detail: None,
         disable_tool_search: None,
     })?;
@@ -2317,6 +2416,7 @@ pub fn copy_grok_profile(
         model_prices: None,
         proxy: None,
         strip_image_generation_tool: None,
+        subscription_policy: None,
         strip_responses_image_detail: None,
         disable_tool_search: None,
     })?;
@@ -2642,6 +2742,8 @@ pub struct ProviderInput {
     /// 转发前移除托管生图工具（#228）；不传表示不改（编辑时保留原来的）。
     #[serde(default)]
     pub strip_image_generation_tool: Option<bool>,
+    #[serde(default)]
+    pub subscription_policy: Option<crate::gateway::store::SubscriptionPolicy>,
     /// 转发前移除 Responses 图片 `detail`（#2870）；不传表示不改（编辑时保留原来的）。
     #[serde(default)]
     pub strip_responses_image_detail: Option<bool>,
@@ -2760,6 +2862,7 @@ fn add_provider_with(
             upstream_gone: Vec::new(),
             models_checked_at_ms: 0,
             newapi_access: None,
+            subscription_policy: None,
             upstream_meta: Default::default(),
             relay,
             extra: Default::default(),
@@ -2810,6 +2913,10 @@ pub fn create_provider(
             provider.model_prices =
                 clean_model_prices(input.model_prices.clone().unwrap_or_default());
             provider.proxy = proxy;
+            provider.subscription_policy = input
+                .subscription_policy
+                .clone()
+                .map(crate::gateway::store::SubscriptionPolicy::normalized);
             Ok(())
         },
     )
@@ -2854,6 +2961,37 @@ fn update_provider_in(
     else {
         bail!("供应商不存在：{id}");
     };
+    if crate::official_login::member_uses_official_login_transport(&provider.relay) {
+        if let Some(proxy) = &input.proxy {
+            provider.proxy = clean_proxy(proxy)?;
+        }
+        if !input.name.trim().is_empty() {
+            provider.relay.name = input.name.trim().to_string();
+        }
+        if !input.model.trim().is_empty() || !input.model_list.trim().is_empty() {
+            provider.relay.model = input.model.trim().to_string();
+            provider.relay.model_list = input.model_list.clone();
+        }
+        if let Some(value) = input.strip_image_generation_tool {
+            provider.relay.strip_image_generation_tool = value;
+        }
+        if let Some(value) = input.strip_responses_image_detail {
+            provider.relay.strip_responses_image_detail = value;
+        }
+        if let Some(value) = input.disable_tool_search {
+            provider.relay.disable_tool_search = value;
+        }
+        if input.price.is_some() {
+            provider.price = clean_price(input.price.clone());
+        }
+        if let Some(prices) = &input.model_prices {
+            provider.model_prices = clean_model_prices(prices.clone());
+        }
+        if let Some(policy) = input.subscription_policy.clone() {
+            provider.subscription_policy = Some(policy.normalized());
+        }
+        return Ok(());
+    }
     let mut input = input.clone();
     let keep_keys = clean_keys(&input.keys).is_empty();
     if keep_keys {
@@ -2885,6 +3023,9 @@ fn update_provider_in(
     // 没传「移除托管生图工具」时沿用原来的选择。
     if input.strip_image_generation_tool.is_none() {
         relay.strip_image_generation_tool = provider.relay.strip_image_generation_tool;
+    }
+    if let Some(policy) = input.subscription_policy.clone() {
+        provider.subscription_policy = Some(policy.normalized());
     }
     // 没传「移除图片 detail」时沿用原来的选择。
     if input.strip_responses_image_detail.is_none() {
@@ -3600,6 +3741,7 @@ mod tests {
                 model_prices: None,
                 proxy: None,
                 strip_image_generation_tool: None,
+                subscription_policy: None,
                 strip_responses_image_detail: None,
                 disable_tool_search: None,
             },
@@ -3646,6 +3788,7 @@ mod tests {
                 model_prices: None,
                 proxy: None,
                 strip_image_generation_tool: None,
+                subscription_policy: None,
                 strip_responses_image_detail: None,
                 disable_tool_search: None,
             },
@@ -3782,8 +3925,10 @@ mod tests {
                     window_minutes: Some(300),
                     used_percent: 99.0,
                     resets_at_ms: None,
+                    ..Default::default()
                 }],
                 updated_at_ms: 0,
+                ..Default::default()
             },
         );
 
@@ -3834,6 +3979,150 @@ mod tests {
             ["openai/gpt-5", "openai/*"],
             "OpenRouter 声明的 openai/gpt-5 和还能匹配到它的通配符留下"
         );
+    }
+
+    fn subscription_auth(subject: &str, generation: u8, lent: bool) -> String {
+        use base64::Engine;
+        let claims = json!({
+            "iss": "https://auth.openai.com",
+            "sub": subject,
+            "generation": generation,
+        });
+        let jwt = format!(
+            "header.{}.signature",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string())
+        );
+        json!({
+            "auth_mode": "chatgpt",
+            crate::official_login::GATEWAY_OWNED_MARKER: true,
+            crate::official_login::LENT_TO_CODEX_MARKER: lent,
+            "last_refresh": format!("generation-{generation}"),
+            "tokens": {
+                "account_id": "shared-workspace",
+                "id_token": jwt,
+                "access_token": format!("access-{subject}-{generation}"),
+                "refresh_token": format!("refresh-{subject}-{generation}"),
+            }
+        }).to_string()
+    }
+
+    #[test]
+    fn subscription_policy_update_preserves_official_credentials_and_transport() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = GatewayStore::at(temp.path().join("gateway.json"));
+        let relay = RelayProfile {
+            name: "ChatGPT".to_string(),
+            relay_mode: RelayMode::Official,
+            base_url: String::new(),
+            auth_contents: subscription_auth("alice", 0, false),
+            model: "gpt-6.1-sol".to_string(),
+            model_list: "gpt-6.1-sol".to_string(),
+            ..RelayProfile::default()
+        };
+        let (_, id) = add_provider(&store, relay, "login:chatgpt", None).unwrap();
+        let before = store.load().unwrap();
+        let policy = crate::gateway::store::SubscriptionPolicy {
+            default_used_percent_limit: Some(80),
+            ..Default::default()
+        };
+        let updated = update_provider(&store, &id, &ProviderInput {
+            subscription_policy: Some(policy.clone()),
+            ..ProviderInput::default()
+        }).unwrap();
+        assert_eq!(updated.provider(&id).unwrap().relay, before.provider(&id).unwrap().relay);
+        assert_eq!(updated.provider(&id).unwrap().subscription_policy.as_ref(), Some(&policy));
+        let updated = update_provider(&store, &id, &ProviderInput {
+            name: "Renamed account".into(),
+            model: "new-model".into(),
+            model_list: "new-model\nanother-model".into(),
+            proxy: Some("http://127.0.0.1:7890".into()),
+            strip_image_generation_tool: Some(true),
+            ..Default::default()
+        }).unwrap();
+        let provider = updated.provider(&id).unwrap();
+        let original = before.provider(&id).unwrap();
+        assert_eq!(provider.relay.name, "Renamed account");
+        assert_eq!(provider.relay.model, "new-model");
+        assert_eq!(provider.relay.model_list, "new-model\nanother-model");
+        assert_eq!(provider.proxy, "http://127.0.0.1:7890");
+        assert!(provider.relay.strip_image_generation_tool);
+        assert_eq!(provider.relay.auth_contents, original.relay.auth_contents);
+        assert_eq!(provider.relay.official_account_ref, original.relay.official_account_ref);
+        assert_eq!(provider.relay.relay_mode, original.relay.relay_mode);
+        assert_eq!(provider.subscription_policy.as_ref(), Some(&policy));
+        let persisted_before_rejected = store.load().unwrap();
+        assert!(update_provider(&store, &id, &ProviderInput {
+            proxy: Some("not a proxy".into()),
+            ..Default::default()
+        }).is_err());
+        let persisted = store.load().unwrap();
+        assert_eq!(persisted, persisted_before_rejected);
+        let persisted_provider = persisted.provider(&id).unwrap();
+        assert_eq!(persisted_provider.relay.model, "");
+        assert_eq!(
+            persisted_provider.relay.model_list,
+            "new-model\nanother-model"
+        );
+        assert_eq!(
+            persisted_provider.relay.gateway_proxy.as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
+        assert_eq!(persisted_provider.relay.auth_contents, original.relay.auth_contents);
+        assert_eq!(
+            persisted_provider.relay.official_account_ref,
+            original.relay.official_account_ref
+        );
+        assert_eq!(persisted_provider.relay.relay_mode, original.relay.relay_mode);
+    }
+
+    #[test]
+    fn returning_lent_login_preserves_another_member_in_the_same_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = GatewayStore::at(temp.path().join("gateway.json"));
+        let home = temp.path().join("codex");
+        std::fs::create_dir_all(&home).unwrap();
+        let original = subscription_auth("alice", 0, true);
+        let other = subscription_auth("bob", 1, false);
+        let relay = RelayProfile {
+            name: "ChatGPT".to_string(),
+            relay_mode: RelayMode::Official,
+            auth_contents: original.clone(),
+            ..RelayProfile::default()
+        };
+        let (_, id) = add_provider(&store, relay, "login:chatgpt", None).unwrap();
+        std::fs::write(home.join("auth.json"), &other).unwrap();
+        return_lent_login(&store, &home).unwrap();
+        assert_eq!(std::fs::read_to_string(home.join("auth.json")).unwrap(), other);
+        let gateway = store.load().unwrap();
+        let stored = &gateway.provider(&id).unwrap().relay;
+        assert!(crate::native_auth::same_credential_generation(&stored.auth_contents, &original));
+        assert!(!crate::official_login::is_lent_to_codex(stored));
+    }
+
+    #[test]
+    fn returning_lent_login_saves_the_complete_rotated_token_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = GatewayStore::at(temp.path().join("gateway.json"));
+        let home = temp.path().join("codex");
+        std::fs::create_dir_all(&home).unwrap();
+        let relay = RelayProfile {
+            name: "ChatGPT".to_string(),
+            relay_mode: RelayMode::Official,
+            auth_contents: subscription_auth("alice", 0, true),
+            ..RelayProfile::default()
+        };
+        let (_, id) = add_provider(&store, relay, "login:chatgpt", None).unwrap();
+        let mut live: Value = serde_json::from_str(&subscription_auth("alice", 1, false)).unwrap();
+        live["OPENAI_API_KEY"] = json!("local-gateway-key");
+        std::fs::write(home.join("auth.json"), live.to_string()).unwrap();
+        return_lent_login(&store, &home).unwrap();
+        let gateway = store.load().unwrap();
+        let saved: Value = serde_json::from_str(&gateway.provider(&id).unwrap().relay.auth_contents).unwrap();
+        assert_eq!(saved["tokens"], live["tokens"]);
+        assert_eq!(saved["last_refresh"], live["last_refresh"]);
+        let native: Value = serde_json::from_str(&std::fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        assert!(native.get("tokens").is_none());
+        assert_eq!(native["OPENAI_API_KEY"], "local-gateway-key");
     }
 
     #[test]

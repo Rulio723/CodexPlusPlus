@@ -56,6 +56,7 @@ fn deepseek_input() -> ProviderInput {
         model_prices: None,
         proxy: None,
         strip_image_generation_tool: None,
+        subscription_policy: None,
         strip_responses_image_detail: None,
         disable_tool_search: None,
     }
@@ -77,6 +78,7 @@ fn codex_metadata_disables_search_tool_for_kimi_and_auto_group() {
         model_prices: None,
         proxy: None,
         strip_image_generation_tool: None,
+        subscription_policy: None,
         strip_responses_image_detail: None,
         disable_tool_search: None,
     };
@@ -496,6 +498,7 @@ fn codex_gateway_catalog_carries_display_names_reasoning_and_provider_groups() {
             model_prices: None,
             proxy: None,
             strip_image_generation_tool: None,
+            subscription_policy: None,
             strip_responses_image_detail: None,
             disable_tool_search: None,
         },
@@ -585,7 +588,34 @@ fn codex_gateway_catalog_carries_display_names_reasoning_and_provider_groups() {
     assert_eq!(model("claude-opus-5-5")["display_name"], "Claude-Opus-5-5");
     let group = model("group/daily");
     assert_eq!(group["display_name"], "Daily");
+    assert_eq!(group["description"], "Daily · 模型组");
     assert_eq!(group["codex_plus_group"], "模型组");
+
+    let (_, renamed_id) = save_group(
+        &ctx.gateway,
+        &GroupInput {
+            id: "daily".into(),
+            name: "6.1 Sol".into(),
+            mode: GroupMode::InOrder,
+            members: vec![GroupMember {
+                model: "claude-opus-5-5".into(),
+                weight: 1,
+            }],
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(renamed_id, "daily");
+    refresh_enabled(ctx).unwrap();
+    let renamed_catalog = codex_catalog(ctx);
+    let renamed_group = renamed_catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["slug"] == "group/daily")
+        .unwrap_or_else(|| panic!("目录里没有重命名后的 group/daily：{renamed_catalog}"));
+    assert_eq!(renamed_group["display_name"], "6.1 Sol");
+    assert_eq!(renamed_group["description"], "6.1 Sol · 模型组");
 
     // 注入层读的模型元数据（托管供应商的 model_metadata）同样给出推理档位与分组。
     let settings = ctx.settings.load().unwrap();
@@ -667,6 +697,7 @@ fn codex_group_offers_fast_only_when_every_member_supports_it() {
                 model_prices: None,
                 proxy: None,
                 strip_image_generation_tool: None,
+                subscription_policy: None,
                 strip_responses_image_detail: None,
                 disable_tool_search: None,
             },
@@ -948,6 +979,7 @@ fn signed_in_codex_keeps_its_chatgpt_identity_through_the_gateway() {
 /// 借出期间以 Codex 那份 token 为准；断开时把最新一代收回网关，Codex 回到没登录的样子。
 #[test]
 fn pool_chatgpt_account_is_lent_to_codex_and_taken_back() {
+    use base64::Engine;
     let fixture = fixture(57398);
     let ctx = &fixture.ctx;
     std::fs::create_dir_all(&ctx.codex_home).unwrap();
@@ -982,6 +1014,15 @@ fn pool_chatgpt_account_is_lent_to_codex_and_taken_back() {
     };
     assert!(read_auth().get("tokens").is_none(), "Codex 本来没登录");
 
+    let id_token = format!(
+        "e30.{}.signature",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            json!({
+                "sub": "pool-user",
+                "https://api.openai.com/auth": { "chatgpt_account_id": "acc-pool" }
+            }).to_string()
+        )
+    );
     // 网关里登录的 ChatGPT 账号。
     let chatgpt = RelayProfile {
         name: "ChatGPT Pro".into(),
@@ -990,7 +1031,7 @@ fn pool_chatgpt_account_is_lent_to_codex_and_taken_back() {
         auth_contents: json!({
             "auth_mode": "chatgpt",
             "codex_plus_gateway": true,
-            "tokens": { "id_token": "idt", "access_token": "at-1", "refresh_token": "rt-1", "account_id": "acc-pool" }
+            "tokens": { "id_token": id_token, "access_token": "at-1", "refresh_token": "rt-1", "account_id": "acc-pool" }
         })
         .to_string(),
         model_list: "gpt-6.1-sol".into(),
@@ -1005,7 +1046,7 @@ fn pool_chatgpt_account_is_lent_to_codex_and_taken_back() {
     assert_eq!(auth["auth_mode"], "chatgpt");
     assert_eq!(auth["tokens"]["account_id"], "acc-pool");
     assert_eq!(auth["tokens"]["refresh_token"], "rt-1");
-    assert_eq!(auth["tokens"]["id_token"], "idt");
+    assert_eq!(auth["tokens"]["id_token"], id_token);
     assert_eq!(
         ctx.settings.load().unwrap().active_relay_session_provider(),
         codex_plus_core::settings::RelaySessionProvider::Openai,
@@ -1039,7 +1080,97 @@ fn pool_chatgpt_account_is_lent_to_codex_and_taken_back() {
     assert_eq!(ctx.settings.load().unwrap().active_relay_id, "direct");
 }
 
-/// #2760：网关供应商可以设成「不使用代理（直连）」：存成 `direct`（不分大小写），
+/// 借出的 ChatGPT 账号在池里被停用后，auth.json 里残留的登录态要在下一次接入/刷新
+/// 时被清掉：Codex 回到纯 API Key 模式，而不是带着过期代际的 token 弹官方登录门。
+#[test]
+fn disabled_pool_account_login_is_stripped_from_codex_auth() {
+    use base64::Engine;
+    let fixture = fixture(57403);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    let mut direct = codex_plus_core::provider_import::pool_relay_profile(
+        "直连",
+        "https://api.direct.test/v1",
+        "sk-direct",
+        RelayProtocol::Responses,
+        "gpt-direct",
+        "gpt-direct",
+        &[],
+    )
+    .unwrap();
+    direct.id = "direct".into();
+    direct.relay_mode = RelayMode::PureApi;
+    codex_plus_core::relay_config::normalize_relay_profile_for_storage(&mut direct).unwrap();
+    let mut seeded = BackendSettings::default();
+    seeded.relay_profiles_enabled = true;
+    seeded.relay_profiles = vec![direct];
+    seeded.active_relay_id = "direct".into();
+    codex_plus_core::relay_switch::switch_relay_profile_in_home(
+        &ctx.settings,
+        &ctx.codex_home,
+        seeded,
+        "",
+    )
+    .unwrap();
+    let auth_path = ctx.codex_home.join("auth.json");
+    let read_auth = || -> Value {
+        serde_json::from_str(&std::fs::read_to_string(&auth_path).unwrap_or_default())
+            .unwrap_or(Value::Null)
+    };
+
+    let id_token = format!(
+        "e30.{}.signature",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            json!({
+                "sub": "pool-user",
+                "https://api.openai.com/auth": { "chatgpt_account_id": "acc-pool" }
+            }).to_string()
+        )
+    );
+    let chatgpt = RelayProfile {
+        name: "ChatGPT Pro".into(),
+        relay_mode: RelayMode::Official,
+        protocol: RelayProtocol::Responses,
+        auth_contents: json!({
+            "auth_mode": "chatgpt",
+            "codex_plus_gateway": true,
+            "tokens": { "id_token": id_token, "access_token": "at-1", "refresh_token": "rt-1", "account_id": "acc-pool" }
+        })
+        .to_string(),
+        model_list: "gpt-6.1-sol".into(),
+        ..RelayProfile::default()
+    };
+    let (_, pool_id) =
+        codex_plus_core::gateway::apply::add_provider(&ctx.gateway, chatgpt, "login:chatgpt", None)
+            .unwrap();
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    assert_eq!(read_auth()["tokens"]["account_id"], "acc-pool", "已借出");
+
+    // 用户在供应商池里停用了这个账号。
+    ctx.gateway
+        .update(|gateway| {
+            let provider = gateway
+                .providers
+                .iter_mut()
+                .find(|provider| provider.relay.id == pool_id)
+                .unwrap();
+            provider.enabled = false;
+            Ok(())
+        })
+        .unwrap();
+
+    // 池变动后重写开着的 Agent 配置：auth.json 里的残留登录被清掉。
+    codex_plus_core::gateway::apply::refresh_enabled(ctx).unwrap();
+    let auth = read_auth();
+    assert!(auth.get("tokens").is_none(), "停用账号的登录被清掉");
+    assert!(auth.get("auth_mode").is_none());
+    assert!(auth.get("last_refresh").is_none());
+    // 网关那份不受影响：凭据还在供应商快照里。
+    let pool = ctx.gateway.load().unwrap();
+    let pool_auth: Value =
+        serde_json::from_str(&pool.provider(&pool_id).unwrap().relay.auth_contents).unwrap();
+    assert_eq!(pool_auth["tokens"]["account_id"], "acc-pool");
+}
 /// 解析出的代理就是它（不退回系统代理或进程级代理），建 client 时关掉所有代理。
 #[test]
 fn gateway_provider_proxy_can_be_direct() {
@@ -1814,7 +1945,8 @@ fn gateway_provider_keeps_strip_image_generation_tool_across_edits() {
     assert!(relay(&store).strip_image_generation_tool);
     assert!(relay(&store).strips_image_generation_tool());
 
-    let keep = ProviderInput { strip_image_generation_tool: None, ..input.clone() };
+    let keep = ProviderInput { strip_image_generation_tool: None,
+            subscription_policy: None, ..input.clone() };
     update_provider(&store, &id, &keep).unwrap();
     assert!(relay(&store).strip_image_generation_tool);
 
@@ -1844,6 +1976,7 @@ fn unsigned_codex_gateway_declares_local_api_identity_for_native_fast() {
             model_prices: None,
             proxy: None,
             strip_image_generation_tool: None,
+            subscription_policy: None,
             strip_responses_image_detail: None,
             disable_tool_search: None,
         },

@@ -390,9 +390,10 @@ test("全应用不用系统原生的确认 / 提示 / 输入框，统一用 app-
   assert.match(app, /<AppDialogHost \/>/);
 });
 
-test("供应商的价格与代理在供应商池详情里编辑，添加 / 编辑弹窗只管连接、Key 与模型", () => {
+test("普通供应商的价格与代理在详情里编辑，官方账号可在编辑弹窗设置代理", () => {
   const form = readFileSync(new URL("./ProviderFormDialog.tsx", import.meta.url), "utf8");
-  assert.doesNotMatch(form, /t\("价格"\)|t\("代理"\)|priceInput: event|proxy: event/);
+  assert.doesNotMatch(form, /t\("价格"\)|t\("代理"\)|priceInput: event/);
+  assert.match(form, /subscriptionEditing[\s\S]*t\("HTTP 代理"\)/);
   const providers = readFileSync(new URL("./GatewayProviders.tsx", import.meta.url), "utf8");
   assert.match(providers, /"save_gateway_provider_extras"/);
   assert.match(providers, /<ProviderExtrasDialog/);
@@ -404,13 +405,15 @@ test("供应商的价格与代理在供应商池详情里编辑，添加 / 编�
 test("赞助商单独一组放在「添加供应商」最前面，不再混在中转里", () => {
   const presets = gatewayPresets(new Date(2026, 9, 26));
   const sponsors = presets.filter((preset) => preset.section === "sponsor").map((preset) => preset.key);
-  assert.deepEqual(sponsors, ["jojocode-max", "runapi", "apikeyfun", "cccccc-api"]);
+  assert.deepEqual(sponsors, ["jojocode-max", "runapi", "apikeyfun", "cccccc-api", "tokenmy"]);
   // 到期日当天仍显示，第二天起从目录里去掉。
   const keys = (date: Date) => gatewayPresets(date).map((preset) => preset.key);
-  assert.ok(keys(new Date(2026, 10, 7)).includes("runapi"));
-  assert.ok(!keys(new Date(2026, 10, 8)).includes("runapi"));
-  assert.deepEqual(activeSponsorIds(new Date(2026, 10, 23)), ["jojocode-max", "cccccc-api"]);
-  assert.deepEqual(activeSponsorIds(new Date(2026, 11, 2)), ["jojocode-max"]);
+  assert.ok(keys(new Date(2026, 11, 7)).includes("runapi"));
+  assert.ok(!keys(new Date(2026, 11, 8)).includes("runapi"));
+  assert.ok(keys(new Date(2026, 10, 20)).includes("tokenmy"));
+  assert.ok(!keys(new Date(2026, 10, 21)).includes("tokenmy"));
+  assert.deepEqual(activeSponsorIds(new Date(2026, 10, 23)), ["jojocode-max", "runapi", "cccccc-api"]);
+  assert.deepEqual(activeSponsorIds(new Date(2026, 11, 2)), ["jojocode-max", "runapi"]);
   for (const gone of ["pateway", "therouter", "shengsuanyun", "ccsub"]) assert.ok(!keys(new Date(2026, 9, 26)).includes(gone), gone);
   assert.equal(presets[0].section, "sponsor");
   const relays = presets.filter((preset) => preset.section === "relay").map((preset) => preset.key);
