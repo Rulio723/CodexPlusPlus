@@ -150,7 +150,7 @@ import { diagnosticFacts, filterLogEntries, formatLogTime, parseLogText } from "
 import { CommandPalette, type PaletteCommand } from "./CommandPalette";
 import { paletteShortcut } from "./command-palette-model";
 import { SessionsView, sessionDeleteSucceeded } from "./GatewaySessions";
-import { agentName, groupDisplayName, formatQueueWait, formatRequestCost, maskAccountName, queueWaitMs, QUEUE_REASON_PREFIX, foreignCompactionDropped, FOREIGN_COMPACTION_DROPPED_REASON, usageRangeStart, importCandidates, draftFromBinding, bindingFromDraft, validateDraft, type GatewayPayload, type ImportCandidate, type GatewayResult, type UsageCost, type UsageRange } from "./gateway-model";
+import { agentName, groupDisplayName, formatQueueWait, formatRequestCost, formatTokens, maskAccountName, queueWaitMs, QUEUE_REASON_PREFIX, foreignCompactionDropped, FOREIGN_COMPACTION_DROPPED_REASON, usageRangeStart, importCandidates, draftFromBinding, bindingFromDraft, validateDraft, type GatewayPayload, type ImportCandidate, type GatewayResult, type UsageCost, type UsageRange } from "./gateway-model";
 import { SessionAgentTabs, type SessionTab } from "./SessionAgentTabs";
 import { UsageTabs, onOpenRequestLog, type RequestLogFocus } from "./UsageTabs";
 import { noticeDuration, noticeTone } from "./notice-model";
@@ -168,6 +168,7 @@ import { AgentDashboard, type DashboardAgent, type DashboardStat, type Dashboard
 import { TOUR_STORAGE_KEY, TOUR_VERSION } from "./onboarding-model";
 import "./ToolPages.css";
 import { BACKEND_SETTINGS_CHANGED_EVENT, ComputerUsePage } from "./ComputerUsePage";
+import { announceBackendSettingsChanged } from "./settings-events";
 import { PluginMarketScreen } from "./PluginMarketScreen";
 import { defaultMarketSort, parseMarketTime, relativeAge, sortMarketScripts, type LocalScriptState, type ScriptMarketSort } from "./script-market-model";
 import { extensionEnabledForHost, extensionsForHost, extensionStateForHost, type ExtensionHost } from "./extension-host-model";
@@ -469,6 +470,7 @@ type BackendSettings = WhaleBalanceSettings & {
   codexAppAutoTakeover: boolean;
   codexAppAutoTakeoverWhenActive: string;
   claudeAppExtensions?: boolean;
+  claudeDesktopLocal?: ClaudeLocalConfig;
   codexExtraArgs: string[];
   dictation: DictationSettings;
   providerSyncEnabled: boolean;
@@ -1417,7 +1419,7 @@ type ToolId = string;
 /** Codex++ 自己的 logo：与应用图标（src-tauri/icons/icon.png）同一张图。 */
 const APP_LOGO_URL = new URL("./assets/codex-plus-logo.png", import.meta.url).href;
 
-type Route = "home" | "overview" | "relay" | "multiLaunch" | "claude" | "relayEnvironment" | "requestLog" | "sessions" | "context" | "skills" | "weixin" | "enhance" | "dreamSkin" | "userScripts" | "pluginMarket" | "recommendations" | "agentCache" | "agentCollaboration" | "computerUse" | "hub" | "gateway" | "gatewayProviders" | "gatewayRouting" | "gatewayUsage" | "gatewaySettings" | "maintenance" | "about" | "settings" | "agentSettings" | "extension";
+type Route = "home" | "overview" | "relay" | "multiLaunch" | "claude" | "claudePatch" | "relayEnvironment" | "requestLog" | "sessions" | "context" | "skills" | "weixin" | "enhance" | "dreamSkin" | "userScripts" | "pluginMarket" | "recommendations" | "agentCache" | "agentCollaboration" | "computerUse" | "hub" | "gateway" | "gatewayProviders" | "gatewayRouting" | "gatewayUsage" | "gatewaySettings" | "maintenance" | "about" | "settings" | "agentSettings" | "extension";
 type Theme = "dark" | "light";
 
 const MANAGER_NAVIGATION_EVENT = "manager-navigation-requested";
@@ -1442,6 +1444,9 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "multiLaunch", get label() { return t("多开"); }, icon: Layers3, tool: "codex" },
   // 增强针对的是 Claude Desktop（汉化、Cowork 时限等），名字写明，免得和 Claude Code 命令行的概览混在一起（#2913）。
   { id: "claude", get label() { return t("Desktop 增强"); }, icon: Languages, tool: "claude" },
+  // 补丁 Desktop：专门给「改过代码的 Desktop 副本」用（制作/更新/检查/启动增强版副本），
+  // 完整功能模式留在「Desktop 增强」页，两页同一个组件按 mode 分渲染。
+  { id: "claudePatch", get label() { return t("补丁 Desktop"); }, icon: PackageOpen, tool: "claude" },
   // 请求日志、会话、MCP、Skills 管理所有 Agent，不属于某一个 Agent。
   { id: "sessions", get label() { return t("会话"); }, icon: MessagesSquare },
   { id: "context", label: "MCP", icon: Network },
@@ -1487,7 +1492,7 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
 const navigationSections: Array<{ id: string; routes: Route[] }> = [
   // 「连接与供应商」紧跟概览：直连模式的老用户每天在这里切供应商，想改用网关也从这里开始。
   { id: "overview", routes: ["overview", "relay"] },
-  { id: "enhance", routes: ["claude", "enhance", "dreamSkin", "pluginMarket", "weixin", "multiLaunch"] },
+  { id: "enhance", routes: ["claude", "claudePatch", "enhance", "dreamSkin", "pluginMarket", "weixin", "multiLaunch"] },
   // Codex 设置（含安装维护）在齿轮的设置模式里，不再占 Agent 的页签。
 ];
 const routeTool = (routeId: Route) => routes.find((candidate) => candidate.id === routeId)?.tool;
@@ -1564,6 +1569,7 @@ const defaultSettings: BackendSettings = {
   codexAppPath: "",
   codexAppAutoTakeover: false,
   codexAppAutoTakeoverWhenActive: "defer",
+  claudeDesktopLocal: { enabled: false, model: "", localization: true, voiceInput: true, computerUse: false, backgroundMode: false },
   codexExtraArgs: [],
   dictation: defaultDictationSettings(),
   providerSyncEnabled: false,
@@ -1874,6 +1880,9 @@ export function App() {
   const overviewRequestSequence = useRef(0);
   const launchPendingRef = useRef(false);
   const [launchPending, setLaunchPending] = useState(false);
+  /** 侧栏 Claude 行的启动键：本地模式状态读一次、动作完成后再读一次（读状态要查进程和钥匙串，不轮询）。 */
+  const [claudeLocalRun, setClaudeLocalRun] = useState<CommandResult<ClaudeLocalStatus> | null>(claudeLocalMemo.status);
+  const [claudeLocalRunBusy, setClaudeLocalRunBusy] = useState(false);
   const [multiLaunchPending, setMultiLaunchPending] = useState<string | null>(null);
   const [multiLaunchInstances, setMultiLaunchInstances] = useState<MultiLaunchInstance[]>([]);
   const [multiLaunchInstancesLoading, setMultiLaunchInstancesLoading] = useState(false);
@@ -2058,7 +2067,7 @@ export function App() {
         const merged: Record<string, unknown> = { ...current, revision: fresh.revision };
         for (const key of [
           "computerUseMode", "computerUseApproval", "computerUsePip",
-          "claudeAppVoiceInput", "claudeAppLocalization", "claudeAppExtensions", "claudeAppComputerUse", "claudeAppBashTimeout",
+          "claudeAppVoiceInput", "claudeAppLocalization", "claudeAppExtensions", "claudeAppComputerUse", "claudeAppBashTimeout", "claudeDesktopLocal",
           // 使用模式也要带上：表单留着旧值，下一次整份保存会把刚记下的模式写回去。
           "managerAgentFocus",
         ]) merged[key] = fresh[key];
@@ -4989,6 +4998,69 @@ export function App() {
     onLaunch: () => void actions.launch(),
     onRestart: () => void actions.restart(),
   };
+  // 侧栏 Codex 行和「Agent 接入」里的 Codex 行共用这一份运行时对象：两边都是启动 / 停止同一个进程。
+  const codexRun = {
+    running: codexAppRunning,
+    unattached: Boolean(overview?.runtime_health?.codex_unattached),
+    busy: launchPending,
+    unavailableReason: codexLaunch.unavailableReason,
+    onStart: codexLaunch.onLaunch,
+    onStop: () => void actions.stopCodex(),
+    onRestart: () => void actions.restart(),
+  };
+  /**
+   * 侧栏 Claude 行的播放键。读一次 claude_local_status（进程 + 证书探测，比较重，不做轮询），
+   * 动作成功后再读一次；失败交给现有的 notice 机制提示。
+   */
+  const refreshClaudeLocalRun = async () => {
+    try {
+      const result = await invoke<CommandResult<ClaudeLocalStatus>>("claude_local_status");
+      if (result.status !== "ok") return;
+      claudeLocalMemo.status = result;
+      setClaudeLocalRun(result);
+    } catch {
+      // 读不到就保持上次状态：按钮照常可点，真正的失败由动作本身报出来。
+    }
+  };
+  const claudeLocalRunAction = async (action: "launch" | "stop") => {
+    if (claudeLocalRunBusy) return;
+    setClaudeLocalRunBusy(true);
+    try {
+      const result = await invoke<CommandResult<ClaudeLocalStatus>>("claude_local_action", { action });
+      if (result.status === "ok") {
+        claudeLocalMemo.status = result;
+        setClaudeLocalRun(result);
+      } else {
+        await actions.showMessage(t("Claude 本地模式"), result.message, "failed");
+        await refreshClaudeLocalRun();
+      }
+    } catch (error) {
+      await actions.showMessage(t("Claude 本地模式"), stringifyError(error), "failed");
+    } finally {
+      setClaudeLocalRunBusy(false);
+    }
+  };
+  useEffect(() => {
+    void refreshClaudeLocalRun();
+    // 只在 App 挂载时探测一次；Claude 本地模式的状态变化由动作和页面自己维护。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const claudeRunStatus = claudeLocalRun?.status === "ok" ? claudeLocalRun : null;
+  const claudeRun = {
+    running: Boolean(claudeRunStatus?.running),
+    busy: claudeLocalRunBusy,
+    unavailableReason: !claudeRunStatus
+      ? null
+      : !claudeRunStatus.supported
+        ? t("未检测到支持的 Claude Desktop")
+        : claudeRunStatus.claudeRunning && !claudeRunStatus.running
+          ? t("Claude 正在运行，请先完全退出，再从 Codex++ 启动")
+          : claudeRunStatus.config?.enabled && !claudeRunStatus.nodeAvailable
+            ? t("缺少 Node.js，无法启动本地服务")
+            : null,
+    onStart: () => void claudeLocalRunAction("launch"),
+    onStop: () => void claudeLocalRunAction("stop"),
+  };
   // Codex 专属页面与 Codex 概览提供启动入口；共享的拓展管理页只在当前 Agent 为 Codex 时提供。
   const onCodexPage = (routeTool(route) === "codex" && (route !== "userScripts" || extensionHost === "codex")) || (route === "overview" && activeTool === "codex");
   const activeToolName = toolEntries.find((entry) => entry.id === activeTool)?.name ?? t("当前 Agent");
@@ -5139,7 +5211,8 @@ export function App() {
           void navigate(next);
         }}
         onExitSettings={() => void navigate(lastMainRoute.current)}
-        codexRun={{ running: codexAppRunning, busy: launchPending, unavailableReason: codexLaunch.unavailableReason, onStart: codexLaunch.onLaunch, onStop: () => void actions.stopCodex(), unattached: Boolean(overview?.runtime_health?.codex_unattached), onRestart: () => void actions.restart() }}
+        codexRun={codexRun}
+        claudeRun={claudeRun}
       />
       <CommandPalette commands={paletteCommands} onClose={() => setPaletteOpen(false)} open={paletteOpen} />
       {agentFocusOpen ? <AgentFocusDialog initial={agentFocus} onDone={closeAgentFocus} onCancel={cancelAgentFocus} /> : null}
@@ -5189,7 +5262,7 @@ export function App() {
               <h1 title={route === "extension" ? undefined : routeSubtitle(navAliasRoute[route] ?? route, soloAgent)}>{pageTitle}</h1>
             </div>
             <div className="topbar-actions">
-              {/* data-topbar-actions：页面级操作的挂载点（TopbarActions / PageHeader），Claude 增强页把「启动增强版」portal 进来。 */}
+              {/* data-topbar-actions：页面级操作的挂载点（TopbarActions / PageHeader），Claude 页把原版启动按钮 portal 进来。 */}
               <div className="topbar-page-actions" data-topbar-actions />
               {/* 「启动 / 重启 Codex」：只在 Codex 的页面里放在标题右侧（#2744 / #2745）；
                   其它页面靠侧栏 Codex 行常驻的播放键启动，停止也在那里。 */}
@@ -5270,7 +5343,16 @@ export function App() {
               onConsumeInitialAgent={() => { setRequestLogAgentFilter("all"); setRequestLogFocus({}); }}
             />
           ) : null}
-          {route === "claude" ? <ClaudeLocalizationScreen /> : null}
+          {route === "claude" ? (
+            <ClaudeLocalizationScreen
+              onLocalStatus={(status) => {
+                // 页面里启动 / 停止后，侧栏 Claude 行的播放键立刻跟着变，不用轮询。
+                claudeLocalMemo.status = status;
+                setClaudeLocalRun((current) => (sameClaudeRunState(current, status) ? current : status));
+              }}
+            />
+          ) : null}
+          {route === "claudePatch" ? <ClaudeLocalizationScreen mode="patch" /> : null}
           {/* 只管理 Codex 时没有 Agent 页签，直接是 Codex 的完整会话管理。 */}
           {route === "sessions" && !soloAgent ? <SessionAgentTabs onChange={setSessionTab} value={sessionTab} /> : null}
           {route === "sessions" && shownSessionTab !== "codex" ? (
@@ -5408,6 +5490,7 @@ export function App() {
                   overview={overview}
                 />
               }
+              codexRun={codexRun}
               notify={actions.showMessage}
               onOpenCodexProviderSettings={() => { void switchTool("codex", "relay"); }}
               onTabChange={(tab) => void navigate(gatewayRouteByTab[tab])}
@@ -16255,6 +16338,75 @@ type ClaudeBashTimeoutSettings = {
   maxSeconds: number;
 };
 
+type ClaudeLocalConfig = {
+  enabled: boolean;
+  model: string;
+  localization: boolean;
+  voiceInput: boolean;
+  computerUse: boolean;
+  backgroundMode: boolean;
+};
+
+type ClaudeLocalStatus = {
+  supported: boolean;
+  sourceApp: string;
+  version: string;
+  claudeRunning: boolean;
+  running: boolean;
+  connected: boolean;
+  port?: number | null;
+  caReady: boolean;
+  caTrusted: boolean;
+  nodeAvailable: boolean;
+  dictationReady: boolean;
+  config: ClaudeLocalConfig;
+  models: string[];
+  /** 当前默认模型实际下发的上下文窗口（供应商声明值）；null / 缺省表示未声明，Claude 按 200k 处理。 */
+  contextWindow?: number | null;
+  /** 因为窗口比默认模型小、没有列给 Claude 的模型。 */
+  hiddenModels?: string[];
+  warning?: string | null;
+  needsRestart: boolean;
+};
+
+/** Claude 在供应商没有声明窗口时自己用的默认上下文窗口。 */
+const CLAUDE_DEFAULT_CONTEXT_WINDOW = 200_000;
+
+/**
+ * 上下文窗口展示：1000000 -> `1M`、1100000 -> `1.1M`、200000 -> `200k`。
+ * 复用网关用量的 `formatTokens`（B/M/K），只把这里的 K 换成小写，和模型列表里的 `[200k]` 写法一致。
+ */
+function formatContextWindow(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value) || value <= 0) return "";
+  return formatTokens(value).replace(/K$/, "k");
+}
+
+/**
+ * 侧栏 Claude 行的播放键只看这几位；页面每 3 秒会刷新一次状态，其余字段变了不必让整个 App 重渲染。
+ */
+function sameClaudeRunState(
+  current: CommandResult<ClaudeLocalStatus> | null,
+  next: CommandResult<ClaudeLocalStatus>,
+): boolean {
+  if (!current || current.status !== next.status) return false;
+  return current.running === next.running
+    && current.claudeRunning === next.claudeRunning
+    && current.supported === next.supported
+    && current.nodeAvailable === next.nodeAvailable
+    && current.config?.enabled === next.config?.enabled;
+}
+
+/** 隐藏模型列表最多列 5 个，其余用「等」收尾。 */
+function formatHiddenModelsPreview(models: string[]): string {
+  const shown = models.slice(0, 5).join("、");
+  return models.length > 5 ? `${shown}${t("等")}` : shown;
+}
+
+const claudeLocalMemo: {
+  status: CommandResult<ClaudeLocalStatus> | null;
+  autoDetected: boolean;
+} = { status: null, autoDetected: false };
+
 type ClaudeLocalizationStatus = {
   supported: boolean;
   sourceApp: string;
@@ -16291,11 +16443,33 @@ const claudeLocalizationMemo: {
   autoDetected: boolean;
 } = { status: null, autoDetected: false };
 
-function ClaudeLocalizationScreen() {
+/**
+ * Claude Desktop 页。
+ *
+ * - `mode="local"`（默认）：完整功能模式——页头的原版启动、本地状态、汉化/听写/电脑控制/后台模式；
+ *   增强副本那一块搬到「补丁 Desktop」页，这一页不再提它，也不放跳转。
+ * - `mode="patch"`：「补丁 Desktop」页——只渲染改过代码的 Desktop 副本（制作/更新/检查/启动、副本开关、
+ *   Bash 时限）；不渲染本地状态那部分，副本块常开。
+ */
+function ClaudeLocalizationScreen(
+  { mode = "local", onLocalStatus }: {
+    mode?: "local" | "patch";
+    /** 每次读到新的原版本地状态（检测、启动、停止、配置）时交给 App，侧栏的播放键要跟着变。 */
+    onLocalStatus?: (status: CommandResult<ClaudeLocalStatus>) => void;
+  } = {},
+) {
+  const patchOnly = mode === "patch";
   const [status, setStatus] = useState<CommandResult<ClaudeLocalizationStatus> | null>(claudeLocalizationMemo.status);
-  // 首次进入会自动检测：初值就标成检测中，免得第一帧先闪出「点击重试」。
-  const [busy, setBusy] = useState<string | null>(claudeLocalizationMemo.autoDetected ? null : "detect");
+  const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  /** 补丁页里副本块恒开；「Desktop 增强」页收起时就不轮询副本状态，避免白跑检测。 */
+  const advancedShown = patchOnly || advancedOpen;
+  const [localStatus, setLocalStatus] = useState<CommandResult<ClaudeLocalStatus> | null>(claudeLocalMemo.status);
+  const [localBusy, setLocalBusy] = useState<string | null>(claudeLocalMemo.autoDetected ? null : "detect");
+  const [localError, setLocalError] = useState<string | null>(null);
+  const localPending = useRef(false);
+  const localGeneration = useRef(0);
   /** 制作增强版时宿主推送的阶段进度（0-100）。 */
   const [progress, setProgress] = useState<{ percent: number; message: string } | null>(null);
   const mounted = useRef(true);
@@ -16312,7 +16486,7 @@ function ClaudeLocalizationScreen() {
   const bashTimeoutSaving = useRef(false);
   const bashTimeoutQueued = useRef<ClaudeBashTimeoutSettings | null>(null);
   /**
-   * 页头右上角的操作槽：「启动增强版」放在和 Codex 页「启动 Codex」相同的位置。
+   * 页头右上角的操作槽：原版启动放在和 Codex 页「启动 Codex」相同的位置。
    * 页头与本页都按路由重建、同一次提交挂载，所以在 layout effect 里取，首帧绘制前就到位。
    */
   const [topbarSlot, setTopbarSlot] = useState<HTMLElement | null>(null);
@@ -16342,6 +16516,79 @@ function ClaudeLocalizationScreen() {
     }
     else setError(result.message);
   };
+  const acceptLocal = (result: CommandResult<ClaudeLocalStatus>) => {
+    if (result.status === "ok") {
+      claudeLocalMemo.status = result;
+      // 通知 App：侧栏 Claude 行和这里共用一份状态（回调是普通函数，别塞进 effect 依赖）。
+      onLocalStatus?.(result);
+    }
+    if (!mounted.current) return;
+    if (result.status === "ok") setLocalStatus(result);
+    else setLocalError(result.message);
+  };
+  const refreshLocal = async () => {
+    if (localPending.current) return;
+    localPending.current = true;
+    localGeneration.current++;
+    setLocalBusy("detect"); setLocalError(null);
+    try { acceptLocal(await invoke<CommandResult<ClaudeLocalStatus>>("claude_local_status")); }
+    catch (cause) { if (mounted.current) setLocalError(stringifyError(cause)); }
+    finally {
+      localPending.current = false;
+      if (mounted.current) setLocalBusy(null);
+    }
+  };
+  useEffect(() => {
+    if (claudeLocalMemo.autoDetected) return;
+    claudeLocalMemo.autoDetected = true;
+    void refreshLocal();
+  }, []);
+  const localAction = async (action: "launch" | "stop" | "trust" | "untrust" | "prepare") => {
+    if (localPending.current || pending.current) return;
+    localPending.current = true;
+    localGeneration.current++;
+    setLocalBusy(action); setLocalError(null);
+    try {
+      acceptLocal(await invoke<CommandResult<ClaudeLocalStatus>>("claude_local_action", { action }));
+    } catch (cause) { if (mounted.current) setLocalError(stringifyError(cause)); }
+    finally {
+      localPending.current = false;
+      if (mounted.current) setLocalBusy(null);
+    }
+  };
+  const configureLocal = async (config: ClaudeLocalConfig) => {
+    if (localPending.current || pending.current) return;
+    localPending.current = true;
+    localGeneration.current++;
+    setLocalBusy("configure"); setLocalError(null);
+    try {
+      const result = await invoke<CommandResult<ClaudeLocalStatus>>("claude_local_configure", { config });
+      acceptLocal(result);
+      if (result.status === "ok") announceBackendSettingsChanged();
+    } catch (cause) { if (mounted.current) setLocalError(stringifyError(cause)); }
+    finally {
+      localPending.current = false;
+      if (mounted.current) setLocalBusy(null);
+    }
+  };
+  useEffect(() => {
+    if ((!localStatus?.running && !localStatus?.claudeRunning) || localBusy !== null) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const generation = localGeneration.current;
+    const poll = async () => {
+      try {
+        const result = await invoke<CommandResult<ClaudeLocalStatus>>("claude_local_status");
+        if (cancelled || !mounted.current || localPending.current || generation !== localGeneration.current) return;
+        if (result.status === "ok") acceptLocal(result);
+      } catch { /* 状态探测失败保留上次结果，手动检测仍可显示具体错误。 */ }
+      if (!cancelled && mounted.current && generation === localGeneration.current) {
+        timer = setTimeout(() => void poll(), 3000);
+      }
+    };
+    timer = setTimeout(() => void poll(), 3000);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [localStatus?.running, localStatus?.claudeRunning, localBusy]);
   const refresh = async () => {
     if (pending.current) return;
     pending.current = true;
@@ -16355,10 +16602,10 @@ function ClaudeLocalizationScreen() {
     }
   };
   useEffect(() => {
-    if (claudeLocalizationMemo.autoDetected) return;
+    if (!advancedShown || claudeLocalizationMemo.autoDetected) return;
     claudeLocalizationMemo.autoDetected = true;
     void refresh();
-  }, []);
+  }, [advancedShown]);
   /**
    * Claude Desktop 是否已在 Computer Use 页接入 codex-plus-cu（含自定义目录）。
    * 和这里的电脑控制同时开会让同一个对话里出现两套工具，用来提示二选一；读不到时按未接入处理。
@@ -16375,7 +16622,7 @@ function ClaudeLocalizationScreen() {
       .catch(() => undefined);
   }, []);
   const act = async (action: "prepare" | "launch" | "restore" | "check") => {
-    if (pending.current) return false;
+    if (pending.current || localPending.current) return false;
     pending.current = true;
     statusGeneration.current++;
     setBusy(action); setError(null);
@@ -16411,7 +16658,7 @@ function ClaudeLocalizationScreen() {
     return succeeded;
   };
   const toggleVoiceInput = async (enabled: boolean) => {
-    if (pending.current) return;
+    if (pending.current || localPending.current) return;
     pending.current = true;
     statusGeneration.current++;
     setBusy("voiceInput"); setError(null);
@@ -16430,7 +16677,7 @@ function ClaudeLocalizationScreen() {
     }
   };
   const toggleComputerUse = async (enabled: boolean) => {
-    if (pending.current) return;
+    if (pending.current || localPending.current) return;
     pending.current = true;
     statusGeneration.current++;
     setBusy("computerUse"); setError(null);
@@ -16447,7 +16694,7 @@ function ClaudeLocalizationScreen() {
     }
   };
   const saveBashTimeout = async (next: ClaudeBashTimeoutSettings) => {
-    if (pending.current && !bashTimeoutSaving.current) return;
+    if (localPending.current || (pending.current && !bashTimeoutSaving.current)) return;
     bashTimeoutQueued.current = next;
     setBashTimeoutDraft(next);
     if (bashTimeoutSaving.current) return;
@@ -16485,7 +16732,7 @@ function ClaudeLocalizationScreen() {
     }
   };
   const toggleLocalization = async (enabled: boolean) => {
-    if (pending.current) return;
+    if (pending.current || localPending.current) return;
     pending.current = true;
     statusGeneration.current++;
     setBusy("localization"); setError(null);
@@ -16506,7 +16753,7 @@ function ClaudeLocalizationScreen() {
   const s = status;
   const bashTimeout = bashTimeoutDraft ?? s?.bashTimeout;
   useEffect(() => {
-    if (!s?.bashTimeoutPending || !s.running || busy !== null) return;
+    if (!advancedShown || !s?.bashTimeoutPending || !s.running || busy !== null) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout>;
     const generation = statusGeneration.current;
@@ -16532,8 +16779,8 @@ function ClaudeLocalizationScreen() {
     };
     timer = setTimeout(() => void poll(), 1000);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [s?.bashTimeoutPending, s?.running, busy]);
-  // 原来是「制作 → 启动 → 开增强」三步：现在右上角一个「启动增强版」，没制作或需要更新时先自动制作再启动。
+  }, [advancedShown, s?.bashTimeoutPending, s?.running, busy]);
+  // 只有明确点击可选的增强版启动，才允许制作副本。
   const needsPrepare = Boolean(s && (!s.prepared || s.needsRebuild));
   const canLaunch = Boolean(s?.supported && s.nodeAvailable && (s.prepared || needsPrepare));
   const launchEnhanced = async () => {
@@ -16557,21 +16804,147 @@ function ClaudeLocalizationScreen() {
         ? t("重新制作增强版")
         : t("制作增强版");
   const prepareHint = t("首次制作会创建独立副本并执行完整性校验；官方应用、登录态和 app.asar 不会被改写。macOS 可能需要钥匙串授权，Windows 会使用独立副本启动。");
+  const local = localStatus;
+  const localState = !local ? t("未检测")
+    : local.connected ? t("本地模式已连接")
+      : local.claudeRunning ? (local.config.enabled ? t("原版运行，未连接本地服务") : t("原版已运行"))
+        : local.running ? t("本地服务已就绪") : t("未启动");
+  const localTone = local?.connected ? "ok" : local?.config.enabled && local?.claudeRunning ? "warn" : "neutral";
+  const canLaunchOriginal = Boolean(local?.supported && (!local.config.enabled || local.nodeAvailable));
+  const localDisabled = localBusy !== null || busy !== null;
+  const localDetail = local
+    ? (local.supported ? `${t("原版版本")} ${local.version || t("未检测到")}` : t("未检测到支持的 Claude Desktop"))
+      + ` · ${local.contextWindow != null && local.contextWindow > 0
+        ? tf("上下文窗口 {0}（供应商声明）", [formatContextWindow(local.contextWindow)])
+        : t("上下文窗口 未声明（Claude 按 200k）")}`
+    : t("正在读取原版 Claude 状态");
+  const hiddenModels = local?.hiddenModels ?? [];
+  const defaultModelWindow = local?.contextWindow != null && local.contextWindow > 0
+    ? formatContextWindow(local.contextWindow)
+    : formatContextWindow(CLAUDE_DEFAULT_CONTEXT_WINDOW);
   return (
     <div className="claude-localization-page cx-page">
-      {topbarSlot
+      {!patchOnly && topbarSlot
         ? createPortal(
             <Button
-              disabled={busy !== null || !canLaunch}
-              onClick={() => void launchEnhanced()}
-              title={needsPrepare ? t("先制作增强版副本，完成后自动启动") : t("启动增强版")}
+              disabled={localDisabled || !canLaunchOriginal}
+              onClick={() => void localAction("launch")}
+              title={t("启动原版 Claude Desktop")}
             >
               <Rocket className="h-4 w-4" />
-              {busy === "launch" ? t("启动中…") : busy === "prepare" ? t("制作中…") : t("启动增强版")}
+              {localBusy === "launch" ? t("启动中…") : t("启动 Claude")}
             </Button>,
             topbarSlot,
           )
         : null}
+      {!patchOnly && localError ? <div className="claude-l10n-error" role="alert">{localError}</div> : null}
+      {!patchOnly && local?.warning ? <div className="claude-l10n-warning" role="status">{local.warning}</div> : null}
+      {!patchOnly && local?.needsRestart ? <p className="claude-l10n-hint" role="status">{t("设置已保存，完全退出 Claude 后重新启动。")}</p> : null}
+      {!patchOnly ? <CxCard className="claude-l10n-hero">
+        <CxRow
+          badges={<CxBadge tone={localTone}>{localBusy === "detect" ? t("检测中…") : localState}</CxBadge>}
+          detail={localDetail}
+          icon={<CxStatusIcon tone={local?.connected ? "ok" : "off"}><Rocket /></CxStatusIcon>}
+          title="Claude Desktop"
+        >
+          <div className="claude-l10n-actions">
+            {local?.running ? (
+              <button className="cx-secondary" disabled={localDisabled} onClick={() => void localAction("stop")} type="button">
+                <Square />{t("停止本地服务")}
+              </button>
+            ) : null}
+            <button className="cx-secondary" disabled={localDisabled} onClick={() => void refreshLocal()} type="button">
+              <RefreshCw />{t("检测原版 Claude")}
+            </button>
+          </div>
+        </CxRow>
+      </CxCard> : null}
+      {/* 窗口比默认模型小的模型不会列给 Claude（Claude 按默认模型的窗口压所有模型）；说清楚它们去哪了。 */}
+      {!patchOnly && hiddenModels.length > 0 ? (
+        <p className="claude-l10n-hint" title={t("Claude 只按默认模型的窗口压缩；把它们列出来会被按默认模型的窗口误算。")}>
+          {tf("另有 {0} 个模型窗口比默认模型小，没有列给 Claude（在那里切换会按 {1} 压缩）：{2}", [
+            hiddenModels.length,
+            defaultModelWindow,
+            formatHiddenModelsPreview(hiddenModels),
+          ])}
+        </p>
+      ) : null}
+      {!patchOnly ? <p className="claude-l10n-hint">{t("账号、套餐与用量显示来自本地合成数据，不代表真实订阅。")}</p> : null}
+      {!patchOnly ? <CxSection className="claude-local-settings" title={t("启动设置")}>
+        <CxCard>
+          <CxRow detail={t("从这里启动后生效；已打开的 Claude 需完全退出重开。")} title={t("启动模式")}>
+            <AppSelect
+              ariaLabel={t("启动模式")}
+              disabled={localDisabled || !local?.supported}
+              onChange={(next) => {
+                if (local) void configureLocal({ ...local.config, enabled: next === "full" });
+              }}
+              options={[
+                { value: "3p", label: t("3p 模式") },
+                { value: "full", label: t("完整功能模式") },
+              ]}
+              value={local?.config.enabled ? "full" : "3p"}
+            />
+          </CxRow>
+          {/* 模型跟着「Agent 接入」里的 Claude Desktop 绑定走：这里只说明，不放第二个入口。 */}
+          <CxRow detail={t("模型在「Agent 接入」里的 Claude Desktop 行选择，改完需要重新启动本地服务。")} title={t("默认模型")} />
+        </CxCard>
+        {local?.config.enabled ? (
+          <>
+            <CxCard>
+              <CxRow badges={<CxBadge tone={local.caTrusted ? "ok" : "neutral"}>{local.caTrusted ? t("已信任") : local.caReady ? t("未信任") : t("未准备")}</CxBadge>} title={t("本地证书")}>
+                <div className="claude-l10n-actions">
+                  {!local.caReady ? (
+                    <button className="cx-secondary" disabled={localDisabled} onClick={() => void localAction("prepare")} type="button"><PackageOpen />{t("准备证书")}</button>
+                  ) : null}
+                  {!local.caTrusted ? (
+                    <button className="cx-secondary" disabled={localDisabled || !local.caReady} onClick={() => void localAction("trust")} type="button"><ShieldCheck />{t("信任证书")}</button>
+                  ) : (
+                    <button className="cx-secondary" disabled={localDisabled} onClick={() => void localAction("untrust")} type="button"><ShieldCheck />{t("取消信任证书")}</button>
+                  )}
+                </div>
+              </CxRow>
+              <CxRow badges={<CxBadge tone={local.dictationReady ? "ok" : "neutral"}>{local.dictationReady ? t("已就绪") : t("未就绪")}</CxBadge>} title={t("语音识别")} />
+              <CxRow badges={<CxBadge tone={local.nodeAvailable ? "ok" : "warn"}>{local.nodeAvailable ? t("已就绪") : t("缺少 Node.js")}</CxBadge>} title={t("运行环境")} />
+            </CxCard>
+            <CxCard className="claude-l10n-feature-grid">
+              {([
+                ["localization", "界面汉化", "本地界面汉化"],
+                ["voiceInput", "原生听写", "本地原生听写"],
+                ["computerUse", "电脑控制", "本地电脑控制"],
+                ["backgroundMode", "后台模式", "本地后台模式"],
+              ] as const).map(([key, label, ariaLabel]) => (
+                <label className="switch-row compact" key={key}>
+                  <input
+                    aria-label={t(ariaLabel)}
+                    checked={local.config[key]}
+                    disabled={localDisabled}
+                    onChange={(event) => void configureLocal({ ...local.config, [key]: event.currentTarget.checked })}
+                    type="checkbox"
+                  />
+                  <span><strong>{t(label)}</strong></span>
+                  <ToggleVisual />
+                </label>
+              ))}
+            </CxCard>
+          </>
+        ) : null}
+      </CxSection> : null}
+      {patchOnly || advancedOpen ? <section className={`claude-local-advanced${patchOnly ? " claude-local-advanced-page" : ""}`}>
+        {patchOnly ? (
+          /* 补丁页顶部说明：这页只管副本，完整功能模式在「Desktop 增强」。 */
+          <CxCard className="claude-l10n-patch-intro">
+            <CxRow
+              detail={t("制作/更新/检查/启动增强版副本；原件与 app.asar 不动。")}
+              icon={<CxStatusIcon tone={s?.prepared && !s.needsRebuild ? "ok" : "off"}><PackageOpen /></CxStatusIcon>}
+              title={t("补丁 Desktop")}
+            />
+            <p className="claude-l10n-hint">
+              {t("给改过代码的 Desktop 副本用：制作/更新/检查/启动增强版，原件与 app.asar 不动；日常用「Desktop 增强」页的完整功能模式即可。副本会改写自己的 app.asar，并关闭 asar 完整性校验；原件不受影响。")}
+            </p>
+          </CxCard>
+        ) : null}
+        <fieldset className="claude-local-advanced-body" disabled={localBusy !== null}>
       {/* 顶部最多几条一次性的提示：检测中 / 未安装、错误、Bash 时限确认、制作进度。 */}
       {!s ? (
         <p className="claude-l10n-hint">
@@ -16615,8 +16988,11 @@ function ClaudeLocalizationScreen() {
           icon={<CxStatusIcon tone={statusTone === "ok" ? "ok" : statusTone === "warn" ? "warn" : "off"}><PackageOpen /></CxStatusIcon>}
           title={t("受管增强版")}
         >
-          {/* 首次要制作时「制作增强版」是唯一的按钮；检查、重新检测、重新制作都收进三点菜单。 */}
+          {/* 增强副本仅在这里手动制作和启动；检查与重新检测收进菜单。 */}
           <div className="claude-l10n-actions">
+            <button className="cx-secondary" disabled={busy !== null || localBusy !== null || !canLaunch} onClick={() => void launchEnhanced()} title={needsPrepare ? t("制作副本并启动增强版") : t("启动增强版")} type="button">
+              <Rocket />{busy === "launch" ? t("启动中…") : busy === "prepare" ? t("制作中…") : t("启动增强版")}
+            </button>
             {needsPrepare || !s ? (
               <button className="cx-secondary" disabled={busy !== null || !s?.supported} onClick={() => void act("prepare")} title={prepareHint} type="button">
                 <PackageOpen />
@@ -16633,7 +17009,6 @@ function ClaudeLocalizationScreen() {
           </div>
         </CxRow>
       </CxCard>
-
       {/* 增强开关一节：每项一行，各自独立、即点即存，重启增强版后应用。 */}
       <CxSection
         aside={s?.supported && !s.prepared ? (
@@ -16801,6 +17176,8 @@ function ClaudeLocalizationScreen() {
           ) : null}
         </CxCard>
       </CxSection>
+        </fieldset>
+      </section> : null}
     </div>
   );
 }
@@ -16986,6 +17363,7 @@ function AppSidebar({
   pendingUpdateProgress = null,
   onOpenUpdate,
   codexRun,
+  claudeRun,
   soloAgent,
   focus,
   extensionPages = [],
@@ -17009,6 +17387,9 @@ function AppSidebar({
   /** Codex 行的播放 / 停止：只有桌面应用的 Codex 有，命令行 Agent 没有常驻进程可启停。
       unavailableReason 非空（如没找到 Codex 应用）时播放键置灰，悬停显示原因。 */
   codexRun: { running: boolean; unattached: boolean; busy: boolean; unavailableReason: string | null; onStart: () => void; onStop: () => void; onRestart: () => void };
+  /** Claude 行同样有播放 / 停止：Claude Desktop 本地模式可以在这里启动、停止本地服务。
+      unavailableReason 非空（没装 Claude、Claude 正开着、缺 Node.js）时置灰，悬停显示原因。 */
+  claudeRun: { running: boolean; busy: boolean; unavailableReason: string | null; onStart: () => void; onStop: () => void };
   tools: ToolEntry[];
   activeTool: ToolId;
   route: Route;
@@ -17272,6 +17653,24 @@ function AppSidebar({
                       type="button"
                     >
                       {codexRun.busy ? <Loader2 aria-hidden="true" className="animate-spin" /> : unattached ? <RotateCcw aria-hidden="true" /> : codexRun.running ? <Square aria-hidden="true" /> : <Play aria-hidden="true" />}
+                    </button>
+                  );
+                })() : null}
+                {tool.id === "claude" ? (() => {
+                  // Claude Desktop 本地模式：和 Codex 行同一套播放键，启动 / 停止本地服务。
+                  const label = claudeRun.running ? t("停止本地服务") : t("启动 Claude");
+                  return (
+                    <button
+                      aria-label={label}
+                      className="cx-side-run"
+                      data-running={claudeRun.running}
+                      data-unavailable={!claudeRun.running && Boolean(claudeRun.unavailableReason)}
+                      disabled={claudeRun.busy || (!claudeRun.running && Boolean(claudeRun.unavailableReason))}
+                      onClick={claudeRun.running ? claudeRun.onStop : claudeRun.onStart}
+                      title={claudeRun.busy ? t("处理中…") : claudeRun.running ? t("停止本地服务") : claudeRun.unavailableReason ?? t("启动 Claude")}
+                      type="button"
+                    >
+                      {claudeRun.busy ? <Loader2 aria-hidden="true" className="animate-spin" /> : claudeRun.running ? <Square aria-hidden="true" /> : <Play aria-hidden="true" />}
                     </button>
                   );
                 })() : null}
@@ -17756,7 +18155,8 @@ function routeSubtitle(route: Route, soloAgent: string | null = null) {
     overview: t("检查问题、启动与快速修复"),
     relay: t("管理 API 供应商、协议、Key 与配置文件"),
     multiLaunch: t("为不同供应商启动相互隔离的 Codex 实例"),
-    claude: t("保留官方 Claude.app 原样，通过增强版为 Claude 应用增强功能"),
+    claude: t("启动原版 Claude Desktop，选择 3p 或完整功能模式"),
+    claudePatch: t("制作、更新与启动改过代码的 Desktop 副本；原件与 app.asar 不动"),
     relayEnvironment: t("旧版直连模式专用：目录外模型映射与供应商独立代理"),
     requestLog: t("所有 Agent 经 Codex++ 的请求：状态、模型、重试、token 用量与缓存命中"),
     sessions: t("Codex、Claude Code、Grok 的本地会话放在一起：在终端继续，Codex 会话还能删除、归档与修复"),
