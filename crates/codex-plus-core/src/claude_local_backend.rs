@@ -810,7 +810,7 @@ fn config_hash(config: &ClaudeLocalSettings) -> String {
         let binding = local_binding(&gateway, config).ok();
         let windows = binding
             .as_ref()
-            .map(|binding| available_model_windows(&gateway, binding))
+            .map(|binding| available_model_windows(&gateway, binding, config.list_all_models))
             .unwrap_or_default();
         // 「Agent 接入」里换了模型也算配置变了：代理要重启，默认模型才会跟着换。
         let model = binding.map(|binding| binding.model);
@@ -854,7 +854,74 @@ fn available_models(gateway: &GatewaySettings) -> Vec<String> {
     models
 }
 
-/// Claude 模型选择器的显示名：有组显示名用组名，否则去掉「供应商/」前缀；
+/// 把模型 slug 拼成给人看的样子：`gpt-6.1-sol` → `GPT-6.1 Sol`、
+/// `deepseek-v4-flash` → `DeepSeek V4 Flash`、`kimi-k3` → `Kimi K3`。
+/// 只用于界面显示，发给上游的 model id 一个字都不改。
+fn friendly_model_name(slug: &str) -> String {
+    let parts: Vec<String> = slug
+        .split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .enumerate()
+        .map(|(index, part)| friendly_model_word(part, index == 0))
+        .collect();
+    let mut out = String::new();
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            // `GPT-6.1` / `GLM-5.3`：前缀后面紧跟版本号时用连字符，其余用空格。
+            let previous = parts[index - 1].as_str();
+            let digit = part.chars().next().is_some_and(|c| c.is_ascii_digit());
+            out.push(if (previous == "GPT" || previous == "GLM") && digit { '-' } else { ' ' });
+        }
+        out.push_str(part);
+    }
+    if out.is_empty() { slug.to_string() } else { out }
+}
+
+fn friendly_model_word(raw: &str, first: bool) -> String {
+    let lower = raw.to_ascii_lowercase();
+    let capitalized = || {
+        let mut chars = lower.chars();
+        match chars.next() {
+            Some(head) => head.to_ascii_uppercase().to_string() + chars.as_str(),
+            None => String::new(),
+        }
+    };
+    match lower.as_str() {
+        "gpt" => "GPT".to_string(),
+        "glm" => "GLM".to_string(),
+        "llm" | "api" => lower.to_ascii_uppercase(),
+        "deepseek" => "DeepSeek".to_string(),
+        "kimi" => "Kimi".to_string(),
+        "qwen" => "Qwen".to_string(),
+        "claude" => "Claude".to_string(),
+        "gemini" => "Gemini".to_string(),
+        "grok" => "Grok".to_string(),
+        "mimo" => "MiMo".to_string(),
+        "mini" | "pro" | "flash" | "sol" | "terra" | "luna" | "astra" | "fast" | "codex"
+        | "opus" | "sonnet" | "haiku" | "turbo" | "lite" | "reasoner" | "thinking" | "image" => {
+            capitalized()
+        }
+        // `v4` / `v2.5`：大写 V
+        _ if lower
+            .strip_prefix('v')
+            .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit() || c == '.')) =>
+        {
+            format!("V{}", &lower[1..])
+        }
+        // 非首段的「字母+数字」短词（`k3`）：首字母大写
+        _ if !first
+            && lower.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && lower.chars().any(|c| c.is_ascii_digit())
+            && lower.len() <= 8 =>
+        {
+            capitalized()
+        }
+        // 版本号、编号、不认识的词原样保留
+        _ => raw.to_string(),
+    }
+}
+
+/// Claude 模型选择器的显示名：有组显示名用组名，否则把 slug 拼得像样点（不再是 `jojocodemax/gpt-6.1-sol`）；
 /// 副标题放供应商显示名（取不到就用前缀原文）。发给网关的 model id 不变。
 fn model_names(
     gateway: &GatewaySettings,
@@ -864,10 +931,11 @@ fn model_names(
         .iter()
         .map(|id| {
             let friendly = crate::gateway::route::model_display_name(gateway, id);
+            let slug = id.rsplit('/').next().unwrap_or(id);
             let name = if friendly != id.as_str() {
                 friendly.to_string()
             } else {
-                id.rsplit('/').next().unwrap_or(id).to_string()
+                friendly_model_name(slug)
             };
             let vendor = id.split('/').next().unwrap_or_default();
             let provider = gateway
@@ -894,8 +962,16 @@ fn is_internal_review_model(model: &str) -> bool {
 /// 启动时按默认模型算一次；在 Claude 里切到窗口更小的模型时它不会跟着变小，
 /// auto-compact 会一直等到大窗口才触发，请求先被上游顶回来。所以只暴露窗口
 /// 不小于默认模型的模型，其余的仍留在 Codex++ 的默认模型选择器里。
-fn exposed_models(gateway: &GatewaySettings, binding: &AgentBinding) -> (Vec<String>, Vec<String>) {
+fn exposed_models(
+    gateway: &GatewaySettings,
+    binding: &AgentBinding,
+    list_all: bool,
+) -> (Vec<String>, Vec<String>) {
     let models = available_models(gateway);
+    if list_all {
+        // 用户显式要求全列：不按窗口过滤，界面里自己留意切到小窗口模型的风险。
+        return (models, Vec::new());
+    }
     let Some(selected) = selected_model_window(gateway, binding, &binding.model) else {
         return (models, Vec::new());
     };
@@ -909,8 +985,9 @@ fn exposed_models(gateway: &GatewaySettings, binding: &AgentBinding) -> (Vec<Str
 fn available_model_windows(
     gateway: &GatewaySettings,
     binding: &AgentBinding,
+    list_all: bool,
 ) -> BTreeMap<String, u64> {
-    exposed_models(gateway, binding)
+    exposed_models(gateway, binding, list_all)
         .0
         .into_iter()
         .filter_map(|model| {
@@ -1069,6 +1146,9 @@ pub fn resume_attached_proxy() -> Result<Option<u16>> {
         return Ok(None);
     };
     let node = node_runtime().context("未找到支持 fetch 和 WebSocket 的 Node.js")?;
+    // 升级 Codex++ 后恢复的代理也要用新版脚本，不能沿用状态目录里的旧副本。
+    install_assets(&root)?;
+    sync_model_compact_windows(&root, &config);
     start_backend(&root, &node, &config, Some(port)).map(Some)
 }
 
@@ -1174,7 +1254,7 @@ pub fn status() -> Result<ClaudeLocalStatus> {
     // 状态里报的是「交给 Claude 的那份列表」，不是网关全量：窗口更小的模型不会出现。
     let binding = local_binding(&gateway, &config).ok();
     let (models, hidden_models) = match binding.as_ref() {
-        Some(binding) => exposed_models(&gateway, binding),
+        Some(binding) => exposed_models(&gateway, binding, config.list_all_models),
         None => (available_models(&gateway), Vec::new()),
     };
     let context_window = binding
@@ -1327,7 +1407,7 @@ fn start_backend(
     crate::resident_helper::ensure_resident_helper(helper_port)?;
     let (gateway, binding) = bind_gateway(&GatewayStore::default(), config)?;
     let wiring = wiring(&gateway, &binding, AGENT_ID, helper_port);
-    let exposed = exposed_models(&gateway, &binding);
+    let exposed = exposed_models(&gateway, &binding, config.list_all_models);
     let instance = uuid::Uuid::new_v4().to_string();
     let ready_file = root.join("ready.json");
     let log = private_file(&root.join("proxy.log"))?;
@@ -1363,7 +1443,11 @@ fn start_backend(
         )
         .env(
             "CLAUDE_LOCAL_GATEWAY_MODEL_WINDOWS",
-            serde_json::to_string(&available_model_windows(&gateway, &binding))?,
+            serde_json::to_string(&available_model_windows(
+                &gateway,
+                &binding,
+                config.list_all_models,
+            ))?,
         )
         // 选中模型的窗口也单独给一份：逐模型表里没有它时，界面还知道该显示多长，
         // 与启动 Claude Code 时写进 CLAUDE_CODE_MAX_CONTEXT_TOKENS 的值同源。
@@ -1427,6 +1511,57 @@ fn local_launch_args(_root: &Path, port: u16, localization: bool) -> Vec<String>
         args.push("--lang=zh-CN".into());
     }
     args
+}
+
+
+/// 把每个模型的压缩窗口写进 Claude Code 的 `settings.json`。
+///
+/// Claude Code 支持**逐模型**的压缩设置：`modelSettings.<canonical model>.autoCompactWindow`
+/// （100000–1000000，或 `auto`）。它按当前模型解析，所以切模型时会跟着变——正好补上
+/// `CLAUDE_CODE_MAX_CONTEXT_TOKENS` 只有一份、进程级的缺口，而且不需要重启。
+/// `CLAUDE_CODE_AUTO_COMPACT_WINDOW` 环境变量会盖过它，所以我们不设那个变量。
+fn write_model_compact_windows(root: &Path, windows: &BTreeMap<String, u64>) -> Result<()> {
+    if windows.is_empty() {
+        return Ok(());
+    }
+    let path = root.join("claude-code/settings.json");
+    let mut settings: Value = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    let Some(object) = settings.as_object_mut() else {
+        return Ok(());
+    };
+    let entry = object.entry("modelSettings").or_insert_with(|| json!({}));
+    // 用户自己写成了别的形状就不动它。
+    let Some(models) = entry.as_object_mut() else {
+        return Ok(());
+    };
+    for (model, window) in windows {
+        let clamped = (*window).clamp(100_000, 1_000_000);
+        let slot = models.entry(model.clone()).or_insert_with(|| json!({}));
+        if let Some(fields) = slot.as_object_mut() {
+            fields.insert("autoCompactWindow".into(), json!(clamped));
+        }
+    }
+    crate::settings::atomic_write(&path, &serde_json::to_vec_pretty(&settings)?)?;
+    Ok(())
+}
+
+/// 按当前网关声明同步一次逐模型窗口；失败不影响启动。
+fn sync_model_compact_windows(root: &Path, config: &ClaudeLocalSettings) {
+    let Ok(gateway) = GatewayStore::default()
+        .load()
+        .map(|gateway| gateway.with_extension_providers())
+    else {
+        return;
+    };
+    let Ok(binding) = local_binding(&gateway, config) else {
+        return;
+    };
+    let windows = available_model_windows(&gateway, &binding, config.list_all_models);
+    let _ = write_model_compact_windows(root, &windows);
 }
 
 fn launch_original(
@@ -1785,6 +1920,7 @@ pub fn perform(action: &str) -> Result<ClaudeLocalResult> {
                 if config.voice_input {
                     prepare_dictation(&root, &node)?;
                 }
+                sync_model_compact_windows(&root, &config);
                 let port = start_backend(&root, &node, &config, None)?;
                 if let Err(error) = launch_original(&source, &root, Some(port), config.localization)
                 {
@@ -1829,6 +1965,40 @@ mod tests {
             },
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn model_compact_windows_merge_into_settings_and_clamp() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("claude-code");
+        fs::create_dir_all(&dir).unwrap();
+        // 已有设置（含用户自己的键）必须保留
+        fs::write(dir.join("settings.json"), br#"{"theme":"dark","modelSettings":{"other":{"autoCompactWindow":300000}}}"#).unwrap();
+
+        let windows = BTreeMap::from([
+            ("relay/gpt-6.1-sol".to_string(), 1_100_000),
+            ("relay/small".to_string(), 128_000),
+        ]);
+        write_model_compact_windows(temp.path(), &windows).unwrap();
+
+        let settings: Value =
+            serde_json::from_slice(&fs::read(dir.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(settings["theme"], "dark");
+        assert_eq!(settings["modelSettings"]["other"]["autoCompactWindow"], 300_000);
+        assert_eq!(settings["modelSettings"]["relay/gpt-6.1-sol"]["autoCompactWindow"], 1_000_000);
+        assert_eq!(settings["modelSettings"]["relay/small"]["autoCompactWindow"], 128_000);
+    }
+
+    #[test]
+    fn friendly_model_names_read_like_product_names() {
+        assert_eq!(friendly_model_name("gpt-6.1-sol"), "GPT-6.1 Sol");
+        assert_eq!(friendly_model_name("gpt-5.6-terra"), "GPT-5.6 Terra");
+        assert_eq!(friendly_model_name("deepseek-v4-flash"), "DeepSeek V4 Flash");
+        assert_eq!(friendly_model_name("kimi-k3"), "Kimi K3");
+        assert_eq!(friendly_model_name("glm-5.3"), "GLM-5.3");
+        assert_eq!(friendly_model_name("claude-opus-4-6"), "Claude Opus 4 6");
+        // 不认识的词保持原样，不会凭空变形
+        assert_eq!(friendly_model_name("gpt-image-2-4k"), "GPT Image 2 4k");
     }
 
     #[test]
@@ -1993,7 +2163,7 @@ mod tests {
             model: "relay/gpt-6-astra".into(),
             ..AgentBinding::default()
         };
-        let (visible, hidden) = exposed_models(&gateway, &binding);
+        let (visible, hidden) = exposed_models(&gateway, &binding, false);
         assert_eq!(visible, vec!["relay/gpt-6-astra"]);
         assert_eq!(hidden, vec!["relay/small-model"], "小窗口模型不交给 Claude");
 
@@ -2002,9 +2172,31 @@ mod tests {
             model: "relay/unknown-model".into(),
             ..AgentBinding::default()
         };
-        let (visible, hidden) = exposed_models(&gateway, &binding);
+        let (visible, hidden) = exposed_models(&gateway, &binding, false);
         assert!(hidden.is_empty());
         assert_eq!(visible.len(), 2);
+    }
+
+    #[test]
+    fn list_all_models_skips_the_window_filter() {
+        let mut gateway = GatewaySettings::default();
+        let mut relay = provider("relay", "gpt-6-astra\nsmall-model");
+        relay.model_windows.insert("gpt-6-astra".into(), 1_100_000);
+        relay.model_windows.insert("small-model".into(), 128_000);
+        gateway.providers.push(relay);
+        let binding = AgentBinding {
+            model: "relay/gpt-6-astra".into(),
+            ..AgentBinding::default()
+        };
+
+        let (visible, hidden) = exposed_models(&gateway, &binding, false);
+        assert_eq!(visible, vec!["relay/gpt-6-astra"]);
+        assert_eq!(hidden, vec!["relay/small-model"]);
+
+        // 显式要求全列：小窗口模型也交给 Claude（界面自己提示风险）
+        let (visible, hidden) = exposed_models(&gateway, &binding, true);
+        assert_eq!(visible.len(), 2);
+        assert!(hidden.is_empty());
     }
 
     #[test]
@@ -2460,7 +2652,7 @@ server.listen(0,'127.0.0.1',()=>{
         );
     }
 
-    /// 选择器显示名：组模型用组名、普通模型去供应商前缀、副标题用供应商显示名。
+    /// 选择器显示名：组模型用组名、普通模型拼成产品名、副标题用供应商显示名。
     #[test]
     fn model_names_prefers_friendly_names_and_vendor_label() {
         let mut gateway = crate::gateway::store::GatewaySettings::default();
@@ -2469,7 +2661,7 @@ server.listen(0,'127.0.0.1',()=>{
         gateway.providers.push(provider);
         let names = model_names(&gateway, &["jojo/gpt-6.1-sol".to_string()]);
         let entry = &names["jojo/gpt-6.1-sol"];
-        assert_eq!(entry["name"], "gpt-6.1-sol");
+        assert_eq!(entry["name"], "GPT-6.1 Sol");
         assert_eq!(entry["description"], "Jojo Codemax");
     }
 
