@@ -5046,14 +5046,16 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   const claudeRunStatus = claudeLocalRun?.status === "ok" ? claudeLocalRun : null;
+  /** 代理活着，或者 Claude 还挂在我们的代理端口上：两种情况都算「在跑」，按钮该是停止。 */
+  const claudeAttached = Boolean(claudeRunStatus?.running || claudeRunStatus?.localProcess);
   const claudeRun = {
-    running: Boolean(claudeRunStatus?.running),
+    running: claudeAttached,
     busy: claudeLocalRunBusy,
     unavailableReason: !claudeRunStatus
       ? null
       : !claudeRunStatus.supported
         ? t("未检测到支持的 Claude Desktop")
-        : claudeRunStatus.claudeRunning && !claudeRunStatus.running
+        : claudeRunStatus.claudeRunning && !claudeAttached
           ? t("Claude 正在运行，请先完全退出，再从 Codex++ 启动")
           : claudeRunStatus.config?.enabled && !claudeRunStatus.nodeAvailable
             ? t("缺少 Node.js，无法启动本地服务")
@@ -16345,6 +16347,9 @@ type ClaudeLocalConfig = {
   voiceInput: boolean;
   computerUse: boolean;
   backgroundMode: boolean;
+  displayName?: string;
+  plan?: string;
+  sessionSync?: boolean;
 };
 
 type ClaudeLocalStatus = {
@@ -16353,6 +16358,8 @@ type ClaudeLocalStatus = {
   version: string;
   claudeRunning: boolean;
   running: boolean;
+  /** Claude 仍挂在本机代理上（代理进程可能已经退了）：这种半开状态也要能按「停止」收尾。 */
+  localProcess?: boolean;
   connected: boolean;
   port?: number | null;
   caReady: boolean;
@@ -16397,11 +16404,6 @@ function sameClaudeRunState(
 }
 
 /** 隐藏模型列表最多列 5 个，其余用「等」收尾。 */
-function formatHiddenModelsPreview(models: string[]): string {
-  const shown = models.slice(0, 5).join("、");
-  return models.length > 5 ? `${shown}${t("等")}` : shown;
-}
-
 const claudeLocalMemo: {
   status: CommandResult<ClaudeLocalStatus> | null;
   autoDetected: boolean;
@@ -16543,7 +16545,7 @@ function ClaudeLocalizationScreen(
     claudeLocalMemo.autoDetected = true;
     void refreshLocal();
   }, []);
-  const localAction = async (action: "launch" | "stop" | "trust" | "untrust" | "prepare") => {
+  const localAction = async (action: "launch" | "stop" | "trust" | "untrust" | "prepare" | "sync_sessions") => {
     if (localPending.current || pending.current) return;
     localPending.current = true;
     localGeneration.current++;
@@ -16818,7 +16820,6 @@ function ClaudeLocalizationScreen(
         ? tf("上下文窗口 {0}（供应商声明）", [formatContextWindow(local.contextWindow)])
         : t("上下文窗口 未声明（Claude 按 200k）")}`
     : t("正在读取原版 Claude 状态");
-  const hiddenModels = local?.hiddenModels ?? [];
   const defaultModelWindow = local?.contextWindow != null && local.contextWindow > 0
     ? formatContextWindow(local.contextWindow)
     : formatContextWindow(CLAUDE_DEFAULT_CONTEXT_WINDOW);
@@ -16860,16 +16861,6 @@ function ClaudeLocalizationScreen(
         </CxRow>
       </CxCard> : null}
       {/* 窗口比默认模型小的模型不会列给 Claude（Claude 按默认模型的窗口压所有模型）；说清楚它们去哪了。 */}
-      {!patchOnly && hiddenModels.length > 0 ? (
-        <p className="claude-l10n-hint" title={t("Claude 只按默认模型的窗口压缩；把它们列出来会被按默认模型的窗口误算。")}>
-          {tf("另有 {0} 个模型窗口比默认模型小，没有列给 Claude（在那里切换会按 {1} 压缩）：{2}", [
-            hiddenModels.length,
-            defaultModelWindow,
-            formatHiddenModelsPreview(hiddenModels),
-          ])}
-        </p>
-      ) : null}
-      {!patchOnly ? <p className="claude-l10n-hint">{t("账号、套餐与用量显示来自本地合成数据，不代表真实订阅。")}</p> : null}
       {!patchOnly ? <CxSection className="claude-local-settings" title={t("启动设置")}>
         <CxCard>
           <CxRow detail={t("从这里启动后生效；已打开的 Claude 需完全退出重开。")} title={t("启动模式")}>
@@ -16888,6 +16879,54 @@ function ClaudeLocalizationScreen(
           </CxRow>
           {/* 模型跟着「Agent 接入」里的 Claude Desktop 绑定走：这里只说明，不放第二个入口。 */}
           <CxRow detail={t("模型在「Agent 接入」里的 Claude Desktop 行选择，改完需要重新启动本地服务。")} title={t("默认模型")} />
+          <CxRow detail={t("只改 Claude 里显示的账号信息，从这里启动后生效。")} title={t("用户名")}>
+            <Input
+              aria-label={t("用户名")}
+              defaultValue={local?.config.displayName ?? ""}
+              disabled={localDisabled || !local?.supported}
+              key={local?.config.displayName ?? ""}
+              onBlur={(event) => {
+                if (local && event.currentTarget.value !== (local.config.displayName ?? "")) void configureLocal({ ...local.config, displayName: event.currentTarget.value });
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") event.currentTarget.blur();
+              }}
+              placeholder={t("Local User")}
+            />
+          </CxRow>
+          <CxRow title={t("套餐")}>
+            <AppSelect
+              ariaLabel={t("套餐")}
+              disabled={localDisabled || !local?.supported}
+              onChange={(next) => {
+                if (local) void configureLocal({ ...local.config, plan: next });
+              }}
+              options={[
+                { value: "free", label: "Free" },
+                { value: "pro", label: "Pro" },
+                { value: "max", label: "Max" },
+                { value: "ultra", label: "Ultra" },
+              ]}
+              value={local?.config.plan || "ultra"}
+            />
+          </CxRow>
+          <CxRow detail={t("启动 Claude 前同步 3p 模式与完整功能模式的 Code 会话")} title={t("会话同步")}>
+            <div className="claude-l10n-actions">
+              <label className="switch-row compact">
+                <input
+                  aria-label={t("会话同步")}
+                  checked={local?.config.sessionSync === true}
+                  disabled={localDisabled || !local?.supported}
+                  onChange={(event) => {
+                    if (local) void configureLocal({ ...local.config, sessionSync: event.currentTarget.checked });
+                  }}
+                  type="checkbox"
+                />
+                <ToggleVisual />
+              </label>
+              <button className="cx-secondary" disabled={localDisabled || !local?.supported || local?.claudeRunning} onClick={() => void localAction("sync_sessions")} title={t("立即同步")} type="button">{t("立即同步")}</button>
+            </div>
+          </CxRow>
         </CxCard>
         {local?.config.enabled ? (
           <>
@@ -16939,9 +16978,7 @@ function ClaudeLocalizationScreen(
               icon={<CxStatusIcon tone={s?.prepared && !s.needsRebuild ? "ok" : "off"}><PackageOpen /></CxStatusIcon>}
               title={t("补丁 Desktop")}
             />
-            <p className="claude-l10n-hint">
-              {t("给改过代码的 Desktop 副本用：制作/更新/检查/启动增强版，原件与 app.asar 不动；日常用「Desktop 增强」页的完整功能模式即可。副本会改写自己的 app.asar，并关闭 asar 完整性校验；原件不受影响。")}
-            </p>
+
           </CxCard>
         ) : null}
         <fieldset className="claude-local-advanced-body" disabled={localBusy !== null}>

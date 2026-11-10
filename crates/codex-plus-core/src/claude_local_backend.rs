@@ -129,6 +129,8 @@ pub struct ClaudeLocalStatus {
     pub version: String,
     pub claude_running: bool,
     pub running: bool,
+    /// Claude 还挂在本机代理上（哪怕代理进程已经退了）：这种「半开」状态要能按停止收尾。
+    pub local_process: bool,
     pub connected: bool,
     pub port: Option<u16>,
     pub ca_ready: bool,
@@ -472,10 +474,22 @@ fn checked(command: &mut Command, timeout: Duration, message: &str) -> Result<()
     Ok(())
 }
 
+/// 统一建 Command：Windows 上不为控制台程序（node、openssl 等）弹黑色终端窗口。
+fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[allow(unused_mut)]
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(crate::windows_create_no_window());
+    }
+    command
+}
+
 fn node_runtime() -> Option<PathBuf> {
     let node = crate::dsh_plugins::locate_node()?;
     probe(
-        Command::new(&node).args([
+        hidden_command(&node).args([
             "-e",
             "process.exit(typeof fetch==='function'&&typeof WebSocket==='function'?0:1)",
         ]),
@@ -484,6 +498,76 @@ fn node_runtime() -> Option<PathBuf> {
     .ok()
     .filter(|(success, _)| *success)
     .map(|_| node)
+}
+
+/// `--proxy-server` 完整标志：整词匹配，5351 不会误伤 53514。
+fn proxy_flag(port: u16) -> String {
+    format!("--proxy-server=http://127.0.0.1:{port}")
+}
+
+/// 进程列表里有没有进程把 `--proxy-server` 指到这个端口：
+/// 逐行、按空白切分，整词等于完整标志才算。
+fn processes_use_proxy(processes: &str, port: u16) -> bool {
+    let flag = proxy_flag(port);
+    processes
+        .lines()
+        .any(|line| line.split_whitespace().any(|token| token == flag))
+}
+
+/// 从 `pgrep -fl`（行首是 pid）里挑出挂在指定代理端口上的进程 pid。
+fn claude_pids_on_proxy(listing: &str, port: u16) -> Vec<u32> {
+    let flag = proxy_flag(port);
+    listing
+        .lines()
+        .filter_map(|line| {
+            let (pid, command) = line.trim().split_once(' ')?;
+            if command.split_whitespace().any(|token| token == flag) {
+                pid.trim().parse().ok()
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// 关掉「经本机代理启动」的 Claude：`--proxy-server=http://127.0.0.1:<port>` 是它独有的标记，
+/// 按端口整词匹配就不会误伤用户自己开的 Claude。返回是否真的动过进程。
+fn quit_claude_with_proxy(port: u16) -> Result<bool> {
+    if !cfg!(target_os = "macos") {
+        return Ok(false);
+    }
+    let pids = claude_pids_on_proxy(&claude_processes()?, port);
+    if pids.is_empty() {
+        return Ok(false);
+    }
+    for pid in &pids {
+        let _ = Command::new("/bin/kill")
+            .args(["-TERM", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline && pids.iter().any(|pid| process_alive(*pid)) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    for pid in pids.iter().filter(|pid| process_alive(**pid)) {
+        let _ = Command::new("/bin/kill")
+            .args(["-KILL", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    Ok(true)
+}
+
+fn process_alive(pid: u32) -> bool {
+    Command::new("/bin/ps")
+        .args(["-p", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn claude_processes() -> Result<String> {
@@ -580,7 +664,7 @@ IP.1=127.0.0.1
     )?;
     let openssl = crate::dsh_plugins::locate_program("openssl")
         .context("未找到 OpenSSL，无法准备本地证书")?;
-    let mut command = Command::new(&openssl);
+    let mut command = hidden_command(&openssl);
     command
         .args(["genrsa", "-out"])
         .arg(ca.join("ca.key"))
@@ -590,7 +674,7 @@ IP.1=127.0.0.1
         Duration::from_secs(20),
         "生成本地 CA 私钥失败",
     )?;
-    let mut command = Command::new(&openssl);
+    let mut command = hidden_command(&openssl);
     command
         .args(["req", "-x509", "-new", "-key"])
         .arg(ca.join("ca.key"))
@@ -610,7 +694,7 @@ IP.1=127.0.0.1
         Duration::from_secs(20),
         "生成本地 CA 证书失败",
     )?;
-    let mut command = Command::new(&openssl);
+    let mut command = hidden_command(&openssl);
     command
         .args(["genrsa", "-out"])
         .arg(ca.join("server.key"))
@@ -620,7 +704,7 @@ IP.1=127.0.0.1
         Duration::from_secs(20),
         "生成本地服务私钥失败",
     )?;
-    let mut command = Command::new(&openssl);
+    let mut command = hidden_command(&openssl);
     command
         .args(["req", "-new", "-key"])
         .arg(ca.join("server.key"))
@@ -633,7 +717,7 @@ IP.1=127.0.0.1
         Duration::from_secs(20),
         "生成本地服务证书请求失败",
     )?;
-    let mut command = Command::new(&openssl);
+    let mut command = hidden_command(&openssl);
     command
         .args(["x509", "-req", "-in"])
         .arg(ca.join("server.csr"))
@@ -770,6 +854,34 @@ fn available_models(gateway: &GatewaySettings) -> Vec<String> {
     models
 }
 
+/// Claude 模型选择器的显示名：有组显示名用组名，否则去掉「供应商/」前缀；
+/// 副标题放供应商显示名（取不到就用前缀原文）。发给网关的 model id 不变。
+fn model_names(
+    gateway: &GatewaySettings,
+    models: &[String],
+) -> std::collections::BTreeMap<String, Value> {
+    models
+        .iter()
+        .map(|id| {
+            let friendly = crate::gateway::route::model_display_name(gateway, id);
+            let name = if friendly != id.as_str() {
+                friendly.to_string()
+            } else {
+                id.rsplit('/').next().unwrap_or(id).to_string()
+            };
+            let vendor = id.split('/').next().unwrap_or_default();
+            let provider = gateway
+                .providers
+                .iter()
+                .find(|provider| provider.relay.id == vendor)
+                .map(|provider| provider.relay.name.clone())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| vendor.to_string());
+            (id.clone(), json!({"name": name, "description": provider}))
+        })
+        .collect()
+}
+
 /// 自动评审模型（`codex-auto-review`）是 Codex 内部子代理用的，不该出现在
 /// 人的模型选择器里：选中它当聊天模型没有意义，只会白烧额度。
 fn is_internal_review_model(model: &str) -> bool {
@@ -850,6 +962,9 @@ fn validate_config(mut config: ClaudeLocalSettings) -> Result<ClaudeLocalSetting
     if config.background_mode {
         config.computer_use = true;
     }
+    // 显示名与套餐按白名单落盘：界面改哪一格都不影响其它字段的规范化。
+    config.display_name = config.effective_display_name();
+    config.plan = config.normalized_plan().to_string();
     Ok(config)
 }
 
@@ -878,9 +993,17 @@ fn chosen_model(
     let routable = |model: &str| {
         !model.is_empty() && crate::gateway::route::model_is_routable(gateway, binding, model)
     };
+    // 「Agent 接入」页里 Claude Desktop 那一行写的是 `claude-desktop` 绑定；本地模式用的是
+    // `claude-desktop-local`。用户只看得见前者，所以以它为准，本地绑定自己的值退到第二位。
+    let sibling = gateway
+        .binding(&ToolId::Unknown("claude-desktop".into()))
+        .map(|binding| binding.model.trim().to_string())
+        .unwrap_or_default();
     let bound = binding.model.trim();
     let configured = config.model.trim();
-    if routable(bound) {
+    if routable(&sibling) {
+        sibling
+    } else if routable(bound) {
         bound.to_string()
     } else if routable(configured) {
         configured.to_string()
@@ -913,6 +1036,47 @@ fn local_binding(gateway: &GatewaySettings, config: &ClaudeLocalSettings) -> Res
         binding.token = new_client_token(&agent);
     }
     Ok(binding)
+}
+
+/// Codex++ 重启后要不要在原端口恢复代理：runtime 不在、ready 有端口、
+/// Claude 还挂在这个端口上、且完整功能模式开着。
+fn resume_port(
+    runtime_alive: bool,
+    ready_port: Option<u16>,
+    processes: &str,
+    enabled: bool,
+) -> Option<u16> {
+    if runtime_alive || !enabled {
+        return None;
+    }
+    ready_port.filter(|port| processes_use_proxy(processes, *port))
+}
+
+/// 管理器重启后代理随之退出，而 Claude 还指着那个端口：在原端口把代理拉起来，
+/// Claude 的重试就能自己连上（换端口它永远连不上）。
+pub fn resume_attached_proxy() -> Result<Option<u16>> {
+    if !cfg!(target_os = "macos") {
+        return Ok(None);
+    }
+    let config = SettingsStore::default().load()?.claude_desktop_local;
+    let root = root_dir();
+    let Some(port) = resume_port(
+        runtime_status().is_some(),
+        ready_port(&root),
+        &claude_processes()?,
+        config.enabled,
+    ) else {
+        return Ok(None);
+    };
+    let node = node_runtime().context("未找到支持 fetch 和 WebSocket 的 Node.js")?;
+    start_backend(&root, &node, &config, Some(port)).map(Some)
+}
+
+/// `ready.json` 里记的端口：代理进程已经没了也还能用来认出「还挂着旧代理的 Claude」。
+fn ready_port(root: &Path) -> Option<u16> {
+    let bytes = fs::read(root.join("ready.json")).ok()?;
+    let value = serde_json::from_slice::<Value>(&bytes).ok()?;
+    value.get("port")?.as_u64()?.try_into().ok()
 }
 
 fn parse_ready(value: &Value, instance: &str, pid: u32) -> Option<u16> {
@@ -979,9 +1143,12 @@ pub fn status() -> Result<ClaudeLocalStatus> {
     let claude_running = !processes.is_empty();
     let runtime = runtime_status();
     // 完整功能模式直接用真实 profile，无 --user-data-dir；按代理端口识别本地进程。
-    let local_process = runtime.as_ref().is_some_and(|(port, _, _, _)| {
-        processes.contains(&format!("--proxy-server=http://127.0.0.1:{port}"))
-    });
+    let port_hint = runtime
+        .as_ref()
+        .map(|(port, _, _, _)| *port)
+        .or_else(|| ready_port(&root));
+    let local_process =
+        port_hint.is_some_and(|port| processes_use_proxy(&processes, port));
     let running = runtime.is_some();
     let connected = local_process
         && runtime.as_ref().is_some_and(|(_, _, _, health)| {
@@ -1044,6 +1211,7 @@ pub fn status() -> Result<ClaudeLocalStatus> {
         source_app: source.to_string_lossy().into_owned(),
         claude_running,
         running,
+        local_process,
         connected,
         port: runtime.map(|(port, _, _, _)| port),
         ca_ready: ready,
@@ -1107,7 +1275,7 @@ fn prepare_dictation(root: &Path, node: &Path) -> Result<()> {
     let mut last_error = None;
     for electron_cache in [&original_cache] {
         let drain = probe(
-            Command::new(node)
+            hidden_command(node)
                 .arg(root.join("scripts/patch-dictation-drain.mjs"))
                 .args(["--apply", "--cache-dir"])
                 .arg(&cache)
@@ -1118,7 +1286,7 @@ fn prepare_dictation(root: &Path, node: &Path) -> Result<()> {
         );
         let code = "const m=await import(process.argv[1]);m.applyStartupPatches({cacheDir:process.argv[2],electronCacheDir:process.argv[3]});";
         let start = probe(
-            Command::new(node)
+            hidden_command(node)
                 .args(["--input-type=module", "-e", code])
                 .arg(
                     reqwest::Url::from_file_path(root.join("scripts/patch-dictation-start.mjs"))
@@ -1143,7 +1311,12 @@ fn prepare_dictation(root: &Path, node: &Path) -> Result<()> {
     Ok(())
 }
 
-fn start_backend(root: &Path, node: &Path, config: &ClaudeLocalSettings) -> Result<u16> {
+fn start_backend(
+    root: &Path,
+    node: &Path,
+    config: &ClaudeLocalSettings,
+    preferred_port: Option<u16>,
+) -> Result<u16> {
     if let Some((port, _, hash, _)) = runtime_status()
         && hash == config_hash(config)
     {
@@ -1154,13 +1327,15 @@ fn start_backend(root: &Path, node: &Path, config: &ClaudeLocalSettings) -> Resu
     crate::resident_helper::ensure_resident_helper(helper_port)?;
     let (gateway, binding) = bind_gateway(&GatewayStore::default(), config)?;
     let wiring = wiring(&gateway, &binding, AGENT_ID, helper_port);
+    let exposed = exposed_models(&gateway, &binding);
     let instance = uuid::Uuid::new_v4().to_string();
     let ready_file = root.join("ready.json");
     let log = private_file(&root.join("proxy.log"))?;
-    let mut command = Command::new(node);
+    let mut command = hidden_command(node);
     command
         .arg(root.join("proxy.mjs"))
-        .args(["--port", "0", "--mode", "mock", "--log", "0", "--ca"])
+        // 恢复挂接时优先在原端口重启：Claude 只认启动时的 --proxy-server 端口。
+        .args(["--port", &preferred_port.unwrap_or(0).to_string(), "--mode", "mock", "--log", "0", "--ca"])
         .arg(root.join("ca"))
         .current_dir(root)
         .env("CLAUDE_LOCAL_MANAGED", "1")
@@ -1180,7 +1355,11 @@ fn start_backend(root: &Path, node: &Path, config: &ClaudeLocalSettings) -> Resu
         .env("CLAUDE_LOCAL_GATEWAY_SMALL_MODEL", wiring.small_model)
         .env(
             "CLAUDE_LOCAL_GATEWAY_MODELS",
-            serde_json::to_string(&exposed_models(&gateway, &binding).0)?,
+            serde_json::to_string(&exposed.0)?,
+        )
+        .env(
+            "CLAUDE_LOCAL_GATEWAY_MODEL_NAMES",
+            serde_json::to_string(&model_names(&gateway, &exposed.0))?,
         )
         .env(
             "CLAUDE_LOCAL_GATEWAY_MODEL_WINDOWS",
@@ -1200,7 +1379,9 @@ fn start_backend(root: &Path, node: &Path, config: &ClaudeLocalSettings) -> Resu
         .env("CLAUDE_LOCAL_LOCALIZATION", flag(config.localization))
         .env("CLAUDE_LOCAL_VOICE_INPUT", flag(config.voice_input))
         .env("CLAUDE_LOCAL_COMPUTER_USE", flag(config.computer_use))
-        .env("CLAUDE_LOCAL_BACKGROUND_MODE", flag(config.background_mode));
+        .env("CLAUDE_LOCAL_BACKGROUND_MODE", flag(config.background_mode))
+        .env("CLAUDE_LOCAL_DISPLAY_NAME", config.effective_display_name())
+        .env("CLAUDE_LOCAL_PLAN", config.normalized_plan());
     if let Some(dir) = recorded_data_dir() {
         command.env("CLAUDE_LOCAL_RECORDED_DIR", dir);
     }
@@ -1254,7 +1435,7 @@ fn launch_original(
     port: Option<u16>,
     localization: bool,
 ) -> Result<()> {
-    let mut command = Command::new(executable(source));
+    let mut command = hidden_command(executable(source));
     for name in [
         "ELECTRON_RUN_AS_NODE",
         "ELECTRON_NO_ASAR",
@@ -1340,7 +1521,7 @@ fn launch_three_p(source: &Path, root: &Path, config: &ClaudeLocalSettings) -> R
     let wiring = wiring(&gateway, binding, "claude-desktop", port);
     private_dir(root)?;
     private_dir(&root.join("claude-code-3p"))?;
-    let mut command = Command::new(executable(source));
+    let mut command = hidden_command(executable(source));
     for name in [
         "ELECTRON_RUN_AS_NODE",
         "ELECTRON_NO_ASAR",
@@ -1386,7 +1567,9 @@ pub fn stop_backend() {
         runtime.stdin.take();
         terminate_child(&mut runtime.child, Duration::from_secs(2));
     }
-    reap_stale_proxy(&root_dir());
+    let root = root_dir();
+    reap_stale_proxy(&root);
+    reap_orphan_proxies(&root);
 }
 
 /// 先礼后兵地结束一个子进程。
@@ -1422,6 +1605,11 @@ pub fn reap_stale_proxy(root: &Path) {
     if !is_our_proxy(pid, root) {
         return;
     }
+    terminate_pid(pid, root);
+}
+
+/// TERM → 最多等 2 秒（用 `is_our_proxy` 探活）→ 仍活着就 KILL。
+fn terminate_pid(pid: u32, root: &Path) {
     let _ = Command::new("/bin/kill")
         .args(["-TERM", &pid.to_string()])
         .stdout(Stdio::null())
@@ -1439,6 +1627,37 @@ pub fn reap_stale_proxy(root: &Path) {
             .status();
     }
 }
+
+/// 回收 `ready.json` 已经不记的遗留代理：重启前没回收成功的会一直占着端口和内存。
+/// 只收本目录（root）下的 `proxy.mjs`，排除自己和当前正在跑的 runtime 代理。
+#[cfg(target_os = "macos")]
+fn reap_orphan_proxies(root: &Path) {
+    let output = Command::new("/usr/bin/pgrep")
+        .args(["-f", "proxy.mjs"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    let Ok(output) = output else { return };
+    let current_child = runtime_slot()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .map(|runtime| runtime.child.id());
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Ok(pid) = line.trim().parse::<u32>() else {
+            continue;
+        };
+        if pid == 0 || pid == std::process::id() || Some(pid) == current_child {
+            continue;
+        }
+        if is_our_proxy(pid, root) {
+            terminate_pid(pid, root);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn reap_orphan_proxies(_root: &Path) {}
 
 /// pid 还活着，且命令行就是本目录的 `proxy.mjs`（与 `ready.json` 里的旧记录核对）。
 fn is_our_proxy(pid: u32, root: &Path) -> bool {
@@ -1458,7 +1677,7 @@ pub fn perform(action: &str) -> Result<ClaudeLocalResult> {
         "原版 Claude 本地模式目前仅支持 macOS"
     );
     ensure!(
-        ["launch", "stop", "trust", "untrust", "prepare"].contains(&action),
+        ["launch", "stop", "trust", "untrust", "prepare", "sync_sessions"].contains(&action),
         "未知的 Claude 本地服务操作"
     );
     let _guard = OPERATION
@@ -1467,12 +1686,21 @@ pub fn perform(action: &str) -> Result<ClaudeLocalResult> {
     let config = SettingsStore::default().load()?.claude_desktop_local;
     let root = root_dir();
     let source = source_app();
-    let message = match action {
+    let mut sync_summary = String::new();
+    let mut message = match action {
         "stop" => {
+            let port = runtime_status()
+                .map(|(port, _, _, _)| port)
+                .or_else(|| ready_port(&root));
             stop_backend();
-            // 完整功能模式停止时把真实 profile 切回原始状态。
+            // 先让 Claude 退出，再还原 profile：Claude 退出时还会回写自己的配置。
+            let quit = port.map(quit_claude_with_proxy).transpose()?.unwrap_or(false);
             restore_real_profile(&app_support_dir(), &root)?;
-            "Claude 本地服务已停止，Claude 应用保持打开。".to_string()
+            if quit {
+                "Claude 本地服务已停止，经它启动的 Claude 已退出。".to_string()
+            } else {
+                "Claude 本地服务已停止。".to_string()
+            }
         }
         "trust" => {
             install_assets(&root)?;
@@ -1493,6 +1721,27 @@ pub fn perform(action: &str) -> Result<ClaudeLocalResult> {
             }
             "Claude 本地兼容资源已准备，原版应用未修改。".to_string()
         }
+        "sync_sessions" => {
+            ensure!(
+                claude_processes()?.is_empty(),
+                "请先完全退出 Claude 再同步会话"
+            );
+            let report = crate::claude_session_sync::sync_sessions(
+                &app_support_dir().join("Claude-3p/claude-code-sessions"),
+                &[root.join("claude-code-3p"), home_dir().join(".claude")],
+                &app_support_dir().join("Claude/claude-code-sessions"),
+                &[root.join("claude-code"), home_dir().join(".claude")],
+                &root.join("backups/session-sync"),
+            )?;
+            if !report.note.is_empty() {
+                report.note.clone()
+            } else {
+                format!(
+                    "已同步会话：3p→完整 {} 个，完整→3p {} 个，更新 {} 个，跳过已删除 {} 个。",
+                    report.to_full, report.to_three_p, report.updated, report.skipped_deleted
+                )
+            }
+        }
         "launch" => {
             ensure!(
                 executable(&source).is_file(),
@@ -1502,6 +1751,29 @@ pub fn perform(action: &str) -> Result<ClaudeLocalResult> {
                 claude_processes()?.is_empty(),
                 "Claude 正在运行，请先完全退出，再从 Codex++ 启动以应用本地模式"
             );
+            if config.session_sync {
+                match crate::claude_session_sync::sync_sessions(
+                    &app_support_dir().join("Claude-3p/claude-code-sessions"),
+                    &[root.join("claude-code-3p"), home_dir().join(".claude")],
+                    &app_support_dir().join("Claude/claude-code-sessions"),
+                    &[root.join("claude-code"), home_dir().join(".claude")],
+                    &root.join("backups/session-sync"),
+                ) {
+                    Ok(report) if report.to_full + report.to_three_p + report.updated > 0 => {
+                        sync_summary = format!(
+                            "已同步会话：3p→完整 {} 个，完整→3p {} 个，更新 {} 个。",
+                            report.to_full, report.to_three_p, report.updated
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "claude_session_sync.launch_failed",
+                            serde_json::json!({"error": format!("{error:#}")}),
+                        );
+                    }
+                }
+            }
             if config.enabled {
                 install_assets(&root)?;
                 prepare_ca(&root)?;
@@ -1513,7 +1785,7 @@ pub fn perform(action: &str) -> Result<ClaudeLocalResult> {
                 if config.voice_input {
                     prepare_dictation(&root, &node)?;
                 }
-                let port = start_backend(&root, &node, &config)?;
+                let port = start_backend(&root, &node, &config, None)?;
                 if let Err(error) = launch_original(&source, &root, Some(port), config.localization)
                 {
                     stop_backend();
@@ -1534,6 +1806,9 @@ pub fn perform(action: &str) -> Result<ClaudeLocalResult> {
                 &json!({"configHash": config_hash(&config), "localMode": config.enabled}),
             )?,
         )?;
+    }
+    if !sync_summary.is_empty() {
+        message = format!("{sync_summary}{message}");
     }
     Ok(ClaudeLocalResult {
         status: status()?,
@@ -1650,6 +1925,34 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config["deploymentMode"], json!("1p"));
+    }
+
+    #[test]
+    fn local_mode_follows_the_claude_desktop_binding_model() {
+        let mut gateway = GatewaySettings::default();
+        gateway.providers = vec![
+            provider("anthropic", "claude-sonnet-4-6"),
+            provider("relay", "gpt-6-astra\ngpt-6.1-sol"),
+        ];
+        gateway.bindings.insert(
+            "claude-desktop".into(),
+            AgentBinding {
+                model: "relay/gpt-6.1-sol".into(),
+                ..AgentBinding::default()
+            },
+        );
+        gateway.bindings.insert(
+            AGENT_ID.into(),
+            AgentBinding {
+                model: "relay/gpt-6-astra".into(),
+                ..AgentBinding::default()
+            },
+        );
+        let binding = local_binding(&gateway, &ClaudeLocalSettings::default()).unwrap();
+        assert_eq!(
+            binding.model, "relay/gpt-6.1-sol",
+            "用户在「Agent 接入」的 Claude Desktop 行选的模型说了算"
+        );
     }
 
     #[test]
@@ -2155,5 +2458,88 @@ server.listen(0,'127.0.0.1',()=>{
             wiring.root,
             "http://127.0.0.1:57321/gw/claude-desktop-local"
         );
+    }
+
+    /// 选择器显示名：组模型用组名、普通模型去供应商前缀、副标题用供应商显示名。
+    #[test]
+    fn model_names_prefers_friendly_names_and_vendor_label() {
+        let mut gateway = crate::gateway::store::GatewaySettings::default();
+        let mut provider = provider("jojo", "gpt-6.1-sol");
+        provider.relay.name = "Jojo Codemax".into();
+        gateway.providers.push(provider);
+        let names = model_names(&gateway, &["jojo/gpt-6.1-sol".to_string()]);
+        let entry = &names["jojo/gpt-6.1-sol"];
+        assert_eq!(entry["name"], "gpt-6.1-sol");
+        assert_eq!(entry["description"], "Jojo Codemax");
+    }
+
+    #[test]
+    fn resume_port_only_when_claude_is_still_attached() {
+        let attached = format!("4509 /Applications/Claude.app/Contents/MacOS/Claude {}", proxy_flag(53514));
+        assert_eq!(resume_port(false, Some(53514), &attached, true), Some(53514));
+        assert_eq!(resume_port(false, Some(53514), "", true), None, "没挂接不恢复");
+        assert_eq!(resume_port(false, Some(5351), &attached, true), None, "端口不匹配不恢复");
+        assert_eq!(resume_port(false, Some(53514), &attached, false), None, "未开完整功能不恢复");
+        assert_eq!(resume_port(true, Some(53514), &attached, true), None, "runtime 在时不恢复");
+        assert_eq!(resume_port(false, None, &attached, true), None);
+    }
+
+    /// 显示名与套餐：缺字段走默认（ultra / 空名→Local User），非法值被规范化。
+    #[test]
+    fn display_name_and_plan_defaults_and_normalization() {
+        let config: crate::settings::ClaudeLocalSettings =
+            serde_json::from_str("{}").unwrap();
+        assert_eq!(config.plan, "ultra");
+        assert_eq!(config.display_name, "");
+        assert_eq!(config.normalized_plan(), "ultra");
+        assert_eq!(config.effective_display_name(), "Local User");
+
+        let mut config = crate::settings::ClaudeLocalSettings::default();
+        for (raw, expected) in [("FREE", "free"), ("Pro", "pro"), ("max", "max"), (" vip ", "ultra")] {
+            config.plan = raw.into();
+            assert_eq!(config.normalized_plan(), expected, "{raw}");
+        }
+        config.display_name = "  张三\u{1f600}  ".into();
+        assert_eq!(config.effective_display_name(), "张三\u{1f600}");
+        config.display_name = "a\nb\t".into();
+        assert_eq!(config.effective_display_name(), "ab");
+        config.display_name = "x".repeat(80);
+        assert_eq!(config.effective_display_name().chars().count(), 64);
+        config.display_name = " \t\n ".into();
+        assert_eq!(config.effective_display_name(), "Local User");
+    }
+
+    /// 代理端口按整词匹配：5351 不能误伤 53514、535140，行尾无空格也算。
+    #[test]
+    fn processes_use_proxy_matches_the_whole_flag() {
+        let main = format!("4509 /Applications/Claude.app/Contents/MacOS/Claude {} --disable-http-cache --lang=zh-CN", proxy_flag(53514));
+        for (processes, port, expected) in [
+            (main.as_str(), 53514, true),
+            (main.as_str(), 5351, false),
+            (main.as_str(), 53515, false),
+        ] {
+            assert_eq!(processes_use_proxy(processes, port), expected, "{port}");
+        }
+        // 标志在行尾（后面没有空白）也要算。
+        let tail = format!("4509 /Applications/Claude.app/Contents/MacOS/Claude {}", proxy_flag(53514));
+        assert!(processes_use_proxy(&tail, 53514));
+        // 不带该标志的用户自己开的 Claude 不算。
+        assert!(!processes_use_proxy("4509 /Applications/Claude.app/Contents/MacOS/Claude", 53514));
+    }
+
+    /// pgrep -fl 输出里只取端口精确匹配的 Claude 主进程：helper 行和别的端口行都不算。
+    #[test]
+    fn claude_pids_on_proxy_picks_only_the_main_process_on_that_port() {
+        let listing = format!(
+            "4509 /Applications/Claude.app/Contents/MacOS/Claude {} --disable-http-cache
+             4512 /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer)
+             77248 /Applications/Claude.app/Contents/MacOS/Claude {}",
+            proxy_flag(53514),
+            proxy_flag(63917),
+        );
+        assert_eq!(claude_pids_on_proxy(&listing, 53514), vec![4509]);
+        assert_eq!(claude_pids_on_proxy(&listing, 63917), vec![77248]);
+        assert!(claude_pids_on_proxy(&listing, 5351).is_empty());
+        assert!(claude_pids_on_proxy("", 53514).is_empty());
     }
 }

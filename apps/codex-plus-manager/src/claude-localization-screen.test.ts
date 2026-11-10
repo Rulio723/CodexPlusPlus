@@ -32,7 +32,6 @@ const formatHelpers = transpile([
   functionSource(gatewayModel, "trimNumber"),
   functionSource(gatewayModel, "formatTokens"),
   functionSource(app, "formatContextWindow"),
-  functionSource(app, "formatHiddenModelsPreview"),
 ].join("\n"));
 
 type Element = { type: string; props: Record<string, any> };
@@ -606,6 +605,42 @@ test("原版启动与模式保存失败保留配置，不自动回退增强副�
   assert.equal(screen.calls.some((call) => call.command.startsWith("claude_localization")), false);
 });
 
+test("用户名与套餐：默认 Ultra，改名与换套餐各发一次 claude_local_configure", async () => {
+  const screen = harness(undefined, {}, { localMemo: { status: localReady, autoDetected: true }, openAdvanced: false });
+  const selects = findElements(screen.render(), "AppSelect");
+  const plan = selects.find((item) => item.props.ariaLabel === "套餐")!;
+  assert.equal(plan.props.value, "ultra");
+  plan.props.onChange("free");
+  await tick();
+  assert.equal(screen.calls[0].command, "claude_local_configure");
+  assert.equal((screen.calls[0].args[0] as { config: { plan: string } }).config.plan, "free");
+  // 上一次保存未完成时 configureLocal 会被丢弃：先让它落定再改用户名。
+  screen.calls[0].resolve({ ...localReady, config: { ...localReady.config, plan: "free" } });
+  await tick();
+  const name = findElements(screen.render(), "Input").find((item) => item.props["aria-label"] === "用户名")!;
+  name.props.onBlur({ currentTarget: { value: "张三" } });
+  await tick();
+  assert.equal(screen.calls[1].command, "claude_local_configure");
+  assert.equal((screen.calls[1].args[0] as { config: { displayName: string } }).config.displayName, "张三");
+});
+
+test("会话同步：开关默认关闭，切换走 configure，立即同步走 action", async () => {
+  const screen = harness(undefined, {}, { localMemo: { status: localReady, autoDetected: true }, openAdvanced: false });
+  const sync = findElements(screen.render(), "input").find((item) => item.props["aria-label"] === "会话同步")!;
+  assert.equal(sync.props.checked, false);
+  sync.props.onChange({ currentTarget: { checked: true } });
+  await tick();
+  assert.equal(screen.calls[0].command, "claude_local_configure");
+  assert.equal((screen.calls[0].args[0] as { config: { sessionSync: boolean } }).config.sessionSync, true);
+  screen.calls[0].resolve({ ...localReady, config: { ...localReady.config, sessionSync: true } });
+  await tick();
+  const syncNow = buttons(screen.render()).find((item) => item.props.title === "立即同步")!;
+  syncNow.props.onClick();
+  await tick();
+  assert.equal(screen.calls[1].command, "claude_local_action");
+  assert.equal((screen.calls[1].args[0] as { action: string }).action, "sync_sessions");
+});
+
 test("默认模型不在这一页选：只留一句说明，不放下拉也不放跳转", () => {
   const screen = harness(undefined, {}, {
     localMemo: { status: { ...localReady, config: { ...localReady.config, enabled: true } }, autoDetected: true },
@@ -736,38 +771,13 @@ test("上下文窗口按供应商声明显示，未声明时说明 Claude 按 20
   assert.match(text(undeclared.render()), /上下文窗口 未声明（Claude 按 200k）/);
 });
 
-test("窗口比默认模型小的模型只给一行提示，最多列 5 个", () => {
-  const screen = harness(undefined, {}, {
-    localMemo: {
-      status: { ...localReady, contextWindow: 1_000_000, hiddenModels: ["a", "b", "c", "d", "e", "f", "g"] },
-      autoDetected: true,
-    },
-    openAdvanced: false,
-  });
-  const body = text(screen.render());
-  assert.match(body, /另有 7 个模型窗口比默认模型小，没有列给 Claude（在那里切换会按 1M 压缩）：a、b、c、d、e等/);
-  assert.doesNotMatch(body, /f、g/, "超过 5 个只留「等」");
-
-  const none = harness(undefined, {}, {
-    localMemo: { status: { ...localReady, hiddenModels: [] }, autoDetected: true },
-    openAdvanced: false,
-  });
-  assert.doesNotMatch(text(none.render()), /没有列给 Claude/);
-});
-
-test("完整功能模式常显示本地合成数据说明，不放进副本页", () => {
-  const local = harness(undefined, {}, { localMemo: { status: localReady, autoDetected: true }, openAdvanced: false });
-  assert.match(text(local.render()), /账号、套餐与用量显示来自本地合成数据，不代表真实订阅。/);
-  const patch = harness({ status: ready, autoDetected: true }, {}, { mode: "patch" });
-  assert.doesNotMatch(text(patch.render()), /本地合成数据/);
-});
 
 test("补丁 Desktop 页：说明卡 + 常开的副本块，没有本地状态与页头启动", () => {
   const screen = harness({ status: ready, autoDetected: true }, {}, { mode: "patch" });
   const page = screen.render();
   assert.match(text(page), /补丁 Desktop/);
-  assert.match(text(page), /给改过代码的 Desktop 副本用/);
-  assert.match(text(page), /关闭 asar 完整性校验/);
+  assert.doesNotMatch(text(page), /给改过代码的 Desktop 副本用/);
+  assert.doesNotMatch(text(page), /关闭 asar 完整性校验/);
   assert.ok(findElements(page, "section").length > 0, "副本块是常开的 section");
   assert.equal(findElements(page, "details").length, 0, "补丁页不再用折叠块");
   assert.match(text(page), /受管增强版/);

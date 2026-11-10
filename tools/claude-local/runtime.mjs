@@ -12,6 +12,19 @@ const isText = (value, max = MAX_TEXT) => typeof value === "string" && value.len
 const isId = (value) => typeof value === "string" && idPattern.test(value);
 const isDate = (value) => typeof value === "string" && value.length <= 64 && Number.isFinite(Date.parse(value));
 
+// Claude 前端只认 free / pro / max 和 max 的 5x/20x，没有 Ultra 档：
+// Ultra 按最高档 max_20x 发，只是显示名不同。
+export const PLANS = {
+  free:  { plan: "free", label: "Free",  capabilities: [],                           rateLimitTier: "default_claude_ai",      analytics: "claude_free" },
+  pro:   { plan: "pro",  label: "Pro",   capabilities: ["claude_pro"],               rateLimitTier: "default_claude_ai",      analytics: "claude_pro" },
+  max:   { plan: "max",  label: "Max",   capabilities: ["claude_pro", "claude_max"], rateLimitTier: "default_claude_max_5x",  analytics: "claude_max" },
+  ultra: { plan: "max",  label: "Ultra", capabilities: ["claude_pro", "claude_max"], rateLimitTier: "default_claude_max_20x", analytics: "claude_max" },
+};
+
+export function planProfile(plan) {
+  return Object.hasOwn(PLANS, plan) ? PLANS[plan] : PLANS.ultra;
+}
+
 export function runtimeConfig(env = process.env) {
   const managed = env.CLAUDE_LOCAL_MANAGED === "1";
   const flag = (name) => env[`CLAUDE_LOCAL_${name}`] !== "0";
@@ -54,6 +67,15 @@ export function runtimeConfig(env = process.env) {
       throw new Error("Invalid Claude local gateway model windows");
     }
   }
+  // 选择器显示名（id → {name, description}）：坏数据当没给，界面回退 id。
+  const modelNames = (() => {
+    try {
+      const value = JSON.parse(env.CLAUDE_LOCAL_GATEWAY_MODEL_NAMES || "{}");
+      if (!isRecord(value)) return {};
+      return Object.fromEntries(Object.entries(value).filter(([id, info]) =>
+        isText(id, 512) && id && isRecord(info) && isText(info.name, 512) && (info.description === undefined || isText(info.description, 512))));
+    } catch { return {}; }
+  })();
   // 选中模型没有逐模型窗口时用这个值兜底（网关按 binding 解析出的窗口）。
   // 写坏了就当没给，不让一次启动失败在建环境变量上。
   const defaultWindow = (() => {
@@ -79,13 +101,22 @@ export function runtimeConfig(env = process.env) {
     managed, gateway, model, smallModel, key,
     models: [...new Set([model, smallModel, ...models])],
     modelWindows,
+    modelNames,
     defaultWindow,
     recordedDir,
     localization: flag("LOCALIZATION"),
     voiceInput: flag("VOICE_INPUT"),
     computerUse: flag("COMPUTER_USE"),
     backgroundMode: flag("BACKGROUND_MODE"),
+    displayName: displayName(env.CLAUDE_LOCAL_DISPLAY_NAME),
+    plan: Object.hasOwn(PLANS, env.CLAUDE_LOCAL_PLAN ?? "") ? env.CLAUDE_LOCAL_PLAN : "ultra",
   };
+}
+
+// 显示名：trim、去控制字符、最多 64 字符；空则按默认。
+function displayName(value) {
+  const name = String(value ?? "").trim().replace(/[\u0000-\u001F\u007F]/g, "").slice(0, 64).trim();
+  return name || "Local User";
 }
 
 export function gatewayTarget(config, requestPath) {
@@ -115,7 +146,7 @@ export function gatewayBody(config, raw) {
 export function modelList(config) {
   return {
     data: config.models.map((id) => ({
-      id, type: "model", display_name: id, created_at: "2026-01-01T00:00:00Z",
+      id, type: "model", display_name: config.modelNames?.[id]?.name || id, created_at: "2026-01-01T00:00:00Z",
     })),
     has_more: false,
     first_id: config.models[0] ?? null,
