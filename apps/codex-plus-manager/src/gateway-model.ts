@@ -384,6 +384,13 @@ export function skippedAgents(payload: GatewayPayload | null, picked: GatewayAge
   return glanceAgents(payload?.agents).map((agent) => agent.agent).filter((agent) => !picked.includes(agent));
 }
 
+/** 编辑供应商时改某个 Agent 是否用它（#3030）：`on` 是重新用它，从排除列表里去掉；关掉则追加。已存在时不动，返回原数组。 */
+export function poolExcludeToggle(previous: string[] | undefined, providerId: string, on: boolean): string[] {
+  const exclude = previous ?? [];
+  if (on) return exclude.filter((id) => id !== providerId);
+  return exclude.includes(providerId) ? exclude : [...exclude, providerId];
+}
+
 /** 窗口支持纯数字和 `200k` / `1M` 写法。无效时返回 NaN。 */
 export function parseContextWindow(value: string): number | null {
   const text = value.trim().toLowerCase();
@@ -1505,11 +1512,13 @@ export function filterSessions(sessions: AgentSessionView[], agent: SessionAgent
 
 /** `/Users/me/code/app` → `~/code/app`；太长时只留最后两级。 */
 export function shortPath(path: string, home = ""): string {
-  let text = path.trim();
+  // Windows 上 Codex 记录的 cwd 带 `\\?\` 长路径前缀（#3030），显示时去掉。
+  let text = path.trim().replace(/^\\\\\?\\UNC\\/, "\\\\").replace(/^\\\\\?\\(?=[A-Za-z]:)/, "");
   if (home && text.startsWith(home)) text = `~${text.slice(home.length)}`;
   else text = text.replace(/^\/Users\/[^/]+/, "~").replace(/^\/home\/[^/]+/, "~");
-  const parts = text.split("/").filter(Boolean);
-  return parts.length > 4 ? `…/${parts.slice(-2).join("/")}` : text;
+  const separator = !text.includes("/") && text.includes("\\") ? "\\" : "/";
+  const parts = text.split(/[\\/]/).filter(Boolean);
+  return parts.length > 4 ? `…${separator}${parts.slice(-2).join(separator)}` : text;
 }
 
 /** 相对时间：刚刚 / N 分钟前 / N 小时前 / N 天前 / 日期。返回中文模板与参数，界面再翻译。 */
