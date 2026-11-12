@@ -1092,8 +1092,11 @@ function mockApi(req, res, url) {
       is_member: true,
     });
   }
+  // 组织详情不能带 Set-Cookie：Desktop 主进程监听 lastActiveOrg cookie，一变就重查插件白名单，
+  // 而白名单检查正是请求这个接口——每次响应都重写 cookie 会形成死循环，主进程卡死、窗口点不动。
+  // 活动组织的 cookie 由 bootstrap / account 等入口设置一次就够了。
   if (/^\/api\/organizations\/[^/]+$/.test(p)) {
-    return jsonWithActiveOrg(res, ORG);
+    return json(res, ORG);
   }
   if (/\/chat_conversations$/.test(p)) {
     if (method === "GET") return json(res, [...CONV_STATE.values()].map(convToRest));
@@ -1306,14 +1309,16 @@ function serveDocShell(req, res, url) {
   }
   const base = UPSTREAM_MAP[host] || `https://${host}`;
   const target = new URL("/epitaxy", base);
-  const client = target.protocol === "http:" ? http : https;
-  const up = client.request(
+  // 带上 Claude Desktop 自己的浏览器 UA：只写「Claude」会被 Cloudflare 当成机器人 403。
+  const userAgent = String(req.headers["user-agent"] || "") || "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Claude Chrome Safari/537.36";
+  const up = upstreamRequest(
+    target,
     {
       hostname: target.hostname,
       port: target.port || 443,
       path: "/epitaxy",
       method: "GET",
-      headers: { accept: "text/html", host, "user-agent": "Claude" },
+      headers: { accept: "text/html", host, "user-agent": userAgent },
       timeout: 15000,
     },
     (r) => {
@@ -1380,6 +1385,60 @@ const UPSTREAM_MAP = (() => {
   try { return JSON.parse(process.env.CLAUDE_LOCAL_UPSTREAM_MAP || "{}"); } catch { return {}; }
 })();
 
+// 抓 claude.ai 网页（首次写穿缓存的外壳、静态资源）可选经出站代理：受限地区直连会被 302 到
+// app-unavailable-in-region。代理地址由后端检测系统代理后传入（只支持 http:// 的 CONNECT 代理）。
+// 本机地址一律直连。
+const UPSTREAM_PROXY = (() => {
+  try {
+    const proxy = new URL(process.env.CLAUDE_LOCAL_UPSTREAM_PROXY || "");
+    return proxy.protocol === "http:" && proxy.hostname ? proxy : null;
+  } catch {
+    return null;
+  }
+})();
+
+function isLoopbackHost(hostname) {
+  return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(String(hostname).toLowerCase());
+}
+
+/** 发往上游网页的请求：https 且配置了出站代理时先 CONNECT 打通隧道，再在隧道上做 TLS。 */
+function upstreamRequest(target, options, callback) {
+  const client = target.protocol === "http:" ? http : https;
+  if (!UPSTREAM_PROXY || target.protocol !== "https:" || isLoopbackHost(target.hostname)) {
+    return client.request(options, callback);
+  }
+  const port = Number(options.port || 443);
+  const authority = `${options.hostname}:${port}`;
+  const proxyAuth = UPSTREAM_PROXY.username
+    ? { "proxy-authorization": `Basic ${Buffer.from(`${decodeURIComponent(UPSTREAM_PROXY.username)}:${decodeURIComponent(UPSTREAM_PROXY.password)}`).toString("base64")}` }
+    : {};
+  return https.request({
+    ...options,
+    agent: undefined,
+    // ClientRequest 支持回调式 createConnection：隧道建好后再交出 TLS socket。
+    createConnection: (_options, done) => {
+      const connect = http.request({
+        host: UPSTREAM_PROXY.hostname,
+        port: Number(UPSTREAM_PROXY.port || 80),
+        method: "CONNECT",
+        path: authority,
+        headers: { host: authority, ...proxyAuth },
+        timeout: options.timeout || 20000,
+      });
+      connect.once("connect", (response, socket) => {
+        if (response.statusCode !== 200) {
+          socket.destroy();
+          return done(new Error(`upstream proxy CONNECT ${response.statusCode}`));
+        }
+        done(null, tls.connect({ socket, servername: options.hostname }));
+      });
+      connect.once("timeout", () => connect.destroy(new Error("upstream proxy timeout")));
+      connect.once("error", (error) => done(error));
+      connect.end();
+    },
+  }, callback);
+}
+
 function proxyUpstream(req, res, url) {
   const cacheKey = `${url.host}${url.pathname}${url.search}`;
   const cp = cachePathFor(cacheKey);
@@ -1391,12 +1450,12 @@ function proxyUpstream(req, res, url) {
   // 保留原始主机（downloads.claude.ai 等），不再统一改写到 claude.ai。
   const base = UPSTREAM_MAP[url.host] || `https://${url.host || "claude.ai"}`;
   const target = new URL(url.pathname + url.search, base);
-  const client = target.protocol === "http:" ? http : https;
   const headers = { ...req.headers, host: url.host || target.host };
   delete headers["proxy-connection"];
   delete headers["accept-encoding"];
 
-  const upstreamReq = client.request(
+  const upstreamReq = upstreamRequest(
+    target,
     {
       hostname: target.hostname,
       port: target.port || 443,

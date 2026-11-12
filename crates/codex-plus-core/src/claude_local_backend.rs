@@ -154,6 +154,120 @@ pub struct ClaudeLocalResult {
     pub message: String,
 }
 
+/// 直连上游：不经 Codex++ 网关，本地兼容服务把请求直接发到这组 Base URL + Key
+/// （`{base}/v1/messages`，与 `ANTHROPIC_BASE_URL` 同一语义）。
+///
+/// 只有 ClaudeMom 会设置；没设置时一切照旧走网关绑定。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectUpstream {
+    pub base_url: String,
+    pub api_key: String,
+    /// 默认模型；Claude 里选 Opus / Sonnet 这类自带条目时也落到它。
+    pub model: String,
+    /// Haiku 档（标题生成等小任务）用的模型；空则用默认模型。
+    pub small_model: String,
+    /// 列给 Claude 模型选择器的模型（默认模型总在第一个）。
+    pub models: Vec<String>,
+    /// 上下文窗口；`None` 表示不声明，Claude 按 200k 处理。
+    pub context_window: Option<u64>,
+    /// 模型显示名（上游 `/v1/models` 的 `display_name`）；没有的按 id 生成。
+    pub model_names: BTreeMap<String, String>,
+}
+
+impl DirectUpstream {
+    /// 去掉首尾空白与结尾斜杠，默认模型放第一位并去重，小模型缺省用默认模型。
+    pub fn normalized(mut self) -> Self {
+        self.base_url = self.base_url.trim().trim_end_matches('/').to_string();
+        self.api_key = self.api_key.trim().to_string();
+        self.model = self.model.trim().to_string();
+        self.small_model = self.small_model.trim().to_string();
+        if self.small_model.is_empty() {
+            self.small_model = self.model.clone();
+        }
+        let mut models = Vec::new();
+        for model in std::iter::once(&self.model).chain(self.models.iter()) {
+            let model = model.trim();
+            if !model.is_empty() && !models.iter().any(|known: &String| known == model) {
+                models.push(model.to_string());
+            }
+        }
+        self.models = models;
+        self.context_window = self.context_window.filter(|window| *window > 0);
+        self
+    }
+
+    fn ready(&self) -> bool {
+        !self.base_url.is_empty() && !self.model.is_empty()
+    }
+
+    fn model_windows(&self) -> BTreeMap<String, u64> {
+        self.context_window
+            .map(|window| self.models.iter().map(|model| (model.clone(), window)).collect())
+            .unwrap_or_default()
+    }
+
+    fn model_names(&self) -> BTreeMap<String, Value> {
+        self.models
+            .iter()
+            .map(|id| {
+                let name = self
+                    .model_names
+                    .get(id)
+                    .map(|name| name.trim())
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| friendly_model_name(id.rsplit('/').next().unwrap_or(id)));
+                (id.clone(), json!({"name": name, "description": ""}))
+            })
+            .collect()
+    }
+}
+
+static DIRECT_UPSTREAM: Mutex<Option<DirectUpstream>> = Mutex::new(None);
+
+/// 切到直连上游（`Some`）或回到网关（`None`）。改了之后下次启动 / 状态读取即按新上游计算；
+/// 正在运行的本地服务配置指纹会变，界面会提示需要重启。
+pub fn set_direct_upstream(upstream: Option<DirectUpstream>) {
+    *DIRECT_UPSTREAM
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = upstream.map(DirectUpstream::normalized);
+}
+
+fn direct_upstream() -> Option<DirectUpstream> {
+    DIRECT_UPSTREAM
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+}
+
+/// 交给本地兼容服务的上游，来自网关绑定或直连配置。
+struct LocalUpstream {
+    root: String,
+    token: String,
+    default_model: String,
+    small_model: String,
+    models: Vec<String>,
+    model_names: BTreeMap<String, Value>,
+    model_windows: BTreeMap<String, u64>,
+    default_window: u64,
+}
+
+impl LocalUpstream {
+    fn direct(upstream: &DirectUpstream) -> Self {
+        Self {
+            root: upstream.base_url.clone(),
+            token: upstream.api_key.clone(),
+            default_model: upstream.model.clone(),
+            small_model: upstream.small_model.clone(),
+            models: upstream.models.clone(),
+            model_names: upstream.model_names(),
+            model_windows: upstream.model_windows(),
+            default_window: upstream.context_window.unwrap_or_default(),
+        }
+    }
+}
+
 struct BackendRuntime {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -256,6 +370,49 @@ fn private_dir(path: &Path) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// 完整功能模式里内置 Claude Code 的配置目录（`CLAUDE_CONFIG_DIR`，会话记录在它的 `projects/` 下）。
+///
+/// Desktop 左侧的会话列表存在真实 Claude profile 里，Codex++ 与 ClaudeMom 共用同一份；会话记录也必须共用，
+/// 否则在一个程序里建的会话到另一个里打不开（一直显示「此页面加载时间比平时更长」）。
+/// 所以放在两个程序的状态目录之外；拿不到家目录时退回各自状态目录里的旧位置。
+fn full_code_dir(root: &Path) -> PathBuf {
+    shared_full_code_dir().unwrap_or_else(|| root.join("claude-code"))
+}
+
+fn shared_full_code_dir() -> Option<PathBuf> {
+    directories::BaseDirs::new()
+        .map(|dirs| dirs.home_dir().join(".claude-desktop-local").join("claude-code"))
+}
+
+/// 共享目录之前，会话记录在各自状态目录的 `claude-code/` 里：启动前把缺的文件补进共享目录。
+/// 只复制共享目录里还没有的文件，不覆盖、不删除原文件；复制失败只记日志，不挡启动。
+fn merge_legacy_full_code_dir(legacy: &Path, shared: &Path) {
+    if legacy == shared || !legacy.is_dir() {
+        return;
+    }
+    if let Err(error) = copy_missing(legacy, shared) {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "claude_local.merge_code_dir_failed",
+            serde_json::json!({ "message": format!("{error:#}") }),
+        );
+    }
+}
+
+fn copy_missing(from: &Path, to: &Path) -> Result<()> {
+    private_dir(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let target = to.join(entry.file_name());
+        if kind.is_dir() {
+            copy_missing(&entry.path(), &target)?;
+        } else if kind.is_file() && !target.exists() {
+            fs::copy(entry.path(), &target)?;
+        }
     }
     Ok(())
 }
@@ -591,15 +748,6 @@ fn recorded_data_dir() -> Option<PathBuf> {
         .ok()
         .map(PathBuf::from)?;
     valid(&dir).then_some(dir)
-}
-
-// 首次运行且没有可回放的页面缓存时提示：依赖在线抓取，离线会降级。
-fn replay_cache_populated(root: &Path) -> bool {
-    let cache = root.join(".cache");
-    cache.is_dir()
-        && fs::read_dir(cache)
-            .map(|mut entries| entries.any(|entry| entry.is_ok()))
-            .unwrap_or(false)
 }
 
 fn install_assets(root: &Path) -> Result<()> {
@@ -1108,6 +1256,22 @@ fn untrust_ca(root: &Path) -> Result<()> {
 }
 
 fn config_hash(config: &ClaudeLocalSettings) -> String {
+    if let Some(upstream) = direct_upstream() {
+        // 直连：换了 Base URL、Key、模型都算配置变了（指纹是摘要，不会把 Key 原样落盘）。
+        return format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&(
+                    config,
+                    "direct",
+                    &upstream,
+                    assets_digest(),
+                    desktop_fingerprint()
+                ))
+                .unwrap_or_default()
+            )
+        );
+    }
     let gateway_state = GatewayStore::default().load().ok().map(|gateway| {
         let gateway = gateway.with_extension_providers();
         let models = available_models(&gateway);
@@ -1127,12 +1291,35 @@ fn config_hash_with_gateway_state(
     config: &ClaudeLocalSettings,
     gateway_state: Option<(Vec<String>, BTreeMap<String, u64>, Option<String>)>,
 ) -> String {
+    hash_with_desktop(config, gateway_state, desktop_fingerprint())
+}
+
+fn hash_with_desktop(
+    config: &ClaudeLocalSettings,
+    gateway_state: Option<(Vec<String>, BTreeMap<String, u64>, Option<String>)>,
+    desktop: Option<(u64, u128)>,
+) -> String {
     format!(
         "{:x}",
         Sha256::digest(
-            serde_json::to_vec(&(config, gateway_state, assets_digest())).unwrap_or_default()
+            serde_json::to_vec(&(config, gateway_state, assets_digest(), desktop))
+                .unwrap_or_default()
         )
     )
+}
+
+/// 安装包里 `app.asar` 的大小与修改时间。受管路径的官方页面和资源都从它读，
+/// Desktop 更新后它会变：算进配置指纹，本地服务就会重启换上新页面，状态里也会提示重启。
+/// 只读文件元数据，不起进程（状态每 3 秒刷新一次）。
+fn desktop_fingerprint() -> Option<(u64, u128)> {
+    let meta = fs::metadata(desktop_resources(&source_app()).join("app.asar")).ok()?;
+    let modified = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((meta.len(), modified))
 }
 
 fn available_models(gateway: &GatewaySettings) -> Vec<String> {
@@ -1566,16 +1753,29 @@ pub fn status() -> Result<ClaudeLocalStatus> {
             .is_some_and(|(_, _, hash, _)| hash != &config_hash(&config))
         || (!config.enabled && local_process)
         || (claude_running && changed_since_launch);
-    let gateway = GatewayStore::default().load()?.with_extension_providers();
-    // 状态里报的是「交给 Claude 的那份列表」，不是网关全量：窗口更小的模型不会出现。
-    let binding = local_binding(&gateway, &config).ok();
-    let (models, hidden_models) = match binding.as_ref() {
-        Some(binding) => exposed_models(&gateway, binding, config.list_all_models),
-        None => (available_models(&gateway), Vec::new()),
+    let direct = direct_upstream();
+    let (models, hidden_models, context_window, no_models) = match direct.as_ref() {
+        Some(upstream) => (
+            upstream.models.clone(),
+            Vec::new(),
+            upstream.context_window,
+            !upstream.ready(),
+        ),
+        None => {
+            let gateway = GatewayStore::default().load()?.with_extension_providers();
+            // 状态里报的是「交给 Claude 的那份列表」，不是网关全量：窗口更小的模型不会出现。
+            let binding = local_binding(&gateway, &config).ok();
+            let (models, hidden_models) = match binding.as_ref() {
+                Some(binding) => exposed_models(&gateway, binding, config.list_all_models),
+                None => (available_models(&gateway), Vec::new()),
+            };
+            let context_window = binding
+                .as_ref()
+                .and_then(|binding| context_tokens(&gateway, binding, &binding.model));
+            let no_models = available_models(&gateway).is_empty();
+            (models, hidden_models, context_window, no_models)
+        }
     };
-    let context_window = binding
-        .as_ref()
-        .and_then(|binding| context_tokens(&gateway, binding, &binding.model));
     let ready = ca_ready(&root);
     let trusted = ready && ca_trusted(&root);
     let effective_dictation = crate::dictation::effective_settings(&settings);
@@ -1588,14 +1788,16 @@ pub fn status() -> Result<ClaudeLocalStatus> {
         .filter(|text| !text.is_empty())
     {
         Some(warning.to_string())
-    } else if available_models(&gateway).is_empty() {
-        Some("供应商池中还没有可用的聊天模型".into())
+    } else if no_models {
+        Some(if direct.is_some() {
+            "还没有选好上游：先添加 Base URL 和 Key，并选一个默认模型".into()
+        } else {
+            "供应商池中还没有可用的聊天模型".into()
+        })
     } else if config.enabled && !trusted {
         Some("首次使用需要准备并信任本地证书".into())
     } else if config.enabled && config.voice_input && !dictation_ready {
         Some("本地听写尚未就绪，请在语音设置中启用 SenseVoice 并准备模型".into())
-    } else if config.enabled && recorded_data_dir().is_none() && !replay_cache_populated(&root) {
-        Some("首次运行需要从 claude.ai 在线抓取页面资源；离线环境下完整功能模式可能无法加载".into())
     } else {
         fs::read_to_string(root.join("compatibility-warning.txt"))
             .ok()
@@ -1731,11 +1933,38 @@ fn start_backend(
         return Ok(port);
     }
     stop_backend();
-    let helper_port = crate::protocol_proxy::ensure_protocol_proxy_port_available();
-    crate::resident_helper::ensure_resident_helper(helper_port)?;
-    let (gateway, binding) = bind_gateway(&GatewayStore::default(), config)?;
-    let wiring = wiring(&gateway, &binding, AGENT_ID, helper_port);
-    let exposed = exposed_models(&gateway, &binding, config.list_all_models);
+    let upstream = match direct_upstream() {
+        Some(upstream) => {
+            ensure!(upstream.ready(), "还没有选好上游：先添加 Base URL 和 Key，并选一个默认模型");
+            // 直连不需要网关，但本地听写的转写走常驻 helper（它写 dictation-helper.json 凭据），
+            // 开着原生听写时照样把它起起来。
+            if config.voice_input {
+                let helper_port = crate::protocol_proxy::ensure_protocol_proxy_port_available();
+                crate::resident_helper::ensure_resident_helper(helper_port)?;
+            }
+            LocalUpstream::direct(&upstream)
+        }
+        None => {
+            let helper_port = crate::protocol_proxy::ensure_protocol_proxy_port_available();
+            crate::resident_helper::ensure_resident_helper(helper_port)?;
+            let (gateway, binding) = bind_gateway(&GatewayStore::default(), config)?;
+            let wiring = wiring(&gateway, &binding, AGENT_ID, helper_port);
+            let (models, _) = exposed_models(&gateway, &binding, config.list_all_models);
+            LocalUpstream {
+                model_names: model_names(&gateway, &models),
+                model_windows: available_model_windows(&gateway, &binding, config.list_all_models),
+                // 选中模型的窗口也单独给一份：逐模型表里没有它时，界面还知道该显示多长，
+                // 与启动 Claude Code 时写进 CLAUDE_CODE_MAX_CONTEXT_TOKENS 的值同源。
+                default_window: context_tokens(&gateway, &binding, &binding.model)
+                    .unwrap_or_default(),
+                root: wiring.root,
+                token: wiring.token,
+                default_model: wiring.default_model,
+                small_model: wiring.small_model,
+                models,
+            }
+        }
+    };
     let instance = uuid::Uuid::new_v4().to_string();
     let ready_file = root.join("ready.json");
     let log = private_file(&root.join("proxy.log"))?;
@@ -1743,7 +1972,16 @@ fn start_backend(
     command
         .arg(root.join("proxy.mjs"))
         // 恢复挂接时优先在原端口重启：Claude 只认启动时的 --proxy-server 端口。
-        .args(["--port", &preferred_port.unwrap_or(0).to_string(), "--mode", "mock", "--log", "0", "--ca"])
+        // 请求日志默认关（会记下访问的路径）；排障时在管理器环境里设 CODEX_PLUS_CLAUDE_LOCAL_LOG=1 打开，写进 proxy.log。
+        .args([
+            "--port",
+            &preferred_port.unwrap_or(0).to_string(),
+            "--mode",
+            "mock",
+            "--log",
+            if std::env::var("CODEX_PLUS_CLAUDE_LOCAL_LOG").is_ok_and(|value| value == "1") { "1" } else { "0" },
+            "--ca",
+        ])
         .arg(root.join("ca"))
         .current_dir(root)
         .env("CLAUDE_LOCAL_MANAGED", "1")
@@ -1753,37 +1991,30 @@ fn start_backend(
         )
         .env("CLAUDE_LOCAL_CACHE_DIR", root.join(".cache"))
         .env("CLAUDE_LOCAL_WEB_I18N_DIR", root.join("catalogs"))
+        .env("CLAUDE_LOCAL_UPSTREAM_PROXY", upstream_web_proxy().unwrap_or_default())
         .env(
             "CLAUDE_LOCAL_DESKTOP_RESOURCES",
             desktop_resources(&source_app()),
         )
-        .env("CLAUDE_LOCAL_GATEWAY_URL", wiring.root)
-        .env("CLAUDE_LOCAL_GATEWAY_KEY", wiring.token)
-        .env("CLAUDE_LOCAL_GATEWAY_MODEL", wiring.default_model)
-        .env("CLAUDE_LOCAL_GATEWAY_SMALL_MODEL", wiring.small_model)
+        .env("CLAUDE_LOCAL_GATEWAY_URL", &upstream.root)
+        .env("CLAUDE_LOCAL_GATEWAY_KEY", &upstream.token)
+        .env("CLAUDE_LOCAL_GATEWAY_MODEL", &upstream.default_model)
+        .env("CLAUDE_LOCAL_GATEWAY_SMALL_MODEL", &upstream.small_model)
         .env(
             "CLAUDE_LOCAL_GATEWAY_MODELS",
-            serde_json::to_string(&exposed.0)?,
+            serde_json::to_string(&upstream.models)?,
         )
         .env(
             "CLAUDE_LOCAL_GATEWAY_MODEL_NAMES",
-            serde_json::to_string(&model_names(&gateway, &exposed.0))?,
+            serde_json::to_string(&upstream.model_names)?,
         )
         .env(
             "CLAUDE_LOCAL_GATEWAY_MODEL_WINDOWS",
-            serde_json::to_string(&available_model_windows(
-                &gateway,
-                &binding,
-                config.list_all_models,
-            ))?,
+            serde_json::to_string(&upstream.model_windows)?,
         )
-        // 选中模型的窗口也单独给一份：逐模型表里没有它时，界面还知道该显示多长，
-        // 与启动 Claude Code 时写进 CLAUDE_CODE_MAX_CONTEXT_TOKENS 的值同源。
         .env(
             "CLAUDE_LOCAL_GATEWAY_DEFAULT_WINDOW",
-            context_tokens(&gateway, &binding, &binding.model)
-                .unwrap_or_default()
-                .to_string(),
+            upstream.default_window.to_string(),
         )
         .env("CLAUDE_LOCAL_STATE_FILE", root.join("conversations.json"))
         .env("CLAUDE_LOCAL_READY_FILE", &ready_file)
@@ -1828,6 +2059,27 @@ fn start_backend(
     }
 }
 
+/// 本地服务抓 claude.ai 网页（首次写穿缓存的外壳与资源）用的出站代理。
+/// 受限地区直连会被 302 到 app-unavailable-in-region；Node 不读系统代理，要显式交给它。
+/// 继承的代理变量优先，其次系统代理；只给 `http://` 的 CONNECT 代理（Node 端只会这一种）。
+fn upstream_web_proxy() -> Option<String> {
+    let inherited = INHERITED_PROXY_VARS
+        .iter()
+        .find_map(|name| std::env::var(name).ok().filter(|value| !value.trim().is_empty()));
+    pick_upstream_web_proxy(
+        inherited,
+        crate::proxy::detect_system_proxy_for_url("https://claude.ai"),
+    )
+}
+
+fn pick_upstream_web_proxy(inherited: Option<String>, system: Option<String>) -> Option<String> {
+    let usable = |value: String| {
+        let value = value.trim().to_string();
+        value.to_ascii_lowercase().starts_with("http://").then_some(value)
+    };
+    inherited.and_then(usable).or_else(|| system.and_then(usable))
+}
+
 fn flag(enabled: bool) -> &'static str {
     if enabled { "1" } else { "0" }
 }
@@ -1850,11 +2102,11 @@ fn local_launch_args(_root: &Path, port: u16, localization: bool) -> Vec<String>
 /// （100000–1000000，或 `auto`）。它按当前模型解析，所以切模型时会跟着变——正好补上
 /// `CLAUDE_CODE_MAX_CONTEXT_TOKENS` 只有一份、进程级的缺口，而且不需要重启。
 /// `CLAUDE_CODE_AUTO_COMPACT_WINDOW` 环境变量会盖过它，所以我们不设那个变量。
-fn write_model_compact_windows(root: &Path, windows: &BTreeMap<String, u64>) -> Result<()> {
+fn write_model_compact_windows(code_dir: &Path, windows: &BTreeMap<String, u64>) -> Result<()> {
     if windows.is_empty() {
         return Ok(());
     }
-    let path = root.join("claude-code/settings.json");
+    let path = code_dir.join("settings.json");
     let mut settings: Value = fs::read(&path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
@@ -1881,6 +2133,10 @@ fn write_model_compact_windows(root: &Path, windows: &BTreeMap<String, u64>) -> 
 
 /// 按当前网关声明同步一次逐模型窗口；失败不影响启动。
 fn sync_model_compact_windows(root: &Path, config: &ClaudeLocalSettings) {
+    if let Some(upstream) = direct_upstream() {
+        let _ = write_model_compact_windows(&full_code_dir(root), &upstream.model_windows());
+        return;
+    }
     let Ok(gateway) = GatewayStore::default()
         .load()
         .map(|gateway| gateway.with_extension_providers())
@@ -1891,7 +2147,7 @@ fn sync_model_compact_windows(root: &Path, config: &ClaudeLocalSettings) {
         return;
     };
     let windows = available_model_windows(&gateway, &binding, config.list_all_models);
-    let _ = write_model_compact_windows(root, &windows);
+    let _ = write_model_compact_windows(&full_code_dir(root), &windows);
 }
 
 /// 把一个已拼好参数/环境变量的 Command 换成另一个可执行文件（MSIX 别名重试用）。
@@ -1996,7 +2252,27 @@ fn launch_original(
     ] {
         command.env_remove(name);
     }
-    if let Some(port) = port {
+    if let Some(port) = port
+        && let Some(upstream) = direct_upstream()
+    {
+        // 直连上游：内置 Claude Code 也走本地服务，令牌就是上游的 Key（本地服务按它校验）。
+        strip_inherited_proxy(&mut command);
+        if let Some(window) = upstream.context_window {
+            command.env("CLAUDE_CODE_MAX_CONTEXT_TOKENS", window.to_string());
+        }
+        apply_real_profile_one_p(&profile_sets(), root)?;
+        let code_dir = full_code_dir(root);
+        private_dir(&code_dir)?;
+        merge_legacy_full_code_dir(&root.join("claude-code"), &code_dir);
+        command
+            .args(local_launch_args(root, port, localization))
+            .env("CLAUDE_CONFIG_DIR", &code_dir)
+            .env("ANTHROPIC_BASE_URL", format!("http://127.0.0.1:{port}"))
+            .env("ANTHROPIC_API_KEY", &upstream.api_key)
+            .env("ANTHROPIC_AUTH_TOKEN", &upstream.api_key)
+            .env("NO_PROXY", "localhost,127.0.0.1")
+            .env("no_proxy", "localhost,127.0.0.1");
+    } else if let Some(port) = port {
         strip_inherited_proxy(&mut command);
         let gateway = GatewayStore::default().load()?;
         let binding = gateway
@@ -2009,14 +2285,16 @@ fn launch_original(
         // 完整功能模式与 PoC 一致：直接用真实 Claude profile（无 --user-data-dir），
         // 启动前把真实配置切到 1p 并记录回滚信息。
         apply_real_profile_one_p(&profile_sets(), root)?;
-        private_dir(&root.join("claude-code"))?;
+        let code_dir = full_code_dir(root);
+        private_dir(&code_dir)?;
+        merge_legacy_full_code_dir(&root.join("claude-code"), &code_dir);
         // 与 3p 路径一致：把 Codex++ 配置的每模型窗口/推理档传给内置 Claude Code。
         let helper_port = crate::protocol_proxy::ensure_protocol_proxy_port_available();
         let wiring = wiring(&gateway, &binding, AGENT_ID, helper_port);
         let token = wiring.token.clone();
         command
             .args(local_launch_args(root, port, localization))
-            .env("CLAUDE_CONFIG_DIR", root.join("claude-code"))
+            .env("CLAUDE_CONFIG_DIR", &code_dir)
             .env("ANTHROPIC_BASE_URL", format!("http://127.0.0.1:{port}"))
             .env("ANTHROPIC_API_KEY", &token)
             .env("ANTHROPIC_AUTH_TOKEN", &token)
@@ -2314,7 +2592,7 @@ pub fn perform(action: &str) -> Result<ClaudeLocalResult> {
                 &main.three_p.join("claude-code-sessions"),
                 &[root.join("claude-code-3p"), home_dir().join(".claude")],
                 &main.data.join("claude-code-sessions"),
-                &[root.join("claude-code"), home_dir().join(".claude")],
+                &[full_code_dir(&root), home_dir().join(".claude")],
                 &root.join("backups/session-sync"),
             )?;
             if !report.note.is_empty() {
@@ -2342,7 +2620,7 @@ pub fn perform(action: &str) -> Result<ClaudeLocalResult> {
                     &main.three_p.join("claude-code-sessions"),
                     &[root.join("claude-code-3p"), home_dir().join(".claude")],
                     &main.data.join("claude-code-sessions"),
-                    &[root.join("claude-code"), home_dir().join(".claude")],
+                    &[full_code_dir(&root), home_dir().join(".claude")],
                     &root.join("backups/session-sync"),
                 ) {
                     Ok(report) if report.to_full + report.to_three_p + report.updated > 0 => {
@@ -2360,6 +2638,10 @@ pub fn perform(action: &str) -> Result<ClaudeLocalResult> {
                     }
                 }
             }
+            ensure!(
+                config.enabled || direct_upstream().is_none(),
+                "直连上游只支持完整功能模式"
+            );
             if config.enabled {
                 install_assets(&root)?;
                 prepare_ca(&root)?;
@@ -2407,6 +2689,61 @@ pub fn perform(action: &str) -> Result<ClaudeLocalResult> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn upstream_web_proxy_prefers_inherited_then_system_and_only_http() {
+        let some = |value: &str| Some(value.to_string());
+        assert_eq!(pick_upstream_web_proxy(some("http://10.0.0.1:8080"), some("http://127.0.0.1:7897")), some("http://10.0.0.1:8080"));
+        assert_eq!(pick_upstream_web_proxy(None, some(" http://127.0.0.1:7897 ")), some("http://127.0.0.1:7897"));
+        // socks 代理 Node 端不支持：跳过继承的，退回系统代理；都不行就直连。
+        assert_eq!(pick_upstream_web_proxy(some("socks5://127.0.0.1:7898"), some("http://127.0.0.1:7897")), some("http://127.0.0.1:7897"));
+        assert_eq!(pick_upstream_web_proxy(some("socks5://127.0.0.1:7898"), None), None);
+        assert_eq!(pick_upstream_web_proxy(None, None), None);
+    }
+
+    /// Desktop 更新（app.asar 变了）算配置变化：本地服务要重启才能换上新的官方页面。
+    #[test]
+    fn desktop_update_changes_the_config_hash() {
+        let config = ClaudeLocalSettings::default();
+        let before = hash_with_desktop(&config, None, Some((100, 1)));
+        assert_eq!(before, hash_with_desktop(&config, None, Some((100, 1))));
+        assert_ne!(before, hash_with_desktop(&config, None, Some((100, 2))), "修改时间变了");
+        assert_ne!(before, hash_with_desktop(&config, None, Some((101, 1))), "大小变了");
+    }
+
+    /// 直连上游：Base URL 与 ANTHROPIC_BASE_URL 同语义（去掉结尾斜杠），默认模型排第一且去重，
+    /// 小模型缺省用默认模型；没有窗口就不声明。（不碰全局开关，免得影响并行用例。）
+    #[test]
+    fn direct_upstream_normalizes_models_and_windows() {
+        let upstream = DirectUpstream {
+            base_url: " https://api.example.com/ ".into(),
+            api_key: " sk-test ".into(),
+            model: "claude-opus-4-6".into(),
+            small_model: String::new(),
+            models: vec!["glm-5".into(), "claude-opus-4-6".into(), " ".into(), "glm-5".into()],
+            context_window: Some(0),
+            model_names: BTreeMap::from([("glm-5".to_string(), "GLM 5 · 智谱".to_string())]),
+        }
+        .normalized();
+        assert_eq!(upstream.base_url, "https://api.example.com");
+        assert_eq!(upstream.api_key, "sk-test");
+        assert_eq!(upstream.small_model, "claude-opus-4-6");
+        assert_eq!(upstream.models, ["claude-opus-4-6", "glm-5"]);
+        assert_eq!(upstream.context_window, None);
+        assert!(upstream.model_windows().is_empty());
+        assert!(upstream.ready());
+
+        let wide = DirectUpstream { context_window: Some(1_000_000), ..upstream.clone() };
+        let local = LocalUpstream::direct(&wide);
+        assert_eq!(local.root, "https://api.example.com");
+        assert_eq!(local.token, "sk-test");
+        assert_eq!(local.default_window, 1_000_000);
+        assert_eq!(local.model_windows.get("glm-5"), Some(&1_000_000));
+        assert_eq!(local.model_names["claude-opus-4-6"]["name"], friendly_model_name("claude-opus-4-6"));
+        assert_eq!(local.model_names["glm-5"]["name"], "GLM 5 · 智谱", "上游给了显示名就用它");
+
+        assert!(!DirectUpstream::default().normalized().ready(), "没有 Base URL 和模型不能启动");
+    }
+
     fn provider(id: &str, models: &str) -> crate::gateway::store::GatewayProvider {
         serde_json::from_value(json!({
             "relay": {
@@ -2416,6 +2753,27 @@ mod tests {
             },
         }))
         .unwrap()
+    }
+
+    /// 共享会话目录：旧位置的会话记录补进共享目录，已有的文件不覆盖，原文件保留。
+    #[test]
+    fn legacy_full_code_dir_merges_missing_files_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join("state/claude-local/claude-code");
+        let shared = temp.path().join("shared/claude-code");
+        fs::create_dir_all(legacy.join("projects/p1")).unwrap();
+        fs::write(legacy.join("projects/p1/a.jsonl"), "from-codex").unwrap();
+        fs::write(legacy.join("projects/p1/b.jsonl"), "old-b").unwrap();
+        fs::create_dir_all(shared.join("projects/p1")).unwrap();
+        fs::write(shared.join("projects/p1/b.jsonl"), "newer-b").unwrap();
+
+        merge_legacy_full_code_dir(&legacy, &shared);
+        assert_eq!(fs::read_to_string(shared.join("projects/p1/a.jsonl")).unwrap(), "from-codex");
+        assert_eq!(fs::read_to_string(shared.join("projects/p1/b.jsonl")).unwrap(), "newer-b", "不覆盖");
+        assert!(legacy.join("projects/p1/a.jsonl").exists(), "原文件保留");
+        // 不存在的旧目录、同一目录都直接跳过。
+        merge_legacy_full_code_dir(&temp.path().join("missing"), &shared);
+        merge_legacy_full_code_dir(&shared, &shared);
     }
 
     #[test]
@@ -2430,7 +2788,7 @@ mod tests {
             ("relay/gpt-6.1-sol".to_string(), 1_100_000),
             ("relay/small".to_string(), 128_000),
         ]);
-        write_model_compact_windows(temp.path(), &windows).unwrap();
+        write_model_compact_windows(&dir, &windows).unwrap();
 
         let settings: Value =
             serde_json::from_slice(&fs::read(dir.join("settings.json")).unwrap()).unwrap();

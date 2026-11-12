@@ -101,10 +101,10 @@ async function request(instance, pathname, { host, body, type = "application/jso
   }
 }
 
-async function start(extra = {}) {
+async function start(extra = {}, runtimeDir = path.join(root, "runtime")) {
   const ready = path.join(root, "ready.json");
   const instanceId = `managed-test-${Date.now()}`;
-  const child = spawn(process.execPath, [path.join(root, "runtime", "proxy.mjs"), "--port", "0", "--mode", "mock", "--log", "0", "--ca", path.join(here, "ca")], {
+  const child = spawn(process.execPath, [path.join(runtimeDir, "proxy.mjs"), "--port", "0", "--mode", "mock", "--log", "0", "--ca", path.join(here, "ca")], {
     env: {
       ...process.env,
       CLAUDE_LOCAL_MANAGED: "1",
@@ -301,6 +301,52 @@ test("fresh managed profile serves the installed official shell and bounded ASAR
   assert.equal(bootstrap.json.gated_imports_build_id, "fixture-build");
 });
 
+test("installed template fetches the first shell through the configured upstream proxy, then replays it", async () => {
+  // 后端 install_assets 会写入内嵌模板（mock/.codex-plus-template）：模板数据配线上外壳写穿缓存。
+  // 受限地区直连 claude.ai 会被 302，首次抓外壳要经后端传入的出站代理（CONNECT 隧道）。
+  const connects = [];
+  const upstreamProxy = http.createServer();
+  upstreamProxy.on("connect", (req, socket) => {
+    connects.push(req.url);
+    socket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
+  });
+  upstreamProxy.listen(0, "127.0.0.1");
+  await once(upstreamProxy, "listening");
+  upstreamProxy.unref();
+  const runtimeDir = path.join(root, "template-runtime");
+  fs.cpSync(path.join(root, "runtime"), runtimeDir, { recursive: true });
+  fs.writeFileSync(path.join(runtimeDir, "mock", ".codex-plus-template"), "");
+  const env = {
+    CLAUDE_LOCAL_CACHE_DIR: path.join(runtimeDir, ".cache"),
+    CLAUDE_LOCAL_UPSTREAM_PROXY: `http://127.0.0.1:${upstreamProxy.address().port}`,
+  };
+  const fresh = await start(env, runtimeDir);
+  try {
+    const shell = await request(fresh, "/settings/general", { host: "claude.ai" });
+    assert.notEqual(shell.status, 200, "代理拒绝时不能假装拿到了外壳");
+    assert.deepEqual(connects, ["claude.ai:443"], "首次外壳经出站代理去 claude.ai");
+  } finally {
+    await stop(fresh);
+  }
+
+  // 录制（或已写穿）的外壳在场时直接回放，不再联网。
+  connects.length = 0;
+  const shellKey = crypto.createHash("sha1").update("claude.ai/epitaxy").digest("hex");
+  fs.mkdirSync(path.join(runtimeDir, ".cache"), { recursive: true });
+  fs.writeFileSync(path.join(runtimeDir, ".cache", shellKey), `<html data-build-id="recorded">${"x".repeat(5000)}</html>`);
+  fs.writeFileSync(path.join(runtimeDir, ".cache", `${shellKey}.json`), JSON.stringify({ status: 200, headers: { "content-type": "text/html" }, url: "claude.ai/epitaxy" }));
+  const recorded = await start(env, runtimeDir);
+  try {
+    const shell = await request(recorded, "/settings/general", { host: "claude.ai" });
+    assert.equal(shell.status, 200);
+    assert.match(shell.bytes.toString("utf8"), /data-build-id="recorded"/);
+    assert.deepEqual(connects, []);
+  } finally {
+    await stop(recorded);
+    upstreamProxy.close();
+  }
+});
+
 test("clean managed runtime uses synthetic bootstrap and configured catalogs without private recordings", async () => {
   for (const pathname of ["/edge-api/bootstrap", "/api/bootstrap", "/api/bootstrap/local/app_start"]) {
     const result = await request(service, pathname, { host: "claude.ai" });
@@ -335,6 +381,18 @@ test("clean managed runtime uses synthetic bootstrap and configured catalogs wit
   assert.deepEqual(chromeLocaleCatalog.json, { message: "translated" });
   const defaultLocaleCatalog = await request(service, "/i18n/s/en-US.json", { host: "claude.ai" });
   assert.deepEqual(defaultLocaleCatalog.json, { message: "translated" });
+});
+
+test("organization detail never resets the active-org cookie (Desktop re-checks the allowlist on every change)", async () => {
+  // Desktop 主进程监听 lastActiveOrg cookie，一变就请求 /api/organizations/<id> 查插件白名单；
+  // 这个接口再下发 cookie 就是死循环（实测 1600+ 次/秒，主进程卡死、窗口点不动）。
+  const detail = await request(service, "/api/organizations/e0e877d3-8475-44a1-a501-4fc431b085ab", { host: "claude.ai" });
+  assert.equal(detail.status, 200);
+  assert.equal(detail.json.uuid, "e0e877d3-8475-44a1-a501-4fc431b085ab");
+  assert.equal(detail.headers["set-cookie"], undefined);
+  // 活动组织仍由 bootstrap 入口设置。
+  const bootstrap = await request(service, "/api/bootstrap", { host: "claude.ai" });
+  assert.ok(String(bootstrap.headers["set-cookie"]).includes("lastActiveOrg="));
 });
 
 test("managed organization discovery stays on the already joined local organization", async () => {
